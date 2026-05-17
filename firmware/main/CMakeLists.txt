@@ -2,9 +2,6 @@
 set(XIAOZHI_MAIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xiaozhi-esp32/main")
 
 file(GLOB_RECURSE STACK_CHAN_SOURCES
-    "apps/*.c"
-    "apps/*.cc"
-    "apps/*.cpp"
     "assets/*.c"
     "assets/*.cc"
     "assets/*.cpp"
@@ -312,7 +309,6 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         ArduinoJson
-                        esp-now
                         mooncake
                         mooncake_log
                         smooth_ui_toolkit
