@@ -8,7 +8,9 @@
 #include <freertos/task.h>
 #include <mooncake_log.h>
 
+#include "state.h"
 #include "transport.h"
+#include "wakeword.h"
 
 namespace agent::mic_pump {
 
@@ -40,12 +42,22 @@ void task(void*)
     std::vector<int16_t> buf(samples_per_frame);
 
     while (true) {
+        auto mode = state::current();
+        // Mic stays open during IDLE so wakeword can hear; muted during
+        // SPEAKING to avoid feeding our own TTS back to STT.
+        if (mode == state::Mode::Speaking) {
+            vTaskDelay(pdMS_TO_TICKS(kFrameMs));
+            continue;
+        }
         if (!codec->InputData(buf)) {
             vTaskDelay(pdMS_TO_TICKS(kFrameMs));
             continue;
         }
-        // Send unconditionally; transport drops silently if not connected.
-        transport::send_audio(buf.data(), buf.size());
+        if (mode == state::Mode::Idle) {
+            wakeword::feed(buf);
+        } else if (mode == state::Mode::Listening) {
+            transport::send_audio(buf.data(), buf.size());
+        }
     }
 }
 

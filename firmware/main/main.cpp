@@ -19,9 +19,12 @@
 #include <board.h>
 #include <display/display.h>
 
+#include "agent/commands.h"
 #include "agent/mic_pump.h"
 #include "agent/speaker_play.h"
+#include "agent/state.h"
 #include "agent/transport.h"
+#include "agent/wakeword.h"
 
 static constexpr const char* TAG = "stackchan";
 
@@ -94,16 +97,22 @@ extern "C" void app_main(void)
         mclog::tagInfo(TAG, "net: {}", msg);
     });
 
-    // Phase 1: open the WS to the brain. Audio frames from the brain go to
-    // the speaker; the mic continuously streams to the brain. With the
-    // brain echoing, we should hear ourselves.
+    // Phase 2: wakeword → LISTENING → STT → SPEAKING → TTS playback.
     agent::transport::set_on_audio(
         [](const int16_t* samples, size_t n) { agent::speaker_play::push(samples, n); });
+    agent::transport::set_on_json(
+        [](std::string_view json) { agent::commands::dispatch(json); });
     agent::transport::start(BRAIN_HOST, BRAIN_PORT);
     agent::speaker_play::start();
+    agent::wakeword::on_detected([](const std::string& w) {
+        agent::transport::send_event_json(
+            std::string("{\"event\":\"wakeword\",\"word\":\"") + w + "\"}");
+        agent::state::transition(agent::state::Mode::Listening);
+    });
+    agent::wakeword::start();
     agent::mic_pump::start();
 
-    mclog::tagInfo(TAG, "phase 1 running — echo loop active");
+    mclog::tagInfo(TAG, "phase 2 running — listening for wakeword");
 
     // Idle loop: pump stackchan (avatar blink/breath + motion spring) at 50 Hz.
     while (1) {

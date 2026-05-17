@@ -1,0 +1,79 @@
+"""Speech-to-text wrapper around faster-whisper.
+
+Phase 2 use case: brain accumulates 16 kHz s16le PCM frames during the
+LISTENING state, then calls `Transcriber.transcribe(pcm_bytes)` once
+the utterance ends. Returns the text.
+
+Default model is `small.en` int8 — small enough to live on CPU during
+local Mac iteration; we'll switch to GPU/cuda on the Jetson.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from faster_whisper import WhisperModel
+
+log = logging.getLogger("brain.stt")
+
+
+@dataclass
+class Transcript:
+    text: str
+    latency_ms: int
+
+
+class Transcriber:
+    """Lazy-loads the model on first transcribe; subsequent calls reuse it."""
+
+    def __init__(
+        self,
+        model_name: str = "small.en",
+        device: str = "auto",
+        compute_type: str = "int8",
+    ) -> None:
+        self.model_name = model_name
+        self.device = device
+        self.compute_type = compute_type
+        self._model: WhisperModel | None = None
+
+    def _load(self) -> WhisperModel:
+        if self._model is None:
+            log.info(
+                "loading whisper model %s (device=%s, compute_type=%s)",
+                self.model_name,
+                self.device,
+                self.compute_type,
+            )
+            t0 = time.monotonic()
+            self._model = WhisperModel(
+                self.model_name, device=self.device, compute_type=self.compute_type
+            )
+            log.info("whisper loaded in %.1fs", time.monotonic() - t0)
+        return self._model
+
+    def transcribe(self, pcm: bytes) -> Transcript:
+        """Transcribe a buffer of 16 kHz s16le mono PCM samples."""
+        if not pcm:
+            return Transcript(text="", latency_ms=0)
+
+        model = self._load()
+        audio = (
+            np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        )
+        t0 = time.monotonic()
+        segments, _info = model.transcribe(
+            audio,
+            language="en",
+            beam_size=1,
+            # Short utterances; word timestamps and VAD aren't needed.
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        ms = int((time.monotonic() - t0) * 1000)
+        log.info("stt: %d ms, %d bytes → %r", ms, len(pcm), text)
+        return Transcript(text=text, latency_ms=ms)
