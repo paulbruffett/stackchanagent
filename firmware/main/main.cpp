@@ -5,9 +5,11 @@
  * unused factory HAL modules). Replaces M5's mooncake/apps app-launcher layer
  * with a single agentic loop that connects to the Python brain on the LAN.
  *
- * Phase 1 (current): HAL init, render the avatar, bring up Wi-Fi, open a
- * WebSocket to the brain, and pipe mic→brain / brain→speaker for an echo
- * loopback test. No wakeword or agent logic yet.
+ * Through Phase 3: HAL init → avatar → servo sweep → Wi-Fi → WebSocket →
+ * wakeword arm → state machine running. Brain handles wakeword event →
+ * mic stream → STT → Claude tool-use turn → TTS playback. Tools the brain
+ * can call: set_expression, look_at (set_motion_rate not yet wired
+ * firmware-side; IdleMotionModifier install is Phase 6).
  */
 #include <cstddef>
 #include <cstdint>
@@ -60,7 +62,7 @@ extern "C" void app_main(void)
         GetHAL().lvglUnlock();
     }
 
-    mclog::tagInfo(TAG, "phase 1 main — bring-up check");
+    mclog::tagInfo(TAG, "bring-up check");
 
     // Visible servo sweep. Angles are tenths of a degree (yaw limit ±1280
     // = ±128°, pitch limit 30..870 = 3..87°).
@@ -97,7 +99,9 @@ extern "C" void app_main(void)
         mclog::tagInfo(TAG, "net: {}", msg);
     });
 
-    // Phase 2: wakeword → LISTENING → STT → SPEAKING → TTS playback.
+    // Wakeword → LISTENING → STT → SPEAKING → TTS playback. JSON commands
+    // from the brain land in commands::dispatch (set_expression, look_at,
+    // start/stop_speaking, stop_listening).
     agent::transport::set_on_audio(
         [](const int16_t* samples, size_t n) { agent::speaker_play::push(samples, n); });
     agent::transport::set_on_json(
@@ -112,7 +116,7 @@ extern "C" void app_main(void)
     agent::wakeword::start();
     agent::mic_pump::start();
 
-    mclog::tagInfo(TAG, "phase 2 running — listening for wakeword");
+    mclog::tagInfo(TAG, "running — listening for wakeword");
 
     // Idle loop: pump stackchan (avatar blink/breath + motion spring) at 50 Hz.
     while (1) {
