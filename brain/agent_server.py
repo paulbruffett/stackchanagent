@@ -22,11 +22,18 @@ import logging
 import socket
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo, Zeroconf
 
+# Load ANTHROPIC_API_KEY (and any other env) from the project root .env
+# before importing the agent module (which constructs the Anthropic client).
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+from claude_agent import AgentSession
 from stt import Transcriber
 from tts import Synthesizer
 
@@ -67,6 +74,7 @@ class ConnState:
     voiced_ms: int = 0
     trailing_silence_ms: int = 0
     started_at: float = 0.0
+    agent: AgentSession | None = None
 
 
 def frame_rms(frame: bytes) -> float:
@@ -109,9 +117,17 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     log.info("transcript: %r (%d ms)", transcript.text, transcript.latency_ms)
 
-    # Phase 2 placeholder: just echo the transcript back. Phase 3 swaps
-    # this for a Claude tool-use turn.
-    speak_text = f"You said: {transcript.text}"
+    # Claude tool-use turn. Tools fire as side effects (WS commands).
+    if state.agent is None:
+        state.agent = AgentSession(ws)
+    t0 = time.monotonic()
+    speak_text = await state.agent.respond(transcript.text)
+    agent_ms = int((time.monotonic() - t0) * 1000)
+    log.info("agent: %d ms, %r", agent_ms, speak_text[:120])
+
+    if not speak_text:
+        log.info("empty agent reply — going idle")
+        return
 
     t0 = time.monotonic()
     tts_pcm = tts.synthesize(speak_text)

@@ -26,3 +26,4 @@ brain/*.egg-info/
 .vscode/
 .idea/
 *.swp
+.env
