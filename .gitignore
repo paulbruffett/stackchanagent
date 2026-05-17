@@ -1,0 +1,28 @@
+# ESP-IDF build artifacts
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# Vendored deps — recreated by `python3 firmware/fetch_repos.py`.
+# (Pinned versions live in firmware/repos.json which IS tracked.)
+firmware/components/
+firmware/xiaozhi-esp32/
+
+# PlatformIO build (from the Arduino attempt, preserved at firmware-arduino-bak/)
+**/.pio/
+
+# Python brain
+brain/.venv/
+brain/**/__pycache__/
+brain/**/*.pyc
+brain/*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
