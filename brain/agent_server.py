@@ -36,11 +36,22 @@ log = logging.getLogger("brain")
 
 async def handle(ws: ServerConnection) -> None:
     log.info("esp32 connected: %s", ws.remote_address)
+    audio_frames = 0
+    last_audio_log = 0.0
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
                 # Phase 1: echo audio back so the speaker plays what the mic hears.
                 await ws.send(msg)
+                audio_frames += 1
+                now = asyncio.get_event_loop().time()
+                if now - last_audio_log >= 2.0:
+                    log.info(
+                        "audio echo: %d frames so far (last frame %d bytes)",
+                        audio_frames,
+                        len(msg),
+                    )
+                    last_audio_log = now
             elif isinstance(msg, bytes) and msg and msg[0] == OP_JPEG:
                 log.debug("jpeg frame, %d bytes", len(msg) - 1)
             elif isinstance(msg, str):
@@ -50,27 +61,47 @@ async def handle(ws: ServerConnection) -> None:
                     log.warning("bad json from esp32: %r", msg[:120])
                     continue
                 log.info("event: %s", payload)
+            elif isinstance(msg, bytes):
+                log.warning(
+                    "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)
+                )
             else:
-                log.warning("unexpected frame type / opcode: %r", msg[:8] if msg else msg)
+                log.warning("unexpected frame type: %r", type(msg).__name__)
     except Exception:
         log.exception("connection error")
     finally:
         log.info("esp32 disconnected")
 
 
-def advertise_mdns() -> tuple[Zeroconf, ServiceInfo]:
-    zc = Zeroconf()
-    ip = socket.gethostbyname(socket.gethostname())
-    info = ServiceInfo(
-        type_="_ws._tcp.local.",
-        name=f"{MDNS_NAME}._ws._tcp.local.",
-        addresses=[socket.inet_aton(ip)],
-        port=PORT,
-        server=f"{MDNS_NAME}.local.",
-    )
-    zc.register_service(info)
-    log.info("mDNS: advertising %s.local at %s:%d", MDNS_NAME, ip, PORT)
-    return zc, info
+def advertise_mdns() -> tuple[Zeroconf, ServiceInfo] | tuple[None, None]:
+    """Register stackchan-brain.local via zeroconf.
+
+    On macOS, port 5353 is held by the system mdnsresponder and zeroconf's
+    register_service can time out. We treat that as non-fatal — for local
+    testing the firmware can be pointed at the host's existing `.local`
+    hostname (e.g. `Pauls-Mac-mini.local`) directly.
+    """
+    try:
+        zc = Zeroconf()
+        ip = socket.gethostbyname(socket.gethostname())
+        info = ServiceInfo(
+            type_="_ws._tcp.local.",
+            name=f"{MDNS_NAME}._ws._tcp.local.",
+            addresses=[socket.inet_aton(ip)],
+            port=PORT,
+            server=f"{MDNS_NAME}.local.",
+        )
+        zc.register_service(info)
+        log.info("mDNS: advertising %s.local at %s:%d", MDNS_NAME, ip, PORT)
+        return zc, info
+    except Exception as exc:
+        log.warning(
+            "mDNS registration failed (%s). The brain still listens on :%d; "
+            "point the firmware at the host's existing .local hostname.",
+            exc,
+            PORT,
+        )
+        return None, None
 
 
 async def main() -> None:
@@ -84,8 +115,9 @@ async def main() -> None:
             log.info("brain listening on ws://%s:%d", HOST, PORT)
             await asyncio.Future()
     finally:
-        zc.unregister_service(info)
-        zc.close()
+        if zc is not None and info is not None:
+            zc.unregister_service(info)
+            zc.close()
 
 
 if __name__ == "__main__":
