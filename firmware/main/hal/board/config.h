@@ -5,9 +5,14 @@
 
 #include <driver/gpio.h>
 
-#define AUDIO_INPUT_REFERENCE    true
-#define AUDIO_INPUT_SAMPLE_RATE  24000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+// Wakeword (esp-sr multinet) and faster-whisper both expect 16 kHz mono.
+// Keep input and output equal — CoreS3AudioCodec asserts they match.
+// AUDIO_INPUT_REFERENCE=true adds a second physical channel carrying the
+// speaker reference for AEC. We're half-duplex by design (mic muted while
+// SPEAKING) so we don't need it; turning it off gives us clean mono mic.
+#define AUDIO_INPUT_REFERENCE    false
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
 
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_0
 #define AUDIO_I2S_GPIO_WS GPIO_NUM_33

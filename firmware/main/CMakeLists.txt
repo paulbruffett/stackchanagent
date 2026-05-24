@@ -2,9 +2,9 @@
 set(XIAOZHI_MAIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xiaozhi-esp32/main")
 
 file(GLOB_RECURSE STACK_CHAN_SOURCES
-    "apps/*.c"
-    "apps/*.cc"
-    "apps/*.cpp"
+    "agent/*.c"
+    "agent/*.cc"
+    "agent/*.cpp"
     "assets/*.c"
     "assets/*.cc"
     "assets/*.cpp"
@@ -12,8 +12,8 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
     "hal/*.cc"
     "hal/*.cpp"
     "stackchan/*.c"
-    "stackchan/*.cc"
     "stackchan/*.cpp"
+    "stackchan/*.cc"
 )
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
@@ -312,7 +312,6 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         ArduinoJson
-                        esp-now
                         mooncake
                         mooncake_log
                         smooth_ui_toolkit

@@ -261,12 +261,6 @@ public:
     void setTimezone(std::string_view tz);
     std::string getTimezone();
 
-    /* --------------------------------- EspNow --------------------------------- */
-    uitk::Signal<const std::vector<uint8_t>&> onEspNowData;
-    void startEspNow(int channel);
-    bool espNowSend(const std::vector<uint8_t>& data, const uint8_t* destAddr = nullptr);
-    void setLaserEnabled(bool enabled);
-
     /* ------------------------------- Warm Reboot ------------------------------ */
     void requestWarmReboot(int appIndex);
     int getWarmRebootTarget();
@@ -276,22 +270,6 @@ public:
     void startNetwork(std::function<void(std::string_view)> onLog);
     WifiStatus getWifiStatus();
     void startSntp();
-
-    /* -------------------------------- App center ------------------------------- */
-    app_center::AppInfoList_t fetchAppList();
-    void launchApp(std::string_view url, std::function<void(int)> onProgress);
-
-    /* --------------------------------- EzData --------------------------------- */
-    void startEzDataService(std::function<void(std::string_view)> onStartLog);
-    uitk::Signal<std::string_view> onEzdataPairCode;
-
-    /* ------------------------------- User Acount ------------------------------ */
-    UserAccountInfo_t getUserAccountInfo();
-    bool updateAccountInfo(std::function<void(std::string_view)> onLog);
-    bool unbindAccount(std::function<void(std::string_view)> onLog);
-
-    /* ----------------------------------- OTA ---------------------------------- */
-    bool updateFirmware(std::function<void(std::string_view)> onLog);
 
     /* ---------------------------------- Audio --------------------------------- */
     void setSpeakerVolume(uint8_t volume, bool permanent = false);
@@ -305,7 +283,6 @@ private:
 
     void xiaozhi_board_init();
     void lvgl_init();
-    void xiaozhi_mcp_init();
     void ble_init(bool useAltUuid);
     void servo_init();
     void head_touch_init();

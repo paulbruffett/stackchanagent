@@ -2,11 +2,12 @@
 name = "stackchan-brain"
 version = "0.1.0"
 description = "Jetson-side agent for the M5StackChan refactor"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "websockets>=12.0",
     "anthropic>=0.40.0",
     "zeroconf>=0.131.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -16,15 +17,23 @@ voice = [
     "piper-tts>=1.2.0",
     "numpy>=1.26",
 ]
-# Phase 4+: vision.
+# Phase 4+: vision. Face detection uses OpenCV's bundled Haar cascade —
+# no extra model download, no mediapipe (which keeps breaking its API
+# every minor release).
+# headless variant: no GUI libs, avoids libavdevice collision with
+# faster-whisper's `av` (PyAV) dependency.
 vision = [
-    "opencv-python>=4.9",
-    "mediapipe>=0.10",
+    "opencv-python-headless>=4.9",
 ]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+
+[tool.setuptools]
+# Brain is a flat collection of scripts run directly with .venv/bin/python;
+# we install for the dependency tree, not to ship a package.
+py-modules = []
 
 [tool.ruff]
 line-length = 100
