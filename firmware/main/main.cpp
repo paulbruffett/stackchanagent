@@ -21,6 +21,7 @@
 #include <board.h>
 #include <display/display.h>
 
+#include "agent/camera_pump.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
 #include "agent/speaker_play.h"
@@ -34,7 +35,7 @@ static constexpr const char* TAG = "stackchan";
 // On macOS where zeroconf can't bind 5353, point this at the host's own
 // .local hostname (e.g. "Pauls-Mac-mini.local") for local testing.
 // TODO: lift to a Kconfig setting.
-static constexpr const char* BRAIN_HOST = "stackchan-brain.local";
+static constexpr const char* BRAIN_HOST = "Pauls-Mac-mini.local";
 static constexpr int BRAIN_PORT = 8765;
 
 extern "C" void app_main(void)
@@ -115,6 +116,7 @@ extern "C" void app_main(void)
     });
     agent::wakeword::start();
     agent::mic_pump::start();
+    agent::camera_pump::start();
 
     mclog::tagInfo(TAG, "running — listening for wakeword");
 

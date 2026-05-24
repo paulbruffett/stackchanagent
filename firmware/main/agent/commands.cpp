@@ -39,6 +39,11 @@ void apply_set_expression(JsonDocument& doc)
     mclog::tagInfo(TAG, "expression: {}", value);
 }
 
+// Spring speed for agent-initiated look_at. The motion library maps
+// speed → stiffness/damping; 500 ≈ stock M5 default (snappy), 300 is
+// noticeably gentler. Lower if the head still moves too aggressively.
+static constexpr int kLookAtSpeed = 300;
+
 void apply_look_at(JsonDocument& doc)
 {
     // Claude speaks degrees; servos take tenths-of-degree.
@@ -51,7 +56,7 @@ void apply_look_at(JsonDocument& doc)
     if (yaw > 1280) yaw = 1280;
     if (pitch < 30) pitch = 30;
     if (pitch > 870) pitch = 870;
-    GetStackChan().motion().move(yaw, pitch);
+    GetStackChan().motion().moveWithSpeed(yaw, pitch, kLookAtSpeed);
     mclog::tagInfo(TAG, "look_at: yaw={}° pitch={}°", yaw_deg, pitch_deg);
 }
 

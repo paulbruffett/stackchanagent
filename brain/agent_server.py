@@ -34,8 +34,10 @@ from zeroconf import ServiceInfo, Zeroconf
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from claude_agent import AgentSession
+from gaze import GazeController
 from stt import Transcriber
 from tts import Synthesizer
+from vision import FaceDetector, FaceTracker
 
 HOST = "0.0.0.0"
 PORT = 8765
@@ -60,21 +62,38 @@ SILENCE_TAIL_MS = 700
 SPEECH_LEAD_MS = 200
 MAX_UTTERANCE_MS = 10000
 
+# Proactive greeting gates.
+GREETING_COOLDOWN_S = 300.0   # at most one greeting per 5 minutes per conn
+RECENT_INTERACTION_S = 90.0   # silent if user has spoken in the last 90 s
+
 log = logging.getLogger("brain")
 
 # Lazy globals — one model load per process.
 stt = Transcriber()
 tts = Synthesizer()
+# FaceDetector wraps mediapipe state; safe to share across connections
+# only if .process calls aren't concurrent. Per-conn instances are
+# simpler and the model is tiny — instantiate lazily on first JPEG.
 
 
 @dataclass
 class ConnState:
     listening: bool = False
+    speaking: bool = False
     speech_buf: bytearray = field(default_factory=bytearray)
     voiced_ms: int = 0
     trailing_silence_ms: int = 0
     started_at: float = 0.0
     agent: AgentSession | None = None
+    latest_jpeg: bytes | None = None
+    face_detector: FaceDetector | None = None
+    face_tracker: FaceTracker = field(default_factory=FaceTracker)
+    gaze: GazeController = field(default_factory=GazeController)
+    last_user_interaction_s: float = 0.0
+    last_greeting_s: float = 0.0
+    # Set while a vision/detection task is in flight, so we drop overlapping
+    # frames rather than queuing detections behind a slow mediapipe call.
+    detecting: bool = False
 
 
 def frame_rms(frame: bytes) -> float:
@@ -100,6 +119,37 @@ async def send_pcm_stream(ws: ServerConnection, pcm: bytes) -> None:
         await asyncio.sleep(FRAME_MS / 1000 * 0.8)
 
 
+def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
+    if state.agent is None:
+        state.agent = AgentSession(
+            ws,
+            get_latest_jpeg=lambda: state.latest_jpeg,
+            on_external_head_move=state.gaze.notify_head_moved,
+        )
+    return state.agent
+
+
+async def speak(ws: ServerConnection, state: ConnState, text: str) -> None:
+    """Synthesize `text`, stream the audio to firmware, manage SPEAKING."""
+    t0 = time.monotonic()
+    tts_pcm = tts.synthesize(text)
+    tts_ms = int((time.monotonic() - t0) * 1000)
+    log.info(
+        "tts ready: %d ms, %d bytes (%.2f s of audio)",
+        tts_ms,
+        len(tts_pcm),
+        len(tts_pcm) / (SAMPLE_RATE * 2),
+    )
+
+    state.speaking = True
+    try:
+        await ws.send(json.dumps({"cmd": "start_speaking"}))
+        await send_pcm_stream(ws, tts_pcm)
+        await ws.send(json.dumps({"cmd": "stop_speaking"}))
+    finally:
+        state.speaking = False
+
+
 async def respond(ws: ServerConnection, state: ConnState) -> None:
     """Run STT → TTS → playback on the buffered speech, then go back to IDLE."""
     pcm = bytes(state.speech_buf)
@@ -117,11 +167,9 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     log.info("transcript: %r (%d ms)", transcript.text, transcript.latency_ms)
 
-    # Claude tool-use turn. Tools fire as side effects (WS commands).
-    if state.agent is None:
-        state.agent = AgentSession(ws)
+    agent = ensure_agent(ws, state)
     t0 = time.monotonic()
-    speak_text = await state.agent.respond(transcript.text)
+    speak_text = await agent.respond(transcript.text)
     agent_ms = int((time.monotonic() - t0) * 1000)
     log.info("agent: %d ms, %r", agent_ms, speak_text[:120])
 
@@ -129,19 +177,72 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         log.info("empty agent reply — going idle")
         return
 
-    t0 = time.monotonic()
-    tts_pcm = tts.synthesize(speak_text)
-    tts_ms = int((time.monotonic() - t0) * 1000)
-    log.info(
-        "tts ready: %d ms, %d bytes (%.2f s of audio)",
-        tts_ms,
-        len(tts_pcm),
-        len(tts_pcm) / (SAMPLE_RATE * 2),
-    )
+    await speak(ws, state, speak_text)
+    state.last_user_interaction_s = time.monotonic()
 
-    await ws.send(json.dumps({"cmd": "start_speaking"}))
-    await send_pcm_stream(ws, tts_pcm)
-    await ws.send(json.dumps({"cmd": "stop_speaking"}))
+
+async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
+    """Run an agent turn triggered by a non-speech event (new face seen).
+    Bypasses STT and uses a stage-direction message instead."""
+    now = time.monotonic()
+    if state.listening or state.speaking:
+        return
+    if now - state.last_greeting_s < GREETING_COOLDOWN_S:
+        return
+    if now - state.last_user_interaction_s < RECENT_INTERACTION_S:
+        return
+
+    state.last_greeting_s = now
+    log.info("proactive greeting: new face")
+
+    agent = ensure_agent(ws, state)
+    t0 = time.monotonic()
+    speak_text = await agent.respond_to_event(
+        "A new person just appeared in front of you. Greet them in one short, "
+        "friendly sentence."
+    )
+    log.info(
+        "greet agent: %d ms, %r",
+        int((time.monotonic() - t0) * 1000), speak_text[:120],
+    )
+    if speak_text:
+        await speak(ws, state, speak_text)
+
+
+async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
+    """Run face detection + gaze update + proactive-greeting check on the
+    most recent JPEG. Skipped if a previous detection is still running,
+    so a slow frame doesn't queue up backlogged work — we always look at
+    the newest available frame instead."""
+    if state.detecting:
+        return
+    jpeg = state.latest_jpeg
+    if jpeg is None:
+        return
+
+    if state.face_detector is None:
+        try:
+            state.face_detector = FaceDetector()
+        except Exception:
+            log.exception("FaceDetector init failed — disabling vision")
+            return
+
+    state.detecting = True
+    try:
+        faces = await asyncio.to_thread(state.face_detector.detect, jpeg)
+    except Exception:
+        log.exception("face detect failed")
+        state.detecting = False
+        return
+    state.detecting = False
+
+    new_face = state.face_tracker.update(faces)
+
+    if faces and not state.speaking:
+        await state.gaze.update(faces[0], ws)
+
+    if new_face:
+        asyncio.create_task(proactive_greet(ws, state))
 
 
 async def handle(ws: ServerConnection) -> None:
@@ -179,7 +280,10 @@ async def handle(ws: ServerConnection) -> None:
                     )
                     await respond(ws, state)
             elif isinstance(msg, bytes) and msg and msg[0] == OP_JPEG:
-                log.debug("jpeg frame, %d bytes", len(msg) - 1)
+                jpeg = bytes(msg[1:])
+                log.debug("jpeg frame, %d bytes", len(jpeg))
+                state.latest_jpeg = jpeg
+                asyncio.create_task(process_latest_jpeg(ws, state))
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)
@@ -193,6 +297,7 @@ async def handle(ws: ServerConnection) -> None:
                     state.voiced_ms = 0
                     state.trailing_silence_ms = 0
                     state.started_at = time.monotonic()
+                    state.last_user_interaction_s = time.monotonic()
             elif isinstance(msg, bytes):
                 log.warning(
                     "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)
@@ -243,7 +348,12 @@ async def main() -> None:
     )
     zc, info = advertise_mdns()
     try:
-        async with serve(handle, HOST, PORT, max_size=2**20):
+        # ping_interval=None: the 78/esp-ml307 WebSocket on the firmware
+        # doesn't reply to pings, so server-side keepalive trips the
+        # connection every ~50 s. We accept the lost dead-conn detection.
+        async with serve(
+            handle, HOST, PORT, max_size=2**20, ping_interval=None
+        ):
             log.info("brain listening on ws://%s:%d", HOST, PORT)
             await asyncio.Future()
     finally:

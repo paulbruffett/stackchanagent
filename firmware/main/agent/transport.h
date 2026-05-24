@@ -32,6 +32,10 @@ bool is_connected();
 // OP_AUDIO. Returns false if the link is down (frame is dropped, no queue).
 bool send_audio(const int16_t* samples, size_t sample_count);
 
+// Send a JPEG frame prefixed with OP_JPEG. Returns false if the link is
+// down (frame is dropped, no queue).
+bool send_jpeg(const uint8_t* jpeg, size_t len);
+
 // Send a JSON text frame. Pass a complete JSON string.
 bool send_event_json(std::string_view json);
 

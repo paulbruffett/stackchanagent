@@ -159,21 +159,35 @@ bool is_connected()
     return state().connected.load();
 }
 
-bool send_audio(const int16_t* samples, size_t sample_count)
+namespace {
+
+bool send_binary(uint8_t op, const uint8_t* payload, size_t len)
 {
     auto& s = state();
     if (!s.connected.load()) return false;
 
-    size_t payload_bytes = sample_count * sizeof(int16_t);
     std::vector<uint8_t> buf;
-    buf.reserve(1 + payload_bytes);
-    buf.push_back(OP_AUDIO);
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(samples);
-    buf.insert(buf.end(), p, p + payload_bytes);
+    buf.reserve(1 + len);
+    buf.push_back(op);
+    buf.insert(buf.end(), payload, payload + len);
 
     std::lock_guard<std::mutex> lock(s.mu);
     if (!s.ws) return false;
     return s.ws->Send(buf.data(), buf.size(), /*binary=*/true);
+}
+
+}  // namespace
+
+bool send_audio(const int16_t* samples, size_t sample_count)
+{
+    return send_binary(OP_AUDIO,
+                       reinterpret_cast<const uint8_t*>(samples),
+                       sample_count * sizeof(int16_t));
+}
+
+bool send_jpeg(const uint8_t* jpeg, size_t len)
+{
+    return send_binary(OP_JPEG, jpeg, len);
 }
 
 bool send_event_json(std::string_view json)
