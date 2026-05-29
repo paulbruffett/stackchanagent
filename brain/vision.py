@@ -69,12 +69,14 @@ class FaceDetector:
         # scaleFactor=1.1: standard tradeoff between speed/accuracy.
         # minNeighbors=4: drop ~half the false positives at the cost of
         # missing a few real faces.
-        # minSize=(40,40): ignore tiny faces — at 320×240 that's anything
-        # smaller than ~12% of the frame.
+        # minSize=(30,30): ignore tiny faces — at 320×240 that's anything
+        # smaller than ~10% of the frame. Lower this if you sit farther
+        # from the robot and want it to notice you.
         rects = self._cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
+            gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30)
         )
         if len(rects) == 0:
+            log.info("detect: %dx%d, 0 faces", iw, ih)
             return []
 
         faces: list[Face] = []
@@ -90,6 +92,11 @@ class FaceDetector:
             )
         # Largest first — gaze controller picks faces[0].
         faces.sort(key=lambda f: f.w * f.h, reverse=True)
+        log.info(
+            "detect: %dx%d, %d face(s); largest cx=%.2f cy=%.2f w=%.2f",
+            iw, ih, len(faces),
+            faces[0].cx, faces[0].cy, faces[0].w,
+        )
         return faces
 
 

@@ -263,7 +263,8 @@ void StackChanAvatarDisplay::SetupUI()
     stackchan.addModifier(std::make_unique<BreathModifier>());
     blink_modifier_id_ = stackchan.addModifier(std::make_unique<BlinkModifier>());
     stackchan.addModifier(std::make_unique<HeadPetModifier>());
-    stackchan.addModifier(std::make_unique<ImuEventModifier>());
+    // ImuEventModifier disabled: was hijacking the spring with goHome() any
+    // time servo motion shook the chassis hard enough to trip the IMU.
 
     preview_image_ = lv_image_create(lv_screen_active());
     lv_obj_set_size(preview_image_, 320, 240);
@@ -274,6 +275,10 @@ void StackChanAvatarDisplay::SetupUI()
 
     auto config        = hal_bridge::get_xiaozhi_config();
     idle_motion_level_ = config.idleRandomMovementLevel;
+    // Phase-6 diagnostic: pin idle servo motion off to test whether
+    // IdleMotionModifier is the source of the post-look_at yaw spikes.
+    // Revert once the trace is captured.
+    idle_motion_level_ = 0;
 
     ESP_LOGI(TAG, "Avatar created and started");
 }

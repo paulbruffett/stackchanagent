@@ -33,8 +33,9 @@ from zeroconf import ServiceInfo, Zeroconf
 # before importing the agent module (which constructs the Anthropic client).
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+from behavior import IdleBehavior
 from claude_agent import AgentSession
-from gaze import GazeController
+from memory import Memory
 from stt import Transcriber
 from tts import Synthesizer
 from vision import FaceDetector, FaceTracker
@@ -63,17 +64,26 @@ SPEECH_LEAD_MS = 200
 MAX_UTTERANCE_MS = 10000
 
 # Proactive greeting gates.
-GREETING_COOLDOWN_S = 300.0   # at most one greeting per 5 minutes per conn
+GREETING_COOLDOWN_S = 1800.0  # at most one greeting per 30 minutes per conn
 RECENT_INTERACTION_S = 90.0   # silent if user has spoken in the last 90 s
+
+# Face-detection cadence. The camera_pump on firmware fires every ~1.5 s
+# regardless (so describe_view always has a recent frame), but we only
+# RUN detection at these intervals to save CPU + avoid noisy tracking.
+# During a look-around sweep we detect every frame, since the robot is
+# actively looking around and a fresh detection should redirect it.
+DETECT_INTERVAL_IDLE_S = 20.0          # default: 20 s between face checks
+DETECT_INTERVAL_LOOK_AROUND_S = 0.0    # 0 = every frame (~1.5 s)
 
 log = logging.getLogger("brain")
 
 # Lazy globals — one model load per process.
 stt = Transcriber()
 tts = Synthesizer()
-# FaceDetector wraps mediapipe state; safe to share across connections
-# only if .process calls aren't concurrent. Per-conn instances are
-# simpler and the model is tiny — instantiate lazily on first JPEG.
+# Single shared Memory across all WS connections, so the robot
+# remembers conversations even after a disconnect/reconnect or process
+# restart. Sqlite handles file locking; only one process should write.
+memory = Memory()
 
 
 @dataclass
@@ -88,9 +98,10 @@ class ConnState:
     latest_jpeg: bytes | None = None
     face_detector: FaceDetector | None = None
     face_tracker: FaceTracker = field(default_factory=FaceTracker)
-    gaze: GazeController = field(default_factory=GazeController)
+    behavior: IdleBehavior = field(default_factory=IdleBehavior)
     last_user_interaction_s: float = 0.0
     last_greeting_s: float = 0.0
+    last_detect_s: float = 0.0
     # Set while a vision/detection task is in flight, so we drop overlapping
     # frames rather than queuing detections behind a slow mediapipe call.
     detecting: bool = False
@@ -123,8 +134,9 @@ def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
     if state.agent is None:
         state.agent = AgentSession(
             ws,
+            memory=memory,
             get_latest_jpeg=lambda: state.latest_jpeg,
-            on_external_head_move=state.gaze.notify_head_moved,
+            on_external_head_move=state.behavior.notify_head_moved,
         )
     return state.agent
 
@@ -186,10 +198,16 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
     Bypasses STT and uses a stage-direction message instead."""
     now = time.monotonic()
     if state.listening or state.speaking:
+        log.info("greet skipped: busy (listening=%s speaking=%s)",
+                 state.listening, state.speaking)
         return
     if now - state.last_greeting_s < GREETING_COOLDOWN_S:
+        log.info("greet skipped: cooldown (%.0fs since last)",
+                 now - state.last_greeting_s)
         return
     if now - state.last_user_interaction_s < RECENT_INTERACTION_S:
+        log.info("greet skipped: recent interaction (%.0fs ago)",
+                 now - state.last_user_interaction_s)
         return
 
     state.last_greeting_s = now
@@ -238,8 +256,8 @@ async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
 
     new_face = state.face_tracker.update(faces)
 
-    if faces and not state.speaking:
-        await state.gaze.update(faces[0], ws)
+    in_conversation = state.listening or state.speaking
+    await state.behavior.tick(ws, faces, in_conversation)
 
     if new_face:
         asyncio.create_task(proactive_greet(ws, state))
@@ -282,8 +300,17 @@ async def handle(ws: ServerConnection) -> None:
             elif isinstance(msg, bytes) and msg and msg[0] == OP_JPEG:
                 jpeg = bytes(msg[1:])
                 log.debug("jpeg frame, %d bytes", len(jpeg))
+                # Always keep the latest frame around for describe_view,
+                # but only RUN detection at the configured cadence.
                 state.latest_jpeg = jpeg
-                asyncio.create_task(process_latest_jpeg(ws, state))
+                interval = (
+                    DETECT_INTERVAL_LOOK_AROUND_S
+                    if state.behavior.look_around_in_progress
+                    else DETECT_INTERVAL_IDLE_S
+                )
+                if time.monotonic() - state.last_detect_s >= interval:
+                    state.last_detect_s = time.monotonic()
+                    asyncio.create_task(process_latest_jpeg(ws, state))
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)

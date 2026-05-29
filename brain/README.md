@@ -6,22 +6,47 @@ and periodic vision.
 
 ## Install
 
+All runtime deps (websockets, anthropic, faster-whisper, piper-tts,
+opencv-headless, numpy) are required and live in the base dependency
+list — there are no optional groups to opt into.
+
+With `uv` (recommended on the Jetson):
+
+```bash
+cd brain
+uv sync
+```
+
+Or with plain pip:
+
 ```bash
 cd brain
 python -m venv .venv && source .venv/bin/activate
-pip install -e .              # phase 1: just websockets + zeroconf + anthropic
-# pip install -e '.[voice]'   # phase 2+
-# pip install -e '.[vision]'  # phase 4+
+pip install -e .
 ```
+
+`ANTHROPIC_API_KEY` is loaded from a `.env` at the repo root (one level
+above `brain/`). Create it once:
+
+```bash
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > ../.env
+```
+
+First-run downloads (cached afterwards):
+- Piper voice (`en_US-amy-medium`) → `~/.cache/piper-voices/`
+- Whisper model (`small.en` int8) → `~/.cache/huggingface/`
 
 ## Run
 
 ```bash
-python agent_server.py
+uv run agent_server.py
+# or, in the venv: python agent_server.py
 ```
 
-Advertises `stackchan-brain.local` via mDNS on port 8765. The firmware
-resolves that name at boot — no IP config needed.
+Listens on `0.0.0.0:8765`. Also attempts to advertise
+`stackchan-brain.local` via mDNS — non-fatal if it fails (the firmware
+can be pointed at a literal IP via `idf.py menuconfig` → Stackchan
+Brain → Brain host).
 
 ## Phase 1 verification
 
