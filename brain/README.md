@@ -14,8 +14,13 @@ With `uv` (recommended on the Jetson):
 
 ```bash
 cd brain
-uv sync
+uv sync   # auto-fetches CPython 3.12 if the system Python is older
 ```
+
+Python 3.11+ is required (`onnxruntime`, pulled in by `piper-tts`,
+dropped 3.10 wheels). On Jetson Ubuntu 22.04 the system Python is 3.10,
+so `uv` downloads a managed `python-build-standalone` aarch64 build —
+the system Python is left untouched.
 
 Or with plain pip:
 
