@@ -8,23 +8,16 @@ dependencies = [
     "anthropic>=0.40.0",
     "zeroconf>=0.131.0",
     "python-dotenv>=1.0",
+    "numpy>=1.26",
+    "faster-whisper>=1.0.3",
+    "piper-tts>=1.2.0",
+    # Face detection uses OpenCV's bundled Haar cascade — no extra model
+    # download, no mediapipe. headless variant: no GUI libs, avoids
+    # libavdevice collision with faster-whisper's `av` (PyAV) dependency.
+    "opencv-python-headless>=4.9",
 ]
 
 [project.optional-dependencies]
-# Phase 2+: STT and TTS. Heavy installs; keep optional during early phases.
-voice = [
-    "faster-whisper>=1.0.3",
-    "piper-tts>=1.2.0",
-    "numpy>=1.26",
-]
-# Phase 4+: vision. Face detection uses OpenCV's bundled Haar cascade —
-# no extra model download, no mediapipe (which keeps breaking its API
-# every minor release).
-# headless variant: no GUI libs, avoids libavdevice collision with
-# faster-whisper's `av` (PyAV) dependency.
-vision = [
-    "opencv-python-headless>=4.9",
-]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",

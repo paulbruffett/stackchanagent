@@ -911,6 +911,28 @@ endmenu
 
 endmenu
 
+menu "Stackchan Brain"
+
+config BRAIN_HOST
+    string "Brain host (mDNS name or IP)"
+    default "stackchan-brain.local"
+    help
+        Hostname or IP the firmware connects to for the Python brain.
+        Production default: "stackchan-brain.local" (advertised by the
+        Jetson via avahi). For Mac dev where zeroconf can't bind :5353,
+        set this to your Mac's own .local hostname (e.g.
+        "Pauls-Mac-mini.local"). Change via `idf.py menuconfig` →
+        "Stackchan Brain" → "Brain host".
+
+config BRAIN_PORT
+    int "Brain WebSocket port"
+    default 8765
+    range 1 65535
+    help
+        TCP port the brain's WebSocket server listens on.
+
+endmenu
+
 menu "BLE prph Configuration"
 
     choice EXAMPLE_USE_IO_TYPE

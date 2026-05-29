@@ -1,17 +1,24 @@
 """Claude tool-use loop for the agentic conversation turn.
 
-Maintains per-connection message history and runs the standard Anthropic
-SDK loop: call → if tool_use, dispatch tool, append result, call again,
-else return the final text. Prompt caching is enabled on the system
-prompt and tool definitions (both stable across turns).
+Maintains conversation history in SQLite (via memory.Memory) so the
+robot remembers prior chats across WS reconnects and process restarts.
+Runs the standard Anthropic SDK loop: call → if tool_use, dispatch
+tool, append result, call again, else return the final text.
 
-Default model: claude-haiku-4-5 (fast + cheap for conversational turns).
-Escalation to claude-sonnet-4-6 will come in Phase 6 when we add image
-input via describe_view.
+Prompt structure (cached prefix in *brackets*):
+  system: [
+    [base SYSTEM_PROMPT],
+    [known_facts text, if any],
+    [summaries text, if any],            ← cache_control here
+  ]
+  messages: unsummarized turns from SQLite + the current turn
+
+Default model: claude-haiku-4-5. Sonnet escalation is Phase 6.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable
 
@@ -19,6 +26,7 @@ from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
 import tools
+from memory import Memory, Turn
 
 log = logging.getLogger("brain.agent")
 
@@ -28,7 +36,7 @@ SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a
 - No markdown, lists, code blocks, or special characters that don't read well aloud.
 - Don't say "I am an AI" or apologize for your nature.
 
-You have tools to change your facial expression, point your head, adjust how often you fidget, look at the camera (describe_view) when asked a visual question, and end the conversation. Use them naturally to be expressive, not on every turn. If the user asks you to "move less" or "be still", call set_motion_rate with a low number.
+You have tools to change your facial expression, point your head, look at the camera (describe_view) when asked a visual question, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
 Lines in [square brackets] are stage directions — things happening in the room, not the user speaking. Respond appropriately (for example, greet someone who's just appeared) but don't read the bracketed text aloud.
 
@@ -37,22 +45,52 @@ Stay in character: curious, friendly, a little informal."""
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
 
+# Rolling summarizer thresholds. Once the unsummarized backlog reaches
+# SUMMARIZE_TRIGGER, fold the oldest half into a Haiku summary, keeping
+# at least KEEP_RECENT_TURNS verbatim. Numbers picked so the verbatim
+# tail still contains 4–5 user turns of context.
+SUMMARIZE_TRIGGER = 20
+KEEP_RECENT_TURNS = 10
+
+SUMMARIZE_SYSTEM = (
+    "You are summarizing a conversation between a user and Stack-Chan, "
+    "a small desktop robot. Produce a concise summary (2-4 sentences) "
+    "that preserves: who said what, any facts mentioned about the user "
+    "or world, tools the robot called and why, and the emotional tone. "
+    "Write in past tense. Do not include greetings or pleasantries that "
+    "weren't substantive."
+)
+
 
 class AgentSession:
-    """One agent state per WebSocket connection. Tracks rolling history."""
+    """One agent state per WebSocket connection, backed by shared
+    persistent memory. Tracks rolling history in-memory and writes
+    every message through to SQLite for replay on the next session."""
 
     def __init__(
         self,
         ws: ServerConnection,
+        memory: Memory,
         get_latest_jpeg: Callable[[], bytes | None] | None = None,
         on_external_head_move: Callable[[float, float], None] | None = None,
     ) -> None:
         self.ws = ws
         self.client = AsyncAnthropic()
-        self.messages: list[dict[str, Any]] = []
+        self.memory = memory
+        # Serializes user turns and the background summarizer so
+        # self.messages isn't rewritten mid-call.
+        self._turn_lock = asyncio.Lock()
+        # Hydrate in-memory thread from any unsummarized history.
+        self.messages: list[dict[str, Any]] = [
+            {"role": t.role, "content": t.content}
+            for t in memory.list_unsummarized_turns()
+        ]
+        if self.messages:
+            log.info("hydrated %d turns from memory", len(self.messages))
         self._tool_ctx = tools.ToolContext(
             ws=ws,
             client=self.client,
+            memory=memory,
             get_latest_jpeg=get_latest_jpeg or (lambda: None),
             on_external_head_move=(
                 on_external_head_move or (lambda y, p: None)
@@ -60,40 +98,67 @@ class AgentSession:
         )
 
     async def respond(self, user_text: str) -> str:
-        """Run a full agent turn. Returns the assistant's spoken reply.
-        Tools fire as side effects (WS commands to the firmware)."""
-        self.messages.append({"role": "user", "content": user_text})
-        return await self._run_loop()
+        """Run a full agent turn off a transcribed user utterance."""
+        async with self._turn_lock:
+            self._append({"role": "user", "content": user_text})
+            return await self._run_loop()
 
     async def respond_to_event(self, stage_direction: str) -> str:
-        """Same as respond(), but the input is a brain-injected stage
-        direction (proactive greeting on new face, etc.) rather than a
-        user utterance. Wrapped in [brackets] so the system prompt's
-        rule kicks in."""
-        self.messages.append(
-            {"role": "user", "content": f"[{stage_direction}]"}
-        )
-        return await self._run_loop()
+        """Run an agent turn off a brain-injected stage direction
+        (proactive greeting on new face, etc.) instead of a user
+        utterance. Wrapped in [brackets] so the system prompt's rule
+        kicks in."""
+        async with self._turn_lock:
+            self._append({"role": "user", "content": f"[{stage_direction}]"})
+            return await self._run_loop()
+
+    def _append(self, message: dict[str, Any]) -> None:
+        """Append to the live thread AND persist to SQLite."""
+        self.messages.append(message)
+        self.memory.append_turn(message["role"], message["content"])
+
+    def _build_system(self) -> list[dict[str, Any]]:
+        system: list[dict[str, Any]] = [
+            {"type": "text", "text": SYSTEM_PROMPT}
+        ]
+
+        facts = self.memory.list_facts()
+        if facts:
+            facts_text = (
+                "Things you've been told to remember about the user or "
+                "your shared context (most recent first):\n"
+                + "\n".join(f"- {f}" for f in reversed(facts))
+            )
+            system.append({"type": "text", "text": facts_text})
+
+        summaries = self.memory.list_summaries()
+        if summaries:
+            summary_text = (
+                "Earlier in your conversation history with this user "
+                "(oldest first):\n"
+                + "\n\n".join(s.summary for s in summaries)
+            )
+            system.append({"type": "text", "text": summary_text})
+
+        # Cache the entire stable prefix — invalidates only when a new
+        # fact or summary is added, then re-caches for the next batch
+        # of turns.
+        system[-1]["cache_control"] = {"type": "ephemeral"}
+        return system
 
     async def _run_loop(self) -> str:
         while True:
             response = await self.client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
+                system=self._build_system(),
                 tools=tools.TOOL_DEFS,
                 messages=self.messages,
             )
 
-            # Append the assistant turn verbatim (preserves tool_use blocks
-            # so the next turn's tool_results can reference them).
-            self.messages.append(
+            # Persist the assistant turn verbatim — preserves tool_use
+            # blocks so the next turn's tool_results stay valid.
+            self._append(
                 {"role": "assistant", "content": response.content}
             )
 
@@ -109,6 +174,7 @@ class AgentSession:
                     response.usage.cache_read_input_tokens,
                     response.usage.cache_creation_input_tokens,
                 )
+                asyncio.create_task(_maybe_summarize(self))
                 return text
 
             tool_results: list[dict[str, Any]] = []
@@ -126,4 +192,105 @@ class AgentSession:
                         "content": result,
                     }
                 )
-            self.messages.append({"role": "user", "content": tool_results})
+            self._append({"role": "user", "content": tool_results})
+
+
+def _last_complete_assistant_id(turns: list[Turn], up_to_idx: int) -> int | None:
+    """Walk back from up_to_idx-1 looking for an assistant message whose
+    content has no pending tool_use block. Returns that turn's id, or
+    None if none found. Splitting a summary in the middle of a tool-use
+    loop would leave orphan tool_use/tool_result pairs in the replay."""
+    for i in range(up_to_idx - 1, -1, -1):
+        t = turns[i]
+        if t.role != "assistant":
+            continue
+        content = t.content
+        if isinstance(content, str):
+            return t.id
+        if isinstance(content, list):
+            has_tool_use = any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in content
+            )
+            if not has_tool_use:
+                return t.id
+    return None
+
+
+def _render_turn(turn: Turn) -> str:
+    speaker = "User" if turn.role == "user" else "Stack-Chan"
+    content = turn.content
+    if isinstance(content, str):
+        return f"{speaker}: {content}"
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                tname = block.get("name", "?")
+                tinput = block.get("input", {})
+                parts.append(f"[tool {tname}({tinput})]")
+            elif btype == "tool_result":
+                parts.append(f"[tool result: {block.get('content', '')}]")
+        joined = " ".join(p for p in parts if p)
+        return f"{speaker}: {joined}"
+    return f"{speaker}: <unrenderable>"
+
+
+async def _maybe_summarize(session: "AgentSession") -> None:
+    """Background: if the unsummarized backlog is large, summarize the
+    oldest complete-exchange chunk via Haiku and mark those rows
+    summarized. Uses the session's turn lock so it can't race with a
+    concurrent user turn rewriting self.messages."""
+    if session.memory.unsummarized_count() < SUMMARIZE_TRIGGER:
+        return
+    async with session._turn_lock:
+        turns = session.memory.list_unsummarized_turns()
+        if len(turns) < SUMMARIZE_TRIGGER:
+            return  # raced with another summarize
+        cutoff_id = _last_complete_assistant_id(
+            turns, len(turns) - KEEP_RECENT_TURNS
+        )
+        if cutoff_id is None:
+            log.warning(
+                "summarizer: no complete-exchange boundary in first %d turns",
+                len(turns) - KEEP_RECENT_TURNS,
+            )
+            return
+        span = [t for t in turns if t.id <= cutoff_id]
+        transcript = "\n".join(_render_turn(t) for t in span)
+
+        log.info(
+            "summarizing turns %d..%d (%d msgs)",
+            span[0].id, span[-1].id, len(span),
+        )
+        try:
+            resp = await session.client.messages.create(
+                model=MODEL,
+                max_tokens=400,
+                system=[{"type": "text", "text": SUMMARIZE_SYSTEM}],
+                messages=[{"role": "user", "content": transcript}],
+            )
+            summary = " ".join(
+                b.text for b in resp.content if b.type == "text"
+            ).strip()
+        except Exception:
+            log.exception("summarizer call failed")
+            return
+
+        if not summary:
+            log.warning("summarizer returned empty text")
+            return
+
+        session.memory.save_summary(span[0].id, span[-1].id, summary)
+        log.info("summary saved (%d chars): %r", len(summary), summary[:160])
+
+        # Reset the in-memory thread to match the new persisted state.
+        session.messages = [
+            {"role": t.role, "content": t.content}
+            for t in session.memory.list_unsummarized_turns()
+        ]

@@ -40,9 +40,11 @@ void apply_set_expression(JsonDocument& doc)
 }
 
 // Spring speed for agent-initiated look_at. The motion library maps
-// speed → stiffness/damping; 500 ≈ stock M5 default (snappy), 300 is
-// noticeably gentler. Lower if the head still moves too aggressively.
-static constexpr int kLookAtSpeed = 300;
+// speed → stiffness via k = 10 + (speed/1000)^2 * 640. 500 ≈ stock M5
+// default (snappy, k=170), 300 is gentler (k≈68), 250 is moderately
+// gentle (k≈50), 200 is the slowest that still tracks (k≈36).
+// Lower numbers smooth out the visible "snap" on small gaze corrections.
+static constexpr int kLookAtSpeed = 250;
 
 void apply_look_at(JsonDocument& doc)
 {
@@ -58,17 +60,6 @@ void apply_look_at(JsonDocument& doc)
     if (pitch > 870) pitch = 870;
     GetStackChan().motion().moveWithSpeed(yaw, pitch, kLookAtSpeed);
     mclog::tagInfo(TAG, "look_at: yaw={}° pitch={}°", yaw_deg, pitch_deg);
-}
-
-void apply_set_motion_rate(JsonDocument& doc)
-{
-    int per_min = doc["per_minute"] | 4;
-    // Phase 3 stub: IdleMotionModifier isn't installed yet — log the request
-    // so brain-side tool feedback is meaningful, and wire it for real in a
-    // follow-up. (The mod is in stackchan/modifiers/idle_motion.h but we
-    // haven't attached it; main.cpp would need to install + retain a handle.)
-    mclog::tagWarn(TAG, "set_motion_rate {} per/min — not yet implemented",
-                   per_min);
 }
 
 }  // namespace
@@ -97,8 +88,6 @@ void dispatch(std::string_view json)
         apply_set_expression(doc);
     } else if (c == "look_at") {
         apply_look_at(doc);
-    } else if (c == "set_motion_rate") {
-        apply_set_motion_rate(doc);
     } else {
         mclog::tagWarn(TAG, "unknown cmd: {}", c);
     }

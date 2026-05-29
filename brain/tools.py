@@ -17,6 +17,8 @@ from typing import Any, Callable
 from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
+from memory import Memory
+
 log = logging.getLogger("brain.tools")
 
 # Sonnet for vision Q&A — Haiku 4.5 can do vision too but Sonnet gives
@@ -29,6 +31,7 @@ class ToolContext:
     """Per-connection handles a tool handler may need."""
     ws: ServerConnection
     client: AsyncAnthropic
+    memory: Memory
     # Callable returning the most recent JPEG frame the firmware has
     # sent us on this connection, or None if we haven't received one
     # yet. Used by describe_view.
@@ -75,10 +78,11 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "description": (
             "Point the head at a target. Yaw is left/right in degrees "
             "(-128 to +128, negative is left, +90 is fully right, 0 is "
-            "straight ahead). Pitch is up/down in degrees (3 to 87, "
-            "where 62 is neutral, ~85 is fully up, ~5 is fully down). "
-            "Use the full range — 'look up' should be 80+ pitch, 'look "
-            "down' should be 10–20. Use for natural conversational gestures."
+            "straight ahead). Pitch is up/down in degrees (3 to 87); "
+            "~3 is looking down at the desk, ~30 is a neutral resting "
+            "pose (slightly up, eyes at user height), ~50 is looking up "
+            "at the user, ~85 is chin-to-ceiling. For 'look down' use "
+            "5–15, for 'look up' use 60–80, for resting use ~30."
         ),
         "input_schema": {
             "type": "object",
@@ -87,21 +91,6 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "pitch_deg": {"type": "number", "minimum": 3, "maximum": 87},
             },
             "required": ["yaw_deg", "pitch_deg"],
-        },
-    },
-    {
-        "name": "set_motion_rate",
-        "description": (
-            "Adjust how often the robot makes idle look-around movements. "
-            "0 = perfectly still, 10 = constantly fidgeting. Default is 4. "
-            "Use when the user asks the robot to 'move less' or 'be still'."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "per_minute": {"type": "integer", "minimum": 0, "maximum": 30}
-            },
-            "required": ["per_minute"],
         },
     },
     {
@@ -125,6 +114,27 @@ TOOL_DEFS: list[dict[str, Any]] = [
                     ),
                 }
             },
+        },
+    },
+    {
+        "name": "remember_fact",
+        "description": (
+            "Save a single fact about the user or your shared context that "
+            "should persist across conversations (their name, preferences, "
+            "ongoing projects, pets, etc.). Use sparingly — only for things "
+            "worth recalling later. Don't use for transient conversation "
+            "state. Phrase the fact concisely in third person, e.g. 'The "
+            "user's name is Paul' or 'The user prefers tea over coffee'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": "Concise third-person fact to remember.",
+                }
+            },
+            "required": ["fact"],
         },
     },
     {
@@ -193,16 +203,16 @@ async def dispatch(
         )
         ctx.on_external_head_move(yaw_deg, pitch_deg)
         return f"Looking at yaw={yaw_deg}, pitch={pitch_deg}."
-    if name == "set_motion_rate":
-        await ctx.ws.send(
-            json.dumps(
-                {"cmd": "set_motion_rate", "per_minute": input_["per_minute"]}
-            )
-        )
-        return f"Motion rate set to {input_['per_minute']} per minute."
     if name == "describe_view":
         prompt = input_.get("prompt") or "Describe what you see in one sentence."
         return await _describe_view(ctx, prompt)
+    if name == "remember_fact":
+        fact = input_["fact"].strip()
+        if not fact:
+            return "Empty fact — nothing saved."
+        ctx.memory.add_fact(fact)
+        log.info("remembered: %r", fact)
+        return f"Remembered: {fact}"
     if name == "end_conversation":
         # No firmware-side cmd needed; the agent's reply is the goodbye.
         return "Conversation ended."

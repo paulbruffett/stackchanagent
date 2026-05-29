@@ -13,6 +13,7 @@
  */
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string_view>
 
 #include <mooncake_log.h>
@@ -31,12 +32,10 @@
 
 static constexpr const char* TAG = "stackchan";
 
-// Hostname + port the brain advertises (matches brain/agent_server.py).
-// On macOS where zeroconf can't bind 5353, point this at the host's own
-// .local hostname (e.g. "Pauls-Mac-mini.local") for local testing.
-// TODO: lift to a Kconfig setting.
-static constexpr const char* BRAIN_HOST = "Pauls-Mac-mini.local";
-static constexpr int BRAIN_PORT = 8765;
+// Brain hostname + port come from Kconfig — change via
+// `idf.py menuconfig` → "Stackchan Brain" → "Brain host".
+static constexpr const char* BRAIN_HOST = CONFIG_BRAIN_HOST;
+static constexpr int BRAIN_PORT = CONFIG_BRAIN_PORT;
 
 extern "C" void app_main(void)
 {
@@ -85,11 +84,11 @@ extern "C" void app_main(void)
         }
     };
 
-    motion.move(0, 0);         pump_for(1500);   // home
+    motion.move(0, 0);         pump_for(1500);   // home (pitch clamps to 3°, max down)
     motion.move(-300, 450);    pump_for(1500);   // look up-left
     motion.move(300, 450);     pump_for(1500);   // look up-right
-    motion.move(0, 200);       pump_for(1500);   // look slightly down
-    motion.move(0, 0);         pump_for(1000);   // home
+    motion.move(0, 200);       pump_for(1500);   // resting pose: pitch=20° (slightly up)
+    motion.move(0, 200);       pump_for(1000);   // settle in resting pose
 
     mclog::tagInfo(TAG, "bring-up ok — bringing up network");
 
@@ -120,11 +119,56 @@ extern "C" void app_main(void)
 
     mclog::tagInfo(TAG, "running — listening for wakeword");
 
+    // Brain-offline badge: small red "OFFLINE" label in the top-right
+    // corner, hidden when the WebSocket is connected. Added after the
+    // avatar's SetupUI so it sits above in LVGL Z order. Visibility is
+    // polled from the idle loop and only toggled on state change.
+    std::unique_ptr<uitk::lvgl_cpp::Label> offline_badge;
+    {
+        LvglLockGuard lock;
+        offline_badge = std::make_unique<uitk::lvgl_cpp::Label>(lv_screen_active());
+        offline_badge->setTextFont(&lv_font_montserrat_14);
+        offline_badge->setTextColor(lv_color_hex(0xFF4040));
+        offline_badge->setText("OFFLINE");
+        offline_badge->align(LV_ALIGN_TOP_RIGHT, -4, 4);
+        offline_badge->setHidden(true);
+    }
+    bool last_offline_state = false;
+
     // Idle loop: pump stackchan (avatar blink/breath + motion spring) at 50 Hz.
+    // Also poll the actual servo position every ~500 ms; log any change > 1°
+    // on either axis. Helps spot modifier-driven moves (HeadPet, ImuEvent)
+    // that don't go through agent.cmd::apply_look_at and so wouldn't
+    // otherwise appear in the log.
+    int last_logged_yaw = 0;
+    int last_logged_pitch = 0;
+    uint32_t next_pose_log_ms = 0;
     while (1) {
         {
             LvglLockGuard lock;
             GetStackChan().update();
+        }
+        uint32_t now = GetHAL().millis();
+        if (now >= next_pose_log_ms) {
+            next_pose_log_ms = now + 500;
+            auto angles = GetStackChan().motion().getCurrentAngles();
+            int yaw_t = angles.x;
+            int pitch_t = angles.y;
+            if (std::abs(yaw_t - last_logged_yaw) > 10
+                || std::abs(pitch_t - last_logged_pitch) > 10) {
+                mclog::tagInfo(TAG, "pose: yaw={}° pitch={}°",
+                               yaw_t / 10.0f, pitch_t / 10.0f);
+                last_logged_yaw = yaw_t;
+                last_logged_pitch = pitch_t;
+            }
+            bool offline = !agent::transport::is_connected();
+            if (offline != last_offline_state) {
+                LvglLockGuard lock;
+                offline_badge->setHidden(!offline);
+                last_offline_state = offline;
+                mclog::tagInfo(TAG, "brain link: {}",
+                               offline ? "OFFLINE" : "online");
+            }
         }
         GetHAL().feedTheDog();
         GetHAL().delay(20);
