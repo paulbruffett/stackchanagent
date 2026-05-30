@@ -1,8 +1,11 @@
 # Locally-built CUDA wheels for the Jetson
 
 `pyproject.toml`'s `[tool.uv.sources]` block pins `ctranslate2` to a wheel in
-this directory **on aarch64 only** (i.e. the Jetson Orin Nano). On Mac the
-marker is false and uv resolves to PyPI's CPU wheel as usual.
+this directory. The pin is unconditional — uv 0.11 silently ignores marker
+expressions on path sources, so we cannot have a platform-conditional source.
+Practical consequence: **`uv sync` will fail on any machine where the wheel
+file isn't present** (including the Mac), because the path won't resolve.
+Brain runs on the Jetson now, so this is acceptable.
 
 The wheels themselves are gitignored — they're machine- and CUDA-version-
 specific. To rebuild on the Jetson:

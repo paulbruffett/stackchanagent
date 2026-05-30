@@ -29,14 +29,15 @@ dev = [
 py-modules = []
 
 [tool.uv.sources]
-# Pin ctranslate2 to a locally-built CUDA wheel on the Jetson (aarch64 Linux).
-# On Mac (platform_machine='arm64') the marker is false and uv resolves to
-# PyPI's CPU wheel as usual. List form is required for the marker to apply —
-# the single-dict form is treated as unconditional. The wheel itself is
-# gitignored — see brain/wheels/README.md for the rebuild recipe.
-ctranslate2 = [
-  { path = "wheels/ctranslate2-4.7.2-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
-]
+# Pin ctranslate2 to a locally-built CUDA wheel. PyPI's wheel is CPU-only,
+# so on the Jetson we must use our own CUDA build (see brain/wheels/README.md).
+#
+# This pin is *unconditional* — uv 0.11 silently ignores `marker = ...` on
+# path sources, so we can't conditionally swap between local wheel (Jetson)
+# and PyPI (Mac). Since brain runs on the Jetson now, Mac `uv sync` would
+# need the wheel file dropped into wheels/ as well. Hobbyist single-device
+# project; not worth a more elaborate setup.
+ctranslate2 = { path = "wheels/ctranslate2-4.7.2-cp312-cp312-linux_aarch64.whl" }
 
 [tool.ruff]
 line-length = 100
