@@ -21,7 +21,9 @@ from scipy.signal import resample_poly
 
 log = logging.getLogger("brain.tts")
 
-DEFAULT_VOICE = "en_US-amy-medium"
+# Piper voice. `libritts_r-medium` has more prosodic variation than the
+# original `amy-medium` and is a strict drop-in. Override via env to A/B.
+DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_US-libritts_r-medium")
 TARGET_SR = 16000
 
 
