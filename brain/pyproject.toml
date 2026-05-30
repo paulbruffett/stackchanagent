@@ -10,6 +10,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "numpy>=1.26",
     "faster-whisper>=1.0.3",
+    # Declared as a direct dep (even though faster-whisper pulls it in
+    # transitively) so the [tool.uv.sources] path pin below applies. uv only
+    # overrides sources for packages listed in [project.dependencies].
+    "ctranslate2>=4.7",
     "piper-tts>=1.2.0",
     # Face detection uses OpenCV's bundled Haar cascade — no extra model
     # download, no mediapipe. headless variant: no GUI libs, avoids
