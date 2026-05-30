@@ -11,11 +11,13 @@ from __future__ import annotations
 import logging
 import os
 import time
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 from piper import PiperVoice
 from piper.download_voices import download_voice
+from scipy.signal import resample_poly
 
 log = logging.getLogger("brain.tts")
 
@@ -63,12 +65,15 @@ class Synthesizer:
         pcm_int16 = np.concatenate([c.audio_int16_array for c in chunks])
 
         if src_sr != TARGET_SR:
-            # Linear resample via numpy. Adequate for speech voices.
-            new_len = int(round(len(pcm_int16) * TARGET_SR / src_sr))
-            x = np.linspace(0, 1, len(pcm_int16), endpoint=False)
-            xi = np.linspace(0, 1, new_len, endpoint=False)
-            pcm_int16 = np.interp(xi, x, pcm_int16.astype(np.float32)).astype(
-                np.int16
+            # Polyphase resample with a windowed-sinc anti-alias filter.
+            # For 22050 → 16000 the ratio reduces to 320/441. Linear interp
+            # (the old path) introduces audible aliasing on the AW88298.
+            g = gcd(TARGET_SR, src_sr)
+            up, down = TARGET_SR // g, src_sr // g
+            pcm_int16 = (
+                resample_poly(pcm_int16.astype(np.float32), up, down)
+                .clip(-32768, 32767)
+                .astype(np.int16)
             )
 
         ms = int((time.monotonic() - t0) * 1000)
