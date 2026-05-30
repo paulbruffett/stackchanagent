@@ -23,6 +23,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import numpy as np
 from dotenv import load_dotenv
@@ -141,29 +142,64 @@ def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
     return state.agent
 
 
-async def speak(ws: ServerConnection, state: ConnState, text: str) -> None:
-    """Synthesize `text`, stream the audio to firmware, manage SPEAKING."""
-    t0 = time.monotonic()
-    tts_pcm = tts.synthesize(text)
-    tts_ms = int((time.monotonic() - t0) * 1000)
-    log.info(
-        "tts ready: %d ms, %d bytes (%.2f s of audio)",
-        tts_ms,
-        len(tts_pcm),
-        len(tts_pcm) / (SAMPLE_RATE * 2),
-    )
-
+async def run_speaker(
+    ws: ServerConnection,
+    state: ConnState,
+    queue: asyncio.Queue[str | None],
+) -> None:
+    """Drain `queue` until a None sentinel: synth each sentence with TTS
+    and ship the PCM. Sends `start_speaking` lazily on the first sentence
+    (so a tool-only turn with no spoken output doesn't toggle the
+    speaking face) and `stop_speaking` only if we ever started."""
+    started = False
     state.speaking = True
     try:
-        await ws.send(json.dumps({"cmd": "start_speaking"}))
-        await send_pcm_stream(ws, tts_pcm)
-        await ws.send(json.dumps({"cmd": "stop_speaking"}))
+        while True:
+            sentence = await queue.get()
+            if sentence is None:
+                break
+            if not started:
+                await ws.send(json.dumps({"cmd": "start_speaking"}))
+                started = True
+            t0 = time.monotonic()
+            tts_pcm = await asyncio.to_thread(tts.synthesize, sentence)
+            log.info(
+                "tts: %d ms, %.2fs audio, %r",
+                int((time.monotonic() - t0) * 1000),
+                len(tts_pcm) / (SAMPLE_RATE * 2),
+                sentence[:80],
+            )
+            await send_pcm_stream(ws, tts_pcm)
+        if started:
+            await ws.send(json.dumps({"cmd": "stop_speaking"}))
     finally:
         state.speaking = False
 
 
+async def _drive_agent_turn(
+    ws: ServerConnection,
+    state: ConnState,
+    run_agent: Callable[[Callable[[str], Awaitable[None]]], Awaitable[str]],
+) -> str:
+    """Wire a sentence-streaming agent run to a speaker worker. The
+    agent calls `enqueue(sentence)` as each sentence completes; the
+    speaker worker drains the queue in parallel so TTS pacing doesn't
+    backpressure the LLM stream."""
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    speaker = asyncio.create_task(run_speaker(ws, state, queue))
+
+    async def enqueue(sentence: str) -> None:
+        await queue.put(sentence)
+
+    try:
+        return await run_agent(enqueue)
+    finally:
+        await queue.put(None)
+        await speaker
+
+
 async def respond(ws: ServerConnection, state: ConnState) -> None:
-    """Run STT → TTS → playback on the buffered speech, then go back to IDLE."""
+    """Run STT → streaming agent → sentence-chunked TTS, then go idle."""
     pcm = bytes(state.speech_buf)
     state.speech_buf = bytearray()
     state.listening = False
@@ -181,15 +217,15 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     t0 = time.monotonic()
-    speak_text = await agent.respond(transcript.text)
-    agent_ms = int((time.monotonic() - t0) * 1000)
-    log.info("agent: %d ms, %r", agent_ms, speak_text[:120])
+    speak_text = await _drive_agent_turn(
+        ws, state, lambda spk: agent.respond(transcript.text, spk)
+    )
+    log.info(
+        "agent turn: %d ms total, %r",
+        int((time.monotonic() - t0) * 1000),
+        speak_text[:120],
+    )
 
-    if not speak_text:
-        log.info("empty agent reply — going idle")
-        return
-
-    await speak(ws, state, speak_text)
     state.last_user_interaction_s = time.monotonic()
 
 
@@ -215,16 +251,19 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     t0 = time.monotonic()
-    speak_text = await agent.respond_to_event(
-        "A new person just appeared in front of you. Greet them in one short, "
-        "friendly sentence."
+    speak_text = await _drive_agent_turn(
+        ws,
+        state,
+        lambda spk: agent.respond_to_event(
+            "A new person just appeared in front of you. Greet them in one "
+            "short, friendly sentence.",
+            spk,
+        ),
     )
     log.info(
-        "greet agent: %d ms, %r",
+        "greet turn: %d ms, %r",
         int((time.monotonic() - t0) * 1000), speak_text[:120],
     )
-    if speak_text:
-        await speak(ws, state, speak_text)
 
 
 async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:

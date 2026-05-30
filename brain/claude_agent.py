@@ -2,8 +2,9 @@
 
 Maintains conversation history in SQLite (via memory.Memory) so the
 robot remembers prior chats across WS reconnects and process restarts.
-Runs the standard Anthropic SDK loop: call → if tool_use, dispatch
-tool, append result, call again, else return the final text.
+Runs the standard Anthropic SDK loop: stream → as text deltas arrive,
+flush completed sentences to a TTS callback; on stream end, if
+stop_reason == tool_use dispatch tools and loop again, else done.
 
 Prompt structure (cached prefix in *brackets*):
   system: [
@@ -20,13 +21,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable
+import re
+from typing import Any, Awaitable, Callable
 
 from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
 import tools
 from memory import Memory, Turn
+
+# Sentence-end punctuation followed by whitespace (or end of buffer). The
+# lookbehind requires an alphanumeric or closing quote/paren so we don't
+# split on decimals like "3.14" or list markers like "1. First". Good
+# enough for short conversational replies; abbreviations like "Dr." may
+# still trigger a false break but Stack-Chan rarely produces them.
+_SENT_END = re.compile(r'(?<=[A-Za-z0-9\)\]\"\'])[.!?](?=\s|$)')
+
+SpeakFn = Callable[[str], Awaitable[None]]
 
 log = logging.getLogger("brain.agent")
 
@@ -97,20 +108,27 @@ class AgentSession:
             ),
         )
 
-    async def respond(self, user_text: str) -> str:
-        """Run a full agent turn off a transcribed user utterance."""
+    async def respond(self, user_text: str, speak: SpeakFn) -> str:
+        """Run a full agent turn off a transcribed user utterance.
+
+        `speak(sentence)` is called for each completed sentence as the
+        LLM streams it back, so the firmware can start playing audio
+        before the full reply is generated. Returns the full assembled
+        text for logging."""
         async with self._turn_lock:
             self._append({"role": "user", "content": user_text})
-            return await self._run_loop()
+            return await self._run_loop(speak)
 
-    async def respond_to_event(self, stage_direction: str) -> str:
+    async def respond_to_event(
+        self, stage_direction: str, speak: SpeakFn
+    ) -> str:
         """Run an agent turn off a brain-injected stage direction
         (proactive greeting on new face, etc.) instead of a user
         utterance. Wrapped in [brackets] so the system prompt's rule
         kicks in."""
         async with self._turn_lock:
             self._append({"role": "user", "content": f"[{stage_direction}]"})
-            return await self._run_loop()
+            return await self._run_loop(speak)
 
     def _append(self, message: dict[str, Any]) -> None:
         """Append to the live thread AND persist to SQLite."""
@@ -146,36 +164,57 @@ class AgentSession:
         system[-1]["cache_control"] = {"type": "ephemeral"}
         return system
 
-    async def _run_loop(self) -> str:
+    async def _run_loop(self, speak: SpeakFn) -> str:
+        assembled: list[str] = []
         while True:
-            response = await self.client.messages.create(
+            buf = ""
+            async with self.client.messages.stream(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=self._build_system(),
                 tools=tools.TOOL_DEFS,
                 messages=self.messages,
-            )
+            ) as stream:
+                async for delta in stream.text_stream:
+                    buf += delta
+                    # Flush every completed sentence as it lands. Pre-
+                    # tool commentary ("Let me check…") still gets
+                    # spoken on tool-use turns — that's appropriate.
+                    while True:
+                        m = _SENT_END.search(buf)
+                        if not m:
+                            break
+                        end = m.end()
+                        sentence = buf[:end].strip()
+                        buf = buf[end:].lstrip()
+                        if sentence:
+                            assembled.append(sentence)
+                            await speak(sentence)
+                response = await stream.get_final_message()
+
+            # Flush any trailing partial (model that ended without
+            # final punctuation, or short tool-use commentary).
+            tail = buf.strip()
+            if tail:
+                assembled.append(tail)
+                await speak(tail)
 
             # Persist the assistant turn verbatim — preserves tool_use
             # blocks so the next turn's tool_results stay valid.
-            self._append(
-                {"role": "assistant", "content": response.content}
-            )
+            self._append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
-                text = " ".join(
-                    b.text for b in response.content if b.type == "text"
-                ).strip()
+                full = " ".join(assembled)
                 log.info(
                     "agent reply: %r (in=%d out=%d cache_r=%d cache_w=%d)",
-                    text[:120],
+                    full[:120],
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                     response.usage.cache_read_input_tokens,
                     response.usage.cache_creation_input_tokens,
                 )
                 asyncio.create_task(_maybe_summarize(self))
-                return text
+                return full
 
             tool_results: list[dict[str, Any]] = []
             for block in response.content:
