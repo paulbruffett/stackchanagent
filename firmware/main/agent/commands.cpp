@@ -44,7 +44,7 @@ void apply_set_expression(JsonDocument& doc)
 // default (snappy, k=170), 300 is gentler (k≈68), 250 is moderately
 // gentle (k≈50), 200 is the slowest that still tracks (k≈36).
 // Lower numbers smooth out the visible "snap" on small gaze corrections.
-static constexpr int kLookAtSpeed = 250;
+static constexpr int kLookAtSpeed = 200;
 
 void apply_look_at(JsonDocument& doc)
 {

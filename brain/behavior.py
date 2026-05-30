@@ -35,7 +35,7 @@ log = logging.getLogger("brain.behavior")
 
 # Tunables — pick whatever feels right; nothing here interacts.
 LOOK_AROUND_INTERVAL_S = 180.0      # 3 min between sweeps
-LOOK_AROUND_POSE_DURATION_S = 3.0   # seconds held at each pose; raise to slow
+LOOK_AROUND_POSE_DURATION_S = 4.0   # seconds held at each pose; raise to slow
 CENTERING_COOLDOWN_S = 180.0        # 3 min lockout after centering
 CENTERING_GAIN = 0.7                # under-center slightly; FOV is approximate
 
@@ -55,14 +55,16 @@ REST_PITCH_DEG = 20.0
 
 # Sweep poses (yaw_deg, pitch_deg). Stays inside the servo limits and
 # returns to rest at the end so consecutive sweeps start from the
-# same place. The dwell (LOOK_AROUND_POSE_DURATION_S) must be long
-# enough for the spring at kLookAtSpeed=200 to actually settle at
-# each target — otherwise the next pose preempts mid-flight and the
-# sweep reads as a snap-reversal instead of a smooth glance.
+# same place. Routes left → center → right (max single step 25°) so
+# there is no full-width L→R reversal; an earlier ±35° left-then-right
+# sweep read as a rapid back-and-forth snap. The dwell
+# (LOOK_AROUND_POSE_DURATION_S) must also be long enough for the spring
+# at kLookAtSpeed=200 to settle at each target, or the next pose
+# preempts mid-flight and reintroduces the snap.
 LOOK_AROUND_POSES: list[tuple[float, float]] = [
-    (-35.0, 25.0),                          # glance up-left
-    (+35.0, 25.0),                          # glance up-right
-    (0.0, 40.0),                            # tip head up briefly
+    (-25.0, 25.0),                          # glance up-left
+    (0.0, 30.0),                            # back through center (no L→R snap)
+    (+25.0, 25.0),                          # glance up-right
     (REST_YAW_DEG, REST_PITCH_DEG),         # rest
 ]
 
