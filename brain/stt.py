@@ -1,16 +1,18 @@
 """Speech-to-text wrapper around faster-whisper.
 
-Phase 2 use case: brain accumulates 16 kHz s16le PCM frames during the
-LISTENING state, then calls `Transcriber.transcribe(pcm_bytes)` once
-the utterance ends. Returns the text.
+Brain accumulates 16 kHz s16le PCM frames during the LISTENING state,
+then calls `Transcriber.transcribe(pcm_bytes)` once the utterance
+ends. Returns the text.
 
-Default model is `small.en` int8 — small enough to live on CPU during
-local Mac iteration; we'll switch to GPU/cuda on the Jetson.
+Default model is `small.en` on CUDA float16 — the brain runs on the
+Orin Nano. Override via env for CPU dev:
+    STT_DEVICE=cpu STT_COMPUTE_TYPE=int8
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -18,6 +20,9 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 log = logging.getLogger("brain.stt")
+
+DEFAULT_DEVICE = os.environ.get("STT_DEVICE", "cuda")
+DEFAULT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "float16")
 
 
 @dataclass
@@ -32,8 +37,8 @@ class Transcriber:
     def __init__(
         self,
         model_name: str = "small.en",
-        device: str = "auto",
-        compute_type: str = "int8",
+        device: str = DEFAULT_DEVICE,
+        compute_type: str = DEFAULT_COMPUTE_TYPE,
     ) -> None:
         self.model_name = model_name
         self.device = device

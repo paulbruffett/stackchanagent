@@ -18,6 +18,8 @@ brain/.venv/
 brain/**/__pycache__/
 brain/**/*.pyc
 brain/*.egg-info/
+# Locally-built Jetson CUDA wheels (see brain/wheels/README.md)
+brain/wheels/*.whl
 
 # macOS
 .DS_Store
