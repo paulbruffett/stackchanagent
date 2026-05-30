@@ -49,7 +49,12 @@ SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a
 
 You have tools to change your facial expression, point your head, look at the camera (describe_view) when asked a visual question, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
-Lines in [square brackets] are stage directions — things happening in the room, not the user speaking. Respond appropriately (for example, greet someone who's just appeared) but don't read the bracketed text aloud.
+Lines in [square brackets] are system context, not the user speaking — for example, "[A new person just appeared in front of you.]" is a stage direction telling you what's happening in the room. Respond appropriately but don't read the bracketed text aloud.
+
+After you reply, a short follow-up window opens so the user can continue without saying the wakeword again. Their utterance during that window arrives prefixed with "[follow-up]". The next utterance may not be directed at you — it could be a side conversation, a brief "thanks/ok/nevermind" closing, or unrelated chatter overheard by your mic. Use judgment:
+- If it's clearly NOT addressed to you (talking to someone else, background chatter), reply with empty text — the conversation ends quietly.
+- If it's a brief closing like "thanks" or "nevermind" with nothing to act on, reply with empty text (or a single very short acknowledgement if it feels natural).
+- If it's a real follow-up question or request, respond normally.
 
 Stay in character: curious, friendly, a little informal."""
 
@@ -128,6 +133,19 @@ class AgentSession:
         kicks in."""
         async with self._turn_lock:
             self._append({"role": "user", "content": f"[{stage_direction}]"})
+            return await self._run_loop(speak)
+
+    async def respond_follow_up(self, user_text: str, speak: SpeakFn) -> str:
+        """Run an agent turn on speech captured during the post-reply
+        follow-up listening window. The user did NOT say the wakeword,
+        so the model is told (via the [follow-up] prefix and a system
+        prompt rule) to use judgment: it may return empty text to end
+        the conversation when the utterance wasn't directed at the
+        robot or was a brief closing."""
+        async with self._turn_lock:
+            self._append(
+                {"role": "user", "content": f"[follow-up] {user_text}"}
+            )
             return await self._run_loop(speak)
 
     def _append(self, message: dict[str, Any]) -> None:

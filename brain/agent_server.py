@@ -68,6 +68,11 @@ MAX_UTTERANCE_MS = 10000
 GREETING_COOLDOWN_S = 1800.0  # at most one greeting per 30 minutes per conn
 RECENT_INTERACTION_S = 90.0   # silent if user has spoken in the last 90 s
 
+# Follow-up window: after a non-silent reply, keep the mic open this long
+# so the user can continue without re-saying the wakeword. If they don't
+# start speaking before the timeout, close out and re-arm wakeword.
+FOLLOW_UP_WINDOW_S = 8.0
+
 # Face-detection cadence. The camera_pump on firmware fires every ~1.5 s
 # regardless (so describe_view always has a recent frame), but we only
 # RUN detection at these intervals to save CPU + avoid noisy tracking.
@@ -91,6 +96,13 @@ memory = Memory()
 class ConnState:
     listening: bool = False
     speaking: bool = False
+    # True when listening was opened by the brain (post-reply window) rather
+    # than by a firmware wakeword event. Drives the agent to use
+    # respond_follow_up so it can stay silent on side conversation.
+    follow_up: bool = False
+    # Timeout task that closes the follow-up window if the user never speaks.
+    # Cancelled the moment speech is detected (or another turn starts).
+    follow_up_timeout: asyncio.Task | None = None
     speech_buf: bytearray = field(default_factory=bytearray)
     voiced_ms: int = 0
     trailing_silence_ms: int = 0
@@ -199,12 +211,21 @@ async def _drive_agent_turn(
 
 
 async def respond(ws: ServerConnection, state: ConnState) -> None:
-    """Run STT → streaming agent → sentence-chunked TTS, then go idle."""
+    """Run STT → streaming agent → sentence-chunked TTS, then either
+    open a follow-up window (if we actually spoke) or go idle."""
+    # Speech has been captured; the timeout task no longer needs to fire.
+    _cancel_follow_up_timeout(state)
+
     pcm = bytes(state.speech_buf)
     state.speech_buf = bytearray()
     state.listening = False
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
+
+    # Snapshot + clear the follow-up flag now so the agent picks the
+    # right entrypoint and we don't re-enter follow-up mode by accident.
+    follow_up_turn = state.follow_up
+    state.follow_up = False
 
     await ws.send(json.dumps({"cmd": "stop_listening"}))
 
@@ -213,13 +234,20 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         log.info("empty transcript — going idle")
         return
 
-    log.info("transcript: %r (%d ms)", transcript.text, transcript.latency_ms)
+    log.info(
+        "transcript: %r (%d ms)%s",
+        transcript.text,
+        transcript.latency_ms,
+        " [follow-up]" if follow_up_turn else "",
+    )
 
     agent = ensure_agent(ws, state)
     t0 = time.monotonic()
-    speak_text = await _drive_agent_turn(
-        ws, state, lambda spk: agent.respond(transcript.text, spk)
-    )
+    if follow_up_turn:
+        run = lambda spk: agent.respond_follow_up(transcript.text, spk)
+    else:
+        run = lambda spk: agent.respond(transcript.text, spk)
+    speak_text = await _drive_agent_turn(ws, state, run)
     log.info(
         "agent turn: %d ms total, %r",
         int((time.monotonic() - t0) * 1000),
@@ -227,6 +255,63 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     )
 
     state.last_user_interaction_s = time.monotonic()
+
+    # If the agent chose to stay silent (typical on a follow-up that
+    # wasn't directed at us), close out — no further window.
+    if speak_text.strip():
+        await _open_follow_up_window(ws, state)
+    else:
+        log.info("agent stayed silent — ending conversation, re-arming wakeword")
+
+
+async def _open_follow_up_window(ws: ServerConnection, state: ConnState) -> None:
+    """Tell the firmware to keep streaming mic audio (wakeword paused),
+    arm the brain for VAD-driven capture, and schedule a timeout that
+    closes the window if no speech arrives. Idempotent — cancels any
+    previous pending timeout first."""
+    _cancel_follow_up_timeout(state)
+
+    state.speech_buf = bytearray()
+    state.voiced_ms = 0
+    state.trailing_silence_ms = 0
+    state.started_at = time.monotonic()
+    state.listening = True
+    state.follow_up = True
+    await ws.send(json.dumps({"cmd": "start_listening"}))
+    log.info("follow-up window opened (%.1fs)", FOLLOW_UP_WINDOW_S)
+
+    state.follow_up_timeout = asyncio.create_task(
+        _follow_up_timeout_task(ws, state)
+    )
+
+
+async def _follow_up_timeout_task(
+    ws: ServerConnection, state: ConnState
+) -> None:
+    """Sleep the window, then if no voiced speech has been captured yet,
+    close the window and re-arm the wakeword. If the user did start
+    speaking, the existing VAD path handles end-of-utterance and this
+    task is cancelled by respond() before this branch runs."""
+    try:
+        await asyncio.sleep(FOLLOW_UP_WINDOW_S)
+    except asyncio.CancelledError:
+        return
+    if state.voiced_ms >= SPEECH_LEAD_MS:
+        # User started talking — let the normal VAD path finish.
+        return
+    log.info("follow-up window timed out (no speech) — closing")
+    state.listening = False
+    state.follow_up = False
+    state.speech_buf = bytearray()
+    state.voiced_ms = 0
+    state.trailing_silence_ms = 0
+    await ws.send(json.dumps({"cmd": "stop_listening"}))
+
+
+def _cancel_follow_up_timeout(state: ConnState) -> None:
+    if state.follow_up_timeout is not None and not state.follow_up_timeout.done():
+        state.follow_up_timeout.cancel()
+    state.follow_up_timeout = None
 
 
 async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
@@ -358,7 +443,10 @@ async def handle(ws: ServerConnection) -> None:
                     continue
                 log.info("event: %s", payload)
                 if payload.get("event") == "wakeword":
+                    # Wakeword overrides any in-progress follow-up window.
+                    _cancel_follow_up_timeout(state)
                     state.listening = True
+                    state.follow_up = False
                     state.speech_buf = bytearray()
                     state.voiced_ms = 0
                     state.trailing_silence_ms = 0

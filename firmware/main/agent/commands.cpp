@@ -80,6 +80,11 @@ void dispatch(std::string_view json)
     std::string_view c{cmd};
     if (c == "stop_listening") {
         state::transition(state::Mode::Idle);
+    } else if (c == "start_listening") {
+        // Brain-initiated listening: follow-up window after a reply
+        // (no wakeword needed for the second utterance). Transition
+        // pauses the wakeword so it doesn't double-fire on speech.
+        state::transition(state::Mode::Listening);
     } else if (c == "start_speaking") {
         state::transition(state::Mode::Speaking);
     } else if (c == "stop_speaking") {
