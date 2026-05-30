@@ -199,9 +199,12 @@ class AgentSession:
                 assembled.append(tail)
                 await speak(tail)
 
-            # Persist the assistant turn verbatim — preserves tool_use
-            # blocks so the next turn's tool_results stay valid.
-            self._append({"role": "assistant", "content": response.content})
+            # Persist the assistant turn. Strip stream-only fields like
+            # `parsed_output` — the SDK populates them on streaming text
+            # blocks, but the API rejects them on input when the message
+            # is replayed on the next turn.
+            content_clean = [_clean_block(b) for b in response.content]
+            self._append({"role": "assistant", "content": content_clean})
 
             if response.stop_reason != "tool_use":
                 full = " ".join(assembled)
@@ -232,6 +235,19 @@ class AgentSession:
                     }
                 )
             self._append({"role": "user", "content": tool_results})
+
+
+_STREAM_ONLY_FIELDS = ("parsed_output",)
+
+
+def _clean_block(block: Any) -> dict[str, Any]:
+    """Convert an SDK content block to a plain dict suitable for replay
+    as API input. The streaming SDK decorates text blocks with
+    `parsed_output`; the API rejects it on the way back in."""
+    d = block.model_dump(exclude_none=True)
+    for f in _STREAM_ONLY_FIELDS:
+        d.pop(f, None)
+    return d
 
 
 def _last_complete_assistant_id(turns: list[Turn], up_to_idx: int) -> int | None:
