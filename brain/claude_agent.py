@@ -40,6 +40,22 @@ _SENT_END = re.compile(r'(?<=[A-Za-z0-9\)\]\"\'])[.!?](?=\s|$)')
 
 SpeakFn = Callable[[str], Awaitable[None]]
 
+
+def _strip_brackets(text: str, depth: int) -> tuple[str, int]:
+    """Drop any text inside [square brackets], tracking nesting `depth`
+    across streamed chunks. Returns (text_outside_brackets, new_depth).
+    A '[' with no matching ']' suppresses the rest of the turn — fine,
+    since the model only brackets non-spoken meta-commentary."""
+    out: list[str] = []
+    for ch in text:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out), depth
+
 log = logging.getLogger("brain.agent")
 
 SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a face, two servos to point your head, a camera, a microphone, and a speaker. The user is talking to you out loud — your replies are spoken aloud, so:
@@ -50,11 +66,13 @@ SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a
 
 You have tools to change your facial expression, point your head, look at the camera (describe_view) when asked a visual question, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
+Everything you output is spoken aloud verbatim, so output ONLY the words you want said. Never narrate your reasoning, never describe what you're about to do, and never write square-bracketed commentary — brackets are reserved for incoming system context, never your output. To stay silent, output nothing at all (an empty reply). Do not write things like "[The user is just chatting, I'll stay quiet]" — that would be read aloud; just return nothing.
+
 Lines in [square brackets] are system context, not the user speaking — for example, "[A new person just appeared in front of you.]" is a stage direction telling you what's happening in the room. Respond appropriately but don't read the bracketed text aloud.
 
-After you reply, a short follow-up window opens so the user can continue without saying the wakeword again. Their utterance during that window arrives prefixed with "[follow-up]". The next utterance may not be directed at you — it could be a side conversation, a brief "thanks/ok/nevermind" closing, or unrelated chatter overheard by your mic. Use judgment:
-- If it's clearly NOT addressed to you (talking to someone else, background chatter), reply with empty text — the conversation ends quietly.
-- If it's a brief closing like "thanks" or "nevermind" with nothing to act on, reply with empty text (or a single very short acknowledgement if it feels natural).
+After you reply, a short follow-up window opens so the user can continue without saying the wakeword again. Their utterance during that window arrives prefixed with "[follow-up]". The next utterance may not be directed at you — it could be a side conversation, a brief "thanks/ok/nevermind" closing, unrelated chatter, or even a faint echo of your own previous reply picked up by the mic. Use judgment:
+- If it's clearly NOT addressed to you (talking to someone else, background chatter, or a fragment of what you just said), output nothing — the conversation ends quietly.
+- If it's a brief closing like "thanks" or "nevermind" with nothing to act on, output nothing (or a single very short acknowledgement if it feels natural).
 - If it's a real follow-up question or request, respond normally.
 
 Stay in character: curious, friendly, a little informal."""
@@ -202,6 +220,7 @@ class AgentSession:
         assembled: list[str] = []
         while True:
             buf = ""
+            bracket_depth = 0
             async with self.client.messages.stream(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
@@ -210,7 +229,15 @@ class AgentSession:
                 messages=self.messages,
             ) as stream:
                 async for delta in stream.text_stream:
-                    buf += delta
+                    # Never speak [bracketed] text. Brackets are reserved
+                    # for system stage directions in the prompt; the model
+                    # sometimes leaks its own reasoning in brackets
+                    # ("[The user is just chatting...]") on follow-up turns.
+                    # Strip those spans from spoken output — if the whole
+                    # reply was bracketed, nothing is spoken and the turn
+                    # ends silently (no follow-up window opens).
+                    clean, bracket_depth = _strip_brackets(delta, bracket_depth)
+                    buf += clean
                     # Flush every completed sentence as it lands. Pre-
                     # tool commentary ("Let me check…") still gets
                     # spoken on tool-use turns — that's appropriate.

@@ -106,6 +106,12 @@ class ConnState:
     last_user_interaction_s: float = 0.0
     last_greeting_s: float = 0.0
     last_detect_s: float = 0.0
+    # monotonic time the most recent TTS playback is expected to finish on
+    # the device. The brain sends audio faster than real time, so when the
+    # speaker worker returns the device still has buffered audio playing;
+    # we wait until past this before reopening the mic (else the robot
+    # hears its own voice tail and replies to itself).
+    est_playback_end_s: float = 0.0
     # Set while a vision/detection task is in flight, so we drop overlapping
     # frames rather than queuing detections behind a slow mediapipe call.
     detecting: bool = False
@@ -157,6 +163,8 @@ async def run_speaker(
     speaking face) and `stop_speaking` only if we ever started."""
     started = False
     state.speaking = True
+    play_start: float | None = None
+    total_audio_s = 0.0
     try:
         while True:
             sentence = await queue.get()
@@ -167,17 +175,25 @@ async def run_speaker(
                 started = True
             t0 = time.monotonic()
             tts_pcm = await asyncio.to_thread(tts.synthesize, sentence)
+            audio_s = len(tts_pcm) / (SAMPLE_RATE * 2)
             log.info(
                 "tts: %d ms, %.2fs audio, %r",
-                int((time.monotonic() - t0) * 1000),
-                len(tts_pcm) / (SAMPLE_RATE * 2),
-                sentence[:80],
+                int((time.monotonic() - t0) * 1000), audio_s, sentence[:80],
             )
+            # Playback starts ~when the first frame reaches the device.
+            if play_start is None:
+                play_start = time.monotonic()
+            total_audio_s += audio_s
             await send_pcm_stream(ws, tts_pcm)
         if started:
             await ws.send(json.dumps({"cmd": "stop_speaking"}))
     finally:
         state.speaking = False
+        # Device plays at real time from play_start; record when the last
+        # sample will have left the speaker so respond() can wait it out.
+        state.est_playback_end_s = (
+            play_start + total_audio_s if play_start is not None else 0.0
+        )
 
 
 async def _drive_agent_turn(
@@ -272,6 +288,16 @@ async def _open_follow_up_window(ws: ServerConnection, state: ConnState) -> None
     arm the brain for VAD-driven capture, and schedule a timeout that
     closes the window if no speech arrives. Idempotent — cancels any
     previous pending timeout first."""
+    # Wait out any TTS still playing on the device before reopening the
+    # mic, plus a small guard, so the robot doesn't capture the tail of
+    # its own voice and reply to itself.
+    guard = get_config().get("FOLLOW_UP_GUARD_S")
+    residual = state.est_playback_end_s - time.monotonic()
+    wait = residual + guard
+    if wait > 0:
+        log.info("follow-up: waiting %.2fs for playback to finish", wait)
+        await asyncio.sleep(wait)
+
     _cancel_follow_up_timeout(state)
 
     state.speech_buf = bytearray()
