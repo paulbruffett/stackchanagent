@@ -29,15 +29,14 @@ import time
 
 from websockets.asyncio.server import ServerConnection
 
+from config import get_config
 from vision import Face
 
 log = logging.getLogger("brain.behavior")
 
-# Tunables — pick whatever feels right; nothing here interacts.
-LOOK_AROUND_INTERVAL_S = 180.0      # 3 min between sweeps
-LOOK_AROUND_POSE_DURATION_S = 4.0   # seconds held at each pose; raise to slow
-CENTERING_COOLDOWN_S = 180.0        # 3 min lockout after centering
-CENTERING_GAIN = 0.7                # under-center slightly; FOV is approximate
+# Tunables moved to config.py (LOOK_AROUND_INTERVAL_S,
+# LOOK_AROUND_POSE_DURATION_S, CENTERING_COOLDOWN_S, CENTERING_GAIN) so
+# they're hot-editable from the web UI. Read via get_config().get(...).
 
 # Camera FOV — nominal for GC0308 + StackChan lens.
 FOV_H_DEG = 60.0
@@ -111,7 +110,7 @@ class IdleBehavior:
                 # centered position, and the cooldown timer would still
                 # be set — blocking any centering for the next 3 min.
                 return
-            if now - self.last_centering_s >= CENTERING_COOLDOWN_S:
+            if now - self.last_centering_s >= get_config().get("CENTERING_COOLDOWN_S"):
                 await self._center_on_face(ws, faces[0])
                 self.last_centering_s = now
             return
@@ -119,7 +118,7 @@ class IdleBehavior:
         # No faces, no sweep running, interval elapsed → fire sweep.
         if self.look_around_in_progress:
             return
-        if now - self.last_look_around_s >= LOOK_AROUND_INTERVAL_S:
+        if now - self.last_look_around_s >= get_config().get("LOOK_AROUND_INTERVAL_S"):
             self.last_look_around_s = now
             self.look_around_in_progress = True
             asyncio.create_task(self._look_around(ws))
@@ -128,12 +127,13 @@ class IdleBehavior:
         self, ws: ServerConnection, face: Face
     ) -> None:
         """Single look_at that centers the face in the camera frame."""
+        gain = get_config().get("CENTERING_GAIN")
         off_x = face.cx - 0.5
         off_y = face.cy - 0.5
-        target_yaw = self.head_yaw + off_x * FOV_H_DEG * CENTERING_GAIN
+        target_yaw = self.head_yaw + off_x * FOV_H_DEG * gain
         # Pitch convention: smaller pitch → head down. Face below center
         # (cy > 0.5, off_y > 0) → tilt head down → subtract.
-        target_pitch = self.head_pitch - off_y * FOV_V_DEG * CENTERING_GAIN
+        target_pitch = self.head_pitch - off_y * FOV_V_DEG * gain
 
         target_yaw = max(-MAX_YAW_DEG, min(MAX_YAW_DEG, target_yaw))
         target_pitch = max(MIN_PITCH_DEG, min(MAX_PITCH_DEG, target_pitch))
@@ -153,7 +153,7 @@ class IdleBehavior:
                 await self._send_look_at(
                     ws, yaw, pitch, source=f"look-around[{i}]"
                 )
-                await asyncio.sleep(LOOK_AROUND_POSE_DURATION_S)
+                await asyncio.sleep(get_config().get("LOOK_AROUND_POSE_DURATION_S"))
         finally:
             self.look_around_in_progress = False
             log.info("look-around: done")

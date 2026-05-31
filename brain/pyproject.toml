@@ -20,6 +20,11 @@ dependencies = [
     # download, no mediapipe. headless variant: no GUI libs, avoids
     # libavdevice collision with faster-whisper's `av` (PyAV) dependency.
     "opencv-python-headless>=4.9",
+    # Phase 9a web console (in-process with agent_server). Plain uvicorn —
+    # not uvicorn[standard] — to avoid compiling uvloop/httptools on the
+    # Jetson aarch64; the default asyncio loop is fine here.
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]
