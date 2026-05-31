@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import socket
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from behavior import IdleBehavior
 from claude_agent import AgentSession
 from config import get_config, init_config
+from mcp_client import McpClient
 from memory import Memory
 from stt import Transcriber
 from tts import Synthesizer
@@ -76,6 +78,9 @@ tts = Synthesizer()
 # remembers conversations even after a disconnect/reconnect or process
 # restart. Sqlite handles file locking; only one process should write.
 memory = Memory()
+# Shared MCP client (Phase 9b): one set of server connections for the
+# whole process. Started in main(); tools merged into every agent turn.
+mcp_client = McpClient(memory)
 
 
 @dataclass
@@ -136,6 +141,7 @@ def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
             memory=memory,
             get_latest_jpeg=lambda: state.latest_jpeg,
             on_external_head_move=state.behavior.notify_head_moved,
+            mcp=mcp_client,
         )
     return state.agent
 
@@ -505,6 +511,25 @@ def advertise_mdns() -> tuple[Zeroconf, ServiceInfo] | tuple[None, None]:
         return None, None
 
 
+def _seed_default_mcp_servers() -> None:
+    """Register the bundled weather + Hue servers once (empty registry).
+    Uses the running interpreter and absolute script paths so it works
+    regardless of cwd. Weather is enabled; Hue is disabled until the user
+    sets HUE_BRIDGE_IP/HUE_TOKEN in .env and toggles it on."""
+    if memory.list_mcp_servers():
+        return
+    srv_dir = Path(__file__).parent / "mcp_servers"
+    memory.add_mcp_server(
+        "weather", "stdio", sys.executable,
+        args=[str(srv_dir / "weather.py")], enabled=True,
+    )
+    memory.add_mcp_server(
+        "hue", "stdio", sys.executable,
+        args=[str(srv_dir / "hue.py")], env_ref="HUE_TOKEN", enabled=False,
+    )
+    log.info("seeded default MCP servers: weather (on), hue (off)")
+
+
 async def main() -> None:
     global stt, tts
     logging.basicConfig(
@@ -523,15 +548,21 @@ async def main() -> None:
         compute_type=cfg.get("STT_COMPUTE_TYPE"),
     )
 
+    # MCP servers (Phase 9b): seed the two local servers on first run so
+    # weather works out of the box and Hue is one toggle + .env away.
+    # Then connect — best-effort, a down server just contributes no tools.
+    _seed_default_mcp_servers()
+    await mcp_client.start()
+
     # Web console: tee brain.* logs to the live feed and serve the
-    # FastAPI app in-process on WEB_PORT, sharing memory + config.
+    # FastAPI app in-process on WEB_PORT, sharing memory + config + mcp.
     loop = asyncio.get_running_loop()
     LOGS.bind_loop(loop)
     TURNS.bind_loop(loop)
     logging.getLogger("brain").addHandler(WebUILogHandler())
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg),
+            create_app(memory, cfg, mcp_client),
             host=HOST, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
@@ -551,6 +582,7 @@ async def main() -> None:
     finally:
         web.should_exit = True
         await web_task
+        await mcp_client.aclose()
         if zc is not None and info is not None:
             zc.unregister_service(info)
             zc.close()

@@ -122,6 +122,16 @@ SPECS: dict[str, Spec] = {
         0.7, "float", False, "behavior",
         "Under-centering factor (FOV is approximate).",
     ),
+
+    # --- MCP / tools (hot) ----------------------------------------------
+    "DEFAULT_LOCATION": Spec(
+        "Seattle, Washington", "str", False, "tools",
+        "Default location for the weather tool when the user doesn't name one.",
+    ),
+    # Note: HUE_BRIDGE_IP and HUE_TOKEN live in .env, not here — the Hue
+    # MCP server reads them from its environment (HUE_BRIDGE_IP passes
+    # through the child env; HUE_TOKEN is injected via the server's
+    # env_ref). Set once out-of-band; see mcp_servers/README.md.
 }
 
 

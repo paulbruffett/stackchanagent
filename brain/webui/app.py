@@ -23,7 +23,7 @@ from webui.logbuf import LOGS, TURNS, Broadcaster
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app(memory: Memory, config: Config) -> FastAPI:
+def create_app(memory: Memory, config: Config, mcp: Any = None) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
     @app.middleware("http")
@@ -109,6 +109,67 @@ def create_app(memory: Memory, config: Config) -> FastAPI:
                 for t in memory.recent_turns(limit)
             ]
         }
+
+    # --- MCP servers (Phase 9b) ---------------------------------------
+    @app.get("/api/mcp/servers")
+    async def list_mcp() -> dict[str, Any]:
+        # Merge persisted registry rows with live connection status.
+        status = {s["name"]: s for s in (mcp.status() if mcp else [])}
+        servers = []
+        for s in memory.list_mcp_servers():
+            live = status.get(s.name, {})
+            servers.append({
+                "id": s.id, "name": s.name, "transport": s.transport,
+                "command": s.command, "args": s.args, "url": s.url,
+                "env_ref": s.env_ref, "enabled": s.enabled,
+                "connected": live.get("connected", False),
+                "error": live.get("error"),
+                "tools": live.get("tools", []),
+            })
+        return {"servers": servers, "mcp_available": mcp is not None}
+
+    @app.post("/api/mcp/servers")
+    async def add_mcp(body: dict[str, Any]) -> dict[str, Any]:
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "missing 'name'")
+        try:
+            sid = memory.add_mcp_server(
+                name=name,
+                transport=body.get("transport", "stdio"),
+                command=body.get("command"),
+                args=body.get("args") or [],
+                url=body.get("url"),
+                env_ref=body.get("env_ref") or None,
+                enabled=bool(body.get("enabled", True)),
+            )
+        except Exception as exc:
+            raise HTTPException(400, f"could not add server: {exc}")
+        return {"id": sid}
+
+    @app.put("/api/mcp/servers/{server_id}")
+    async def edit_mcp(server_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"name", "transport", "command", "args", "url",
+                   "env_ref", "enabled"}
+        fields = {k: v for k, v in body.items() if k in allowed}
+        if not fields:
+            raise HTTPException(400, "no editable fields")
+        if not memory.update_mcp_server(server_id, **fields):
+            raise HTTPException(404, "no such server")
+        return {"ok": True}
+
+    @app.delete("/api/mcp/servers/{server_id}")
+    async def remove_mcp(server_id: int) -> dict[str, Any]:
+        if not memory.delete_mcp_server(server_id):
+            raise HTTPException(404, "no such server")
+        return {"ok": True}
+
+    @app.post("/api/mcp/reload")
+    async def reload_mcp() -> dict[str, Any]:
+        if mcp is None:
+            raise HTTPException(503, "MCP client not available")
+        await mcp.reload()
+        return {"servers": mcp.status()}
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")
