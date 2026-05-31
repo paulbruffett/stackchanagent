@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stack-Chan brain</title>
+  <style>
+    :root { --bg:#11131a; --panel:#1b1e29; --fg:#e6e8ef; --muted:#8b93a7;
+            --accent:#6ea8fe; --warn:#f0b429; --line:#2a2e3d; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+    header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; }
+    header h1 { font-size:16px; margin:0; font-weight:600; }
+    nav { display:flex; gap:4px; }
+    nav button { background:none; border:none; color:var(--muted); padding:6px 12px;
+                 border-radius:6px; cursor:pointer; font:inherit; }
+    nav button.active { background:var(--panel); color:var(--fg); }
+    main { padding:18px; max-width:980px; margin:0 auto; }
+    .tab { display:none; } .tab.active { display:block; }
+    .group { margin-bottom:22px; }
+    .group h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em;
+                color:var(--muted); margin:0 0 8px; }
+    .row { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--line); }
+    .row .k { flex:0 0 230px; font-family:ui-monospace,monospace; font-size:13px; }
+    .row .k small { display:block; color:var(--muted); font-family:system-ui; font-size:11px; }
+    .row input { background:var(--bg); border:1px solid var(--line); color:var(--fg);
+                 border-radius:6px; padding:5px 8px; width:160px; font:inherit; }
+    .badge { font-size:10px; padding:1px 6px; border-radius:99px; background:var(--line); color:var(--muted); }
+    .badge.restart { background:#3a2e12; color:var(--warn); }
+    .badge.over { background:#15324a; color:var(--accent); }
+    button.act { background:var(--accent); border:none; color:#06101f; border-radius:6px;
+                 padding:5px 10px; cursor:pointer; font:inherit; font-weight:600; }
+    button.ghost { background:none; border:1px solid var(--line); color:var(--muted); border-radius:6px; padding:4px 9px; cursor:pointer; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; }
+    .fact { display:flex; gap:8px; align-items:center; }
+    .fact input { flex:1; }
+    .muted { color:var(--muted); }
+    .logs { background:#0c0e14; border:1px solid var(--line); border-radius:8px; padding:10px;
+            height:62vh; overflow:auto; font-family:ui-monospace,monospace; font-size:12px; }
+    .logline { white-space:pre-wrap; padding:1px 0; }
+    .lvl-WARNING { color:var(--warn); } .lvl-ERROR { color:#ff6b6b; }
+    .logname { color:var(--accent); }
+    .toolbar { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+    .toolbar input { flex:1; background:var(--bg); border:1px solid var(--line); color:var(--fg);
+                     border-radius:6px; padding:5px 8px; font:inherit; }
+    .tx .t { color:var(--accent); } .tx .r { color:var(--fg); }
+    .tx .meta { color:var(--muted); font-size:11px; margin-top:4px; }
+    .pill { font-size:10px; background:var(--line); padding:1px 7px; border-radius:99px; margin-right:4px; }
+    .ok { color:#4ade80; } .err { color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🤖 Stack-Chan brain</h1>
+    <nav>
+      <button data-tab="config" class="active">Config</button>
+      <button data-tab="memories">Memories</button>
+      <button data-tab="transactions">Transactions</button>
+      <button data-tab="logs">Logs</button>
+    </nav>
+    <span id="status" class="muted" style="margin-left:auto"></span>
+  </header>
+  <main>
+    <section id="config" class="tab active"></section>
+    <section id="memories" class="tab"></section>
+    <section id="transactions" class="tab">
+      <div class="muted" style="margin-bottom:8px">Live voice transactions (newest at top).</div>
+      <div id="tx-list"></div>
+    </section>
+    <section id="logs" class="tab">
+      <div class="toolbar">
+        <input id="log-filter" placeholder="filter (substring match on name/message)…">
+        <button class="ghost" id="log-clear">clear</button>
+      </div>
+      <div id="log-out" class="logs"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

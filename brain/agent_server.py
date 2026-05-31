@@ -23,9 +23,10 @@ import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import numpy as np
+import uvicorn
 from dotenv import load_dotenv
 from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo, Zeroconf
@@ -36,13 +37,17 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from behavior import IdleBehavior
 from claude_agent import AgentSession
+from config import get_config, init_config
 from memory import Memory
 from stt import Transcriber
 from tts import Synthesizer
 from vision import FaceDetector, FaceTracker
+from webui.app import create_app
+from webui.logbuf import LOGS, TURNS, WebUILogHandler, publish_turn
 
 HOST = "0.0.0.0"
 PORT = 8765
+WEB_PORT = 8080
 MDNS_NAME = "stackchan-brain"
 
 OP_AUDIO = 0x01
@@ -54,31 +59,12 @@ FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 320
 FRAME_BYTES = FRAME_SAMPLES * 2                  # 640
 
-# VAD: a frame's RMS must clear SPEECH_RMS to be "voiced".
-# Speech ends after SILENCE_TAIL_MS of consecutive sub-threshold frames,
-# but only once we've actually heard SPEECH_LEAD_MS of voiced frames.
-# 150 is a quiet-room threshold; bump it if the device picks up too much
-# background hum and refuses to end utterances.
-SPEECH_RMS = 150
-SILENCE_TAIL_MS = 700
-SPEECH_LEAD_MS = 200
-MAX_UTTERANCE_MS = 10000
-
-# Proactive greeting gates.
-GREETING_COOLDOWN_S = 1800.0  # at most one greeting per 30 minutes per conn
-RECENT_INTERACTION_S = 90.0   # silent if user has spoken in the last 90 s
-
-# Follow-up window: after a non-silent reply, keep the mic open this long
-# so the user can continue without re-saying the wakeword. If they don't
-# start speaking before the timeout, close out and re-arm wakeword.
-FOLLOW_UP_WINDOW_S = 8.0
-
-# Face-detection cadence. The camera_pump on firmware fires every ~1.5 s
-# regardless (so describe_view always has a recent frame), but we only
-# RUN detection at these intervals to save CPU + avoid noisy tracking.
-# During a look-around sweep we detect every frame, since the robot is
-# actively looking around and a fresh detection should redirect it.
-DETECT_INTERVAL_IDLE_S = 20.0          # default: 20 s between face checks
+# VAD / greeting / follow-up / detect-cadence knobs are now hot-editable
+# via config.py (web UI). Read with get_config().get("SPEECH_RMS") etc.
+# at the use sites below. Defaults live in config.py::SPECS.
+#
+# DETECT_INTERVAL_LOOK_AROUND_S stays a constant — during a sweep we want
+# detection on every frame, and 0.0 ("every frame") is not a useful knob.
 DETECT_INTERVAL_LOOK_AROUND_S = 0.0    # 0 = every frame (~1.5 s)
 
 log = logging.getLogger("brain")
@@ -242,17 +228,28 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     )
 
     agent = ensure_agent(ws, state)
+    tool_calls: list[dict[str, Any]] = []
+    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    if follow_up_turn:
-        run = lambda spk: agent.respond_follow_up(transcript.text, spk)
-    else:
-        run = lambda spk: agent.respond(transcript.text, spk)
-    speak_text = await _drive_agent_turn(ws, state, run)
-    log.info(
-        "agent turn: %d ms total, %r",
-        int((time.monotonic() - t0) * 1000),
-        speak_text[:120],
-    )
+    try:
+        if follow_up_turn:
+            run = lambda spk: agent.respond_follow_up(transcript.text, spk)
+        else:
+            run = lambda spk: agent.respond(transcript.text, spk)
+        speak_text = await _drive_agent_turn(ws, state, run)
+    finally:
+        agent.on_tool = None
+    total_ms = int((time.monotonic() - t0) * 1000)
+    log.info("agent turn: %d ms total, %r", total_ms, speak_text[:120])
+    publish_turn({
+        "ts": time.time(),
+        "transcript": transcript.text,
+        "follow_up": follow_up_turn,
+        "tools": tool_calls,
+        "reply": speak_text,
+        "stt_ms": transcript.latency_ms,
+        "total_ms": total_ms,
+    })
 
     state.last_user_interaction_s = time.monotonic()
 
@@ -278,7 +275,7 @@ async def _open_follow_up_window(ws: ServerConnection, state: ConnState) -> None
     state.listening = True
     state.follow_up = True
     await ws.send(json.dumps({"cmd": "start_listening"}))
-    log.info("follow-up window opened (%.1fs)", FOLLOW_UP_WINDOW_S)
+    log.info("follow-up window opened (%.1fs)", get_config().get("FOLLOW_UP_WINDOW_S"))
 
     state.follow_up_timeout = asyncio.create_task(
         _follow_up_timeout_task(ws, state)
@@ -293,10 +290,10 @@ async def _follow_up_timeout_task(
     speaking, the existing VAD path handles end-of-utterance and this
     task is cancelled by respond() before this branch runs."""
     try:
-        await asyncio.sleep(FOLLOW_UP_WINDOW_S)
+        await asyncio.sleep(get_config().get("FOLLOW_UP_WINDOW_S"))
     except asyncio.CancelledError:
         return
-    if state.voiced_ms >= SPEECH_LEAD_MS:
+    if state.voiced_ms >= get_config().get("SPEECH_LEAD_MS"):
         # User started talking — let the normal VAD path finish.
         return
     log.info("follow-up window timed out (no speech) — closing")
@@ -322,11 +319,11 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
         log.info("greet skipped: busy (listening=%s speaking=%s)",
                  state.listening, state.speaking)
         return
-    if now - state.last_greeting_s < GREETING_COOLDOWN_S:
+    if now - state.last_greeting_s < get_config().get("GREETING_COOLDOWN_S"):
         log.info("greet skipped: cooldown (%.0fs since last)",
                  now - state.last_greeting_s)
         return
-    if now - state.last_user_interaction_s < RECENT_INTERACTION_S:
+    if now - state.last_user_interaction_s < get_config().get("RECENT_INTERACTION_S"):
         log.info("greet skipped: recent interaction (%.0fs ago)",
                  now - state.last_user_interaction_s)
         return
@@ -335,20 +332,32 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
     log.info("proactive greeting: new face")
 
     agent = ensure_agent(ws, state)
+    tool_calls: list[dict[str, Any]] = []
+    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    speak_text = await _drive_agent_turn(
-        ws,
-        state,
-        lambda spk: agent.respond_to_event(
-            "A new person just appeared in front of you. Greet them in one "
-            "short, friendly sentence.",
-            spk,
-        ),
-    )
-    log.info(
-        "greet turn: %d ms, %r",
-        int((time.monotonic() - t0) * 1000), speak_text[:120],
-    )
+    try:
+        speak_text = await _drive_agent_turn(
+            ws,
+            state,
+            lambda spk: agent.respond_to_event(
+                "A new person just appeared in front of you. Greet them in one "
+                "short, friendly sentence.",
+                spk,
+            ),
+        )
+    finally:
+        agent.on_tool = None
+    total_ms = int((time.monotonic() - t0) * 1000)
+    log.info("greet turn: %d ms, %r", total_ms, speak_text[:120])
+    publish_turn({
+        "ts": time.time(),
+        "transcript": "[new face — proactive greeting]",
+        "follow_up": False,
+        "tools": tool_calls,
+        "reply": speak_text,
+        "stt_ms": None,
+        "total_ms": total_ms,
+    })
 
 
 async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
@@ -397,8 +406,9 @@ async def handle(ws: ServerConnection) -> None:
                     continue
                 frame = msg[1:]
                 state.speech_buf.extend(frame)
+                cfg = get_config()
                 rms = frame_rms(frame)
-                if rms >= SPEECH_RMS:
+                if rms >= cfg.get("SPEECH_RMS"):
                     state.voiced_ms += FRAME_MS
                     state.trailing_silence_ms = 0
                 else:
@@ -407,10 +417,10 @@ async def handle(ws: ServerConnection) -> None:
                 elapsed_ms = int((time.monotonic() - state.started_at) * 1000)
 
                 end_by_silence = (
-                    state.voiced_ms >= SPEECH_LEAD_MS
-                    and state.trailing_silence_ms >= SILENCE_TAIL_MS
+                    state.voiced_ms >= cfg.get("SPEECH_LEAD_MS")
+                    and state.trailing_silence_ms >= cfg.get("SILENCE_TAIL_MS")
                 )
-                end_by_timeout = elapsed_ms >= MAX_UTTERANCE_MS
+                end_by_timeout = elapsed_ms >= cfg.get("MAX_UTTERANCE_MS")
 
                 if end_by_silence or end_by_timeout:
                     log.info(
@@ -430,7 +440,7 @@ async def handle(ws: ServerConnection) -> None:
                 interval = (
                     DETECT_INTERVAL_LOOK_AROUND_S
                     if state.behavior.look_around_in_progress
-                    else DETECT_INTERVAL_IDLE_S
+                    else get_config().get("DETECT_INTERVAL_IDLE_S")
                 )
                 if time.monotonic() - state.last_detect_s >= interval:
                     state.last_detect_s = time.monotonic()
@@ -496,10 +506,37 @@ def advertise_mdns() -> tuple[Zeroconf, ServiceInfo] | tuple[None, None]:
 
 
 async def main() -> None:
+    global stt, tts
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # Load persisted config overrides, then apply the restart-bound knobs
+    # (TTS voice, STT device/compute/model). These objects are lazy — no
+    # model is loaded until first use — so reconstructing here is cheap and
+    # picks up any web-UI override saved on a previous run.
+    cfg = init_config(memory)
+    tts = Synthesizer(voice=cfg.get("PIPER_VOICE"))
+    stt = Transcriber(
+        model_name=cfg.get("STT_MODEL"),
+        device=cfg.get("STT_DEVICE"),
+        compute_type=cfg.get("STT_COMPUTE_TYPE"),
+    )
+
+    # Web console: tee brain.* logs to the live feed and serve the
+    # FastAPI app in-process on WEB_PORT, sharing memory + config.
+    loop = asyncio.get_running_loop()
+    LOGS.bind_loop(loop)
+    TURNS.bind_loop(loop)
+    logging.getLogger("brain").addHandler(WebUILogHandler())
+    web = uvicorn.Server(
+        uvicorn.Config(
+            create_app(memory, cfg),
+            host=HOST, port=WEB_PORT, loop="none", log_level="warning",
+        )
+    )
+    web_task = asyncio.create_task(web.serve())
+
     zc, info = advertise_mdns()
     try:
         # ping_interval=None: the 78/esp-ml307 WebSocket on the firmware
@@ -509,8 +546,11 @@ async def main() -> None:
             handle, HOST, PORT, max_size=2**20, ping_interval=None
         ):
             log.info("brain listening on ws://%s:%d", HOST, PORT)
+            log.info("web console on http://%s:%d", HOST, WEB_PORT)
             await asyncio.Future()
     finally:
+        web.should_exit = True
+        await web_task
         if zc is not None and info is not None:
             zc.unregister_service(info)
             zc.close()

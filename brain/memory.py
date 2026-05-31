@@ -18,6 +18,11 @@ One DB per device at ~/.stackchan/memory.db. Three tables:
       Things the agent has chosen to remember via the `remember_fact`
       tool. Injected as a system block on every turn.
 
+  config(key, value, updated_ts)
+      Runtime-tunable settings edited from the web UI (Phase 9a).
+      value is a JSON-encoded scalar; absent keys fall back to the
+      code defaults in config.py.
+
 Persists across WS reconnects so the robot remembers prior chats
 within and across sessions.
 """
@@ -62,6 +67,12 @@ CREATE TABLE IF NOT EXISTS known_facts (
     ts REAL NOT NULL,
     fact TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_ts REAL NOT NULL
+);
 """
 
 
@@ -78,6 +89,13 @@ class Summary:
     summary: str
     span_from: int
     span_to: int
+
+
+@dataclass(frozen=True)
+class Fact:
+    id: int
+    ts: float
+    fact: str
 
 
 class Memory:
@@ -159,6 +177,60 @@ class Memory:
             "SELECT fact FROM known_facts ORDER BY id"
         ).fetchall()
         return [r["fact"] for r in rows]
+
+    def list_fact_rows(self) -> list[Fact]:
+        """Facts with ids/timestamps, for the editable web-UI view."""
+        rows = self._conn.execute(
+            "SELECT id, ts, fact FROM known_facts ORDER BY id"
+        ).fetchall()
+        return [Fact(id=r["id"], ts=r["ts"], fact=r["fact"]) for r in rows]
+
+    def update_fact(self, fact_id: int, fact: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE known_facts SET fact = ?, ts = ? WHERE id = ?",
+            (fact, time.time(), fact_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_fact(self, fact_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM known_facts WHERE id = ?", (fact_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def recent_turns(self, limit: int = 50) -> list[Turn]:
+        """Most-recent turns (any summarized state), oldest-first within
+        the returned window. For the web-UI memories view."""
+        rows = self._conn.execute(
+            "SELECT id, role, content_json FROM turns "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        rows.reverse()
+        return [
+            Turn(id=r["id"], role=r["role"], content=json.loads(r["content_json"]))
+            for r in rows
+        ]
+
+    # --- config (Phase 9a web UI) -------------------------------------
+
+    def get_all_config(self) -> dict[str, Any]:
+        """Every stored config override, key → decoded JSON value."""
+        rows = self._conn.execute(
+            "SELECT key, value FROM config"
+        ).fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    def set_config(self, key: str, value: Any) -> None:
+        self._conn.execute(
+            "INSERT INTO config(key, value, updated_ts) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_ts = excluded.updated_ts",
+            (key, json.dumps(value), time.time()),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

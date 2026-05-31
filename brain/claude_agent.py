@@ -28,6 +28,7 @@ from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
 import tools
+from config import get_config
 from memory import Memory, Turn
 
 # Sentence-end punctuation followed by whitespace (or end of buffer). The
@@ -93,6 +94,12 @@ class AgentSession:
         self.ws = ws
         self.client = AsyncAnthropic()
         self.memory = memory
+        # Conversational model, read once per session from config (so a
+        # web-UI change applies to the next connection — "restart-ish").
+        self.model = get_config().get("MODEL")
+        # Optional observer (set per-turn by the web-UI turn recorder).
+        # Called with (tool_name, tool_input) as each tool is dispatched.
+        self.on_tool: Callable[[str, Any], None] | None = None
         # Serializes user turns and the background summarizer so
         # self.messages isn't rewritten mid-call.
         self._turn_lock = asyncio.Lock()
@@ -187,7 +194,7 @@ class AgentSession:
         while True:
             buf = ""
             async with self.client.messages.stream(
-                model=MODEL,
+                model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=self._build_system(),
                 tools=tools.TOOL_DEFS,
@@ -242,6 +249,11 @@ class AgentSession:
                 if block.type != "tool_use":
                     continue
                 log.info("tool: %s %s", block.name, block.input)
+                if self.on_tool is not None:
+                    try:
+                        self.on_tool(block.name, block.input)
+                    except Exception:
+                        log.exception("on_tool observer failed")
                 result = await tools.dispatch(
                     block.name, block.input, self._tool_ctx
                 )
@@ -343,7 +355,7 @@ async def _maybe_summarize(session: "AgentSession") -> None:
         )
         try:
             resp = await session.client.messages.create(
-                model=MODEL,
+                model=session.model,
                 max_tokens=400,
                 system=[{"type": "text", "text": SUMMARIZE_SYSTEM}],
                 messages=[{"role": "user", "content": transcript}],
