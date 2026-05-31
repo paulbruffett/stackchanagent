@@ -36,7 +36,7 @@ async function loadConfig() {
   for (const [g, rows] of Object.entries(groups)) {
     const sec = el("div", { className: "group" }, el("h2", { textContent: g }));
     for (const it of rows) {
-      const input = el("input", { value: it.value, dataset: { key: it.key } });
+      const input = el("input", { value: it.value });
       const label = el("div", { className: "k" });
       label.append(it.key, el("small", { textContent: it.help }));
       const save = el("button", { className: "act", textContent: "Save" });
