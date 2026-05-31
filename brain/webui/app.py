@@ -12,7 +12,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -25,6 +25,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 def create_app(memory: Memory, config: Config) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
+
+    @app.middleware("http")
+    async def revalidate_static(request: Request, call_next):
+        """Force the browser to revalidate the SPA assets on every load
+        instead of serving a stale cached copy across deploys. `no-cache`
+        means "always revalidate", not "never store" — StaticFiles' etag /
+        last-modified still yield cheap 304s when nothing changed."""
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/")
     async def index() -> FileResponse:
