@@ -83,9 +83,22 @@ public:
     int getCurrentAngle() override
     {
         int current_pos = _scs_bus.ReadPos(_config.id);
-        int angle       = (current_pos - _zero_pos) * 5 * 10 / 16;
-        angle           = uitk::clamp(angle, getAngleLimit().x, getAngleLimit().y);
+        // ReadPos returns -1 (and otherwise can return corrupt values) on a
+        // failed/contended bus read. Pushed through the angle math, that
+        // yields a value far outside range that clamps to the servo limit
+        // (e.g. yaw -> -1280 = -128°). When auto-angle-sync teleports that
+        // into the spring start, the head sweeps wildly to the rail and
+        // back. Reject reads whose raw position is outside the servo's
+        // valid range and reuse the last good angle instead.
+        if (current_pos < _config.rawPosLimit.x || current_pos > _config.rawPosLimit.y) {
+            mclog::tagWarn(_tag, "id: {} bad ReadPos {}; reusing last good angle {}", _config.id, current_pos,
+                           _last_good_angle);
+            return _last_good_angle;
+        }
+        int angle = (current_pos - _zero_pos) * 5 * 10 / 16;
+        angle     = uitk::clamp(angle, getAngleLimit().x, getAngleLimit().y);
         // mclog::tagInfo(_tag, "id: {} current pos: {} angle: {}", _id, current_pos, angle);
+        _last_good_angle = angle;
         return angle;
     }
 
@@ -148,8 +161,9 @@ private:
     enum class Mode { Position = 0, PWM = 1 };
 
     ServoConfig_t _config;
-    int _zero_pos      = 0;
-    Mode _current_mode = Mode::Position;
+    int _zero_pos        = 0;
+    int _last_good_angle = 0;
+    Mode _current_mode   = Mode::Position;
 
     void check_mode(Mode targetMode)
     {
