@@ -53,17 +53,17 @@ REST_YAW_DEG = 0.0
 REST_PITCH_DEG = 20.0
 
 # Sweep poses (yaw_deg, pitch_deg). Stays inside the servo limits and
-# returns to rest at the end so consecutive sweeps start from the
-# same place. Routes left → center → right (max single step 25°) so
-# there is no full-width L→R reversal; an earlier ±35° left-then-right
-# sweep read as a rapid back-and-forth snap. The dwell
-# (LOOK_AROUND_POSE_DURATION_S) must also be long enough for the spring
-# at kLookAtSpeed=200 to settle at each target, or the next pose
-# preempts mid-flight and reintroduces the snap.
+# returns to rest at the end so consecutive sweeps start from the same
+# place. Routes through center between the left/right extremes so there
+# is no full-width L→R reversal in a single step. Sweep speed is the
+# LOOK_AROUND_SPEED config knob (snappier than centering); the dwell
+# (LOOK_AROUND_POSE_DURATION_S) still needs to be long enough for the
+# spring to settle at each target before the next pose.
 LOOK_AROUND_POSES: list[tuple[float, float]] = [
-    (-25.0, 25.0),                          # glance up-left
-    (0.0, 30.0),                            # back through center (no L→R snap)
-    (+25.0, 25.0),                          # glance up-right
+    (-45.0, 30.0),                          # glance far up-left
+    (0.0, 40.0),                            # center, tipped up
+    (+45.0, 30.0),                          # glance far up-right
+    (0.0, 15.0),                            # center, dipped down
     (REST_YAW_DEG, REST_PITCH_DEG),         # rest
 ]
 
@@ -149,9 +149,10 @@ class IdleBehavior:
         """Run the multi-pose sweep. Always finishes — no interruption."""
         log.info("look-around: starting (%d poses)", len(LOOK_AROUND_POSES))
         try:
+            speed = get_config().get("LOOK_AROUND_SPEED")
             for i, (yaw, pitch) in enumerate(LOOK_AROUND_POSES):
                 await self._send_look_at(
-                    ws, yaw, pitch, source=f"look-around[{i}]"
+                    ws, yaw, pitch, source=f"look-around[{i}]", speed=speed
                 )
                 await asyncio.sleep(get_config().get("LOOK_AROUND_POSE_DURATION_S"))
         finally:
@@ -164,19 +165,19 @@ class IdleBehavior:
         yaw: float,
         pitch: float,
         source: str = "?",
+        speed: int | None = None,
     ) -> None:
+        cmd = {"cmd": "look_at", "yaw_deg": yaw, "pitch_deg": pitch}
+        if speed is not None:
+            cmd["speed"] = speed
         try:
-            await ws.send(
-                json.dumps(
-                    {"cmd": "look_at", "yaw_deg": yaw, "pitch_deg": pitch}
-                )
-            )
+            await ws.send(json.dumps(cmd))
         except Exception:
             log.exception("look_at send failed")
             return
         log.info(
-            "send look_at: yaw=%.1f pitch=%.1f (source=%s)",
-            yaw, pitch, source,
+            "send look_at: yaw=%.1f pitch=%.1f speed=%s (source=%s)",
+            yaw, pitch, speed, source,
         )
         self.head_yaw = yaw
         self.head_pitch = pitch

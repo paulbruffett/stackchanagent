@@ -58,8 +58,14 @@ void apply_look_at(JsonDocument& doc)
     if (yaw > 1280) yaw = 1280;
     if (pitch < 30) pitch = 30;
     if (pitch > 870) pitch = 870;
-    GetStackChan().motion().moveWithSpeed(yaw, pitch, kLookAtSpeed);
-    mclog::tagInfo(TAG, "look_at: yaw={}° pitch={}°", yaw_deg, pitch_deg);
+    // Optional per-command spring speed (0..1000). Absent → kLookAtSpeed
+    // (the gentle default used for face-centering and agent look_at). The
+    // brain sends a higher speed for look-around sweep poses.
+    int speed = doc["speed"] | kLookAtSpeed;
+    if (speed < 0) speed = 0;
+    if (speed > 1000) speed = 1000;
+    GetStackChan().motion().moveWithSpeed(yaw, pitch, speed);
+    mclog::tagInfo(TAG, "look_at: yaw={}° pitch={}° speed={}", yaw_deg, pitch_deg, speed);
 }
 
 }  // namespace

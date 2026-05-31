@@ -275,9 +275,11 @@ void StackChanAvatarDisplay::SetupUI()
 
     auto config        = hal_bridge::get_xiaozhi_config();
     idle_motion_level_ = config.idleRandomMovementLevel;
-    // Phase-6 diagnostic: pin idle servo motion off to test whether
-    // IdleMotionModifier is the source of the post-look_at yaw spikes.
-    // Revert once the trace is captured.
+    // Intentionally force idle servo motion OFF: the agent drives all head
+    // motion from the brain (periodic look-around + face centering over the
+    // look_at command). The firmware's autonomous IdleMotionModifier would
+    // fight that controller and move the head outside the brain's intended
+    // envelope, so it stays disabled regardless of the xiaozhi config level.
     idle_motion_level_ = 0;
 
     ESP_LOGI(TAG, "Avatar created and started");

@@ -108,6 +108,12 @@ SPECS: dict[str, Spec] = {
         4.0, "float", False, "behavior",
         "Dwell time at each look-around pose.",
     ),
+    "LOOK_AROUND_SPEED": Spec(
+        350, "int", False, "behavior",
+        "Servo spring speed (0-1000) for look-around sweep poses; higher = "
+        "snappier glance. Centering and agent look_at keep the gentler "
+        "firmware default.",
+    ),
     "CENTERING_COOLDOWN_S": Spec(
         180.0, "float", False, "behavior",
         "Lockout after centering on a face before the next centering.",
