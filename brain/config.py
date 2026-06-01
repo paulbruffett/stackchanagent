@@ -138,6 +138,31 @@ SPECS: dict[str, Spec] = {
     # MCP server reads them from its environment (HUE_BRIDGE_IP passes
     # through the child env; HUE_TOKEN is injected via the server's
     # env_ref). Set once out-of-band; see mcp_servers/README.md.
+
+    # --- Responsiveness during slow tool calls (hot) --------------------
+    # int 0/1 are used as booleans (the config layer has no bool type);
+    # `get()` returns the int and truthiness works at the use site.
+    "ACK_FILLER": Spec(
+        1, "int", False, "responsiveness",
+        "Speak a short canned acknowledgement (e.g. 'Let me check on "
+        "that.') when a tool call runs and the model hasn't already said "
+        "something, so there's audio within ~1s even on a slow tool. "
+        "1=on, 0=off.",
+    ),
+    "ACK_FILLER_PHRASES": Spec(
+        "Let me check on that.|One sec.|Let me take a look.|"
+        "Give me just a moment.",
+        "str", False, "responsiveness",
+        "Pipe-separated acknowledgement phrases; one is chosen at random "
+        "each time. Leave empty to disable the spoken ack regardless of "
+        "ACK_FILLER.",
+    ),
+    "BUSY_INDICATOR": Spec(
+        1, "int", False, "responsiveness",
+        "Show an on-screen 'thinking' indicator (a '…' speech bubble) "
+        "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
+        "Requires firmware with the set_busy command.",
+    ),
 }
 
 

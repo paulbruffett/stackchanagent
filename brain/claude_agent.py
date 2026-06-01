@@ -20,7 +20,9 @@ Default model: claude-haiku-4-5. Sonnet escalation is Phase 6.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
 import re
 from typing import Any, Awaitable, Callable
 
@@ -55,6 +57,18 @@ def _strip_brackets(text: str, depth: int) -> tuple[str, int]:
         elif depth == 0:
             out.append(ch)
     return "".join(out), depth
+
+
+def _pick_filler() -> str:
+    """Return a short canned acknowledgement to speak before a slow tool
+    call, or "" when disabled. Chosen at random from the configured
+    pipe-separated phrase list so it doesn't get repetitive."""
+    cfg = get_config()
+    if not cfg.get("ACK_FILLER"):
+        return ""
+    raw = cfg.get("ACK_FILLER_PHRASES") or ""
+    phrases = [p.strip() for p in raw.split("|") if p.strip()]
+    return random.choice(phrases) if phrases else ""
 
 log = logging.getLogger("brain.agent")
 
@@ -216,91 +230,140 @@ class AgentSession:
             defs += self._tool_ctx.mcp.tool_defs()
         return defs
 
+    async def _set_busy(self, on: bool) -> None:
+        """Toggle the firmware's on-screen 'thinking' indicator. Best
+        effort — a failed send (e.g. the device just disconnected) must
+        never break the turn. No-op when disabled in config or when the
+        firmware doesn't understand the cmd (it logs + ignores unknowns)."""
+        if not get_config().get("BUSY_INDICATOR"):
+            return
+        try:
+            await self.ws.send(json.dumps({"cmd": "set_busy", "on": on}))
+        except Exception:
+            log.exception("set_busy send failed")
+
     async def _run_loop(self, speak: SpeakFn) -> str:
         assembled: list[str] = []
-        while True:
-            buf = ""
-            bracket_depth = 0
-            async with self.client.messages.stream(
-                model=self.model,
-                max_tokens=MAX_TOKENS,
-                system=self._build_system(),
-                tools=self._tool_defs(),
-                messages=self.messages,
-            ) as stream:
-                async for delta in stream.text_stream:
-                    # Never speak [bracketed] text. Brackets are reserved
-                    # for system stage directions in the prompt; the model
-                    # sometimes leaks its own reasoning in brackets
-                    # ("[The user is just chatting...]") on follow-up turns.
-                    # Strip those spans from spoken output — if the whole
-                    # reply was bracketed, nothing is spoken and the turn
-                    # ends silently (no follow-up window opens).
-                    clean, bracket_depth = _strip_brackets(delta, bracket_depth)
-                    buf += clean
-                    # Flush every completed sentence as it lands. Pre-
-                    # tool commentary ("Let me check…") still gets
-                    # spoken on tool-use turns — that's appropriate.
-                    while True:
-                        m = _SENT_END.search(buf)
-                        if not m:
-                            break
-                        end = m.end()
-                        sentence = buf[:end].strip()
-                        buf = buf[end:].lstrip()
-                        if sentence:
-                            assembled.append(sentence)
-                            await speak(sentence)
-                response = await stream.get_final_message()
+        # Whether the on-screen busy indicator is currently shown, and
+        # whether we've already spoken a canned ack this turn. Both reset
+        # per call; the ack is spoken at most once even across a multi-tool
+        # chain. Cleared in `finally` so a mid-turn error can't leave the
+        # "thinking" bubble stuck on screen.
+        busy = False
+        filler_spoken = False
+        try:
+            while True:
+                buf = ""
+                bracket_depth = 0
+                async with self.client.messages.stream(
+                    model=self.model,
+                    max_tokens=MAX_TOKENS,
+                    system=self._build_system(),
+                    tools=self._tool_defs(),
+                    messages=self.messages,
+                ) as stream:
+                    async for delta in stream.text_stream:
+                        # Never speak [bracketed] text. Brackets are reserved
+                        # for system stage directions in the prompt; the model
+                        # sometimes leaks its own reasoning in brackets
+                        # ("[The user is just chatting...]") on follow-up turns.
+                        # Strip those spans from spoken output — if the whole
+                        # reply was bracketed, nothing is spoken and the turn
+                        # ends silently (no follow-up window opens).
+                        clean, bracket_depth = _strip_brackets(delta, bracket_depth)
+                        buf += clean
+                        # Flush every completed sentence as it lands. Pre-
+                        # tool commentary ("Let me check…") still gets
+                        # spoken on tool-use turns — that's appropriate.
+                        while True:
+                            m = _SENT_END.search(buf)
+                            if not m:
+                                break
+                            end = m.end()
+                            sentence = buf[:end].strip()
+                            buf = buf[end:].lstrip()
+                            if sentence:
+                                # The real reply is arriving — drop the
+                                # "thinking" bubble just before its audio.
+                                if busy:
+                                    await self._set_busy(False)
+                                    busy = False
+                                assembled.append(sentence)
+                                await speak(sentence)
+                    response = await stream.get_final_message()
 
-            # Flush any trailing partial (model that ended without
-            # final punctuation, or short tool-use commentary).
-            tail = buf.strip()
-            if tail:
-                assembled.append(tail)
-                await speak(tail)
+                # Flush any trailing partial (model that ended without
+                # final punctuation, or short tool-use commentary).
+                tail = buf.strip()
+                if tail:
+                    if busy:
+                        await self._set_busy(False)
+                        busy = False
+                    assembled.append(tail)
+                    await speak(tail)
 
-            # Persist the assistant turn. Strip stream-only fields like
-            # `parsed_output` — the SDK populates them on streaming text
-            # blocks, but the API rejects them on input when the message
-            # is replayed on the next turn.
-            content_clean = [_clean_block(b) for b in response.content]
-            self._append({"role": "assistant", "content": content_clean})
+                # Persist the assistant turn. Strip stream-only fields like
+                # `parsed_output` — the SDK populates them on streaming text
+                # blocks, but the API rejects them on input when the message
+                # is replayed on the next turn.
+                content_clean = [_clean_block(b) for b in response.content]
+                self._append({"role": "assistant", "content": content_clean})
 
-            if response.stop_reason != "tool_use":
-                full = " ".join(assembled)
-                log.info(
-                    "agent reply: %r (in=%d out=%d cache_r=%d cache_w=%d)",
-                    full[:120],
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                    response.usage.cache_read_input_tokens,
-                    response.usage.cache_creation_input_tokens,
-                )
-                asyncio.create_task(_maybe_summarize(self))
-                return full
+                if response.stop_reason != "tool_use":
+                    if busy:
+                        await self._set_busy(False)
+                        busy = False
+                    full = " ".join(assembled)
+                    log.info(
+                        "agent reply: %r (in=%d out=%d cache_r=%d cache_w=%d)",
+                        full[:120],
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        response.usage.cache_read_input_tokens,
+                        response.usage.cache_creation_input_tokens,
+                    )
+                    asyncio.create_task(_maybe_summarize(self))
+                    return full
 
-            tool_results: list[dict[str, Any]] = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                log.info("tool: %s %s", block.name, block.input)
-                if self.on_tool is not None:
-                    try:
-                        self.on_tool(block.name, block.input)
-                    except Exception:
-                        log.exception("on_tool observer failed")
-                result = await tools.dispatch(
-                    block.name, block.input, self._tool_ctx
-                )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    }
-                )
-            self._append({"role": "user", "content": tool_results})
+                # Tool-use turn: show we're working and — if the model went
+                # straight to a tool without saying anything — speak a short
+                # canned ack so the user hears feedback within ~1s even when
+                # the tool (weather, vision, lights) is slow. `assembled`
+                # being empty means nothing real was spoken yet, which also
+                # de-dupes against any pre-tool commentary the model emitted.
+                if not busy:
+                    await self._set_busy(True)
+                    busy = True
+                if not assembled and not filler_spoken:
+                    filler = _pick_filler()
+                    if filler:
+                        filler_spoken = True
+                        await speak(filler)
+
+                tool_results: list[dict[str, Any]] = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    log.info("tool: %s %s", block.name, block.input)
+                    if self.on_tool is not None:
+                        try:
+                            self.on_tool(block.name, block.input)
+                        except Exception:
+                            log.exception("on_tool observer failed")
+                    result = await tools.dispatch(
+                        block.name, block.input, self._tool_ctx
+                    )
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        }
+                    )
+                self._append({"role": "user", "content": tool_results})
+        finally:
+            if busy:
+                await self._set_busy(False)
 
 
 _STREAM_ONLY_FIELDS = ("parsed_output",)
