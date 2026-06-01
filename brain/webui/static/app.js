@@ -17,6 +17,7 @@ $$("nav button").forEach((b) =>
     $$(".tab").forEach((t) => t.classList.toggle("active", t.id === b.dataset.tab));
     if (b.dataset.tab === "memories") loadMemories();
     if (b.dataset.tab === "config") loadConfig();
+    if (b.dataset.tab === "mcp") loadMcp();
   })
 );
 
@@ -124,6 +125,88 @@ function renderContent(content) {
     if (b.type === "tool_result") return `<span class="pill">result</span>${esc(JSON.stringify(b.content))}`;
     return `<span class="pill">${esc(b.type)}</span>`;
   }).join("<br>");
+}
+
+// ---- MCP ----
+async function loadMcp() {
+  const root = $("#mcp");
+  root.innerHTML = "";
+  const data = await (await fetch("/api/mcp/servers")).json();
+
+  const bar = el("div", { className: "toolbar" });
+  const reload = el("button", { className: "act", textContent: "Reload MCP" });
+  reload.addEventListener("click", async () => {
+    setStatus("reloading MCP…");
+    const r = await fetch("/api/mcp/reload", { method: "POST" });
+    setStatus(r.ok ? "MCP reloaded" : "reload failed", r.ok ? "ok" : "err");
+    loadMcp();
+  });
+  bar.append(el("div", { className: "muted",
+    textContent: "Edits persist immediately; click Reload to (re)connect servers and apply." }),
+    el("span", { style: "flex:1" }), reload);
+  root.append(bar);
+
+  for (const s of data.servers) {
+    const card = el("div", { className: "card" });
+    const dot = s.connected ? `<span class="ok">●</span>` : (s.enabled ? `<span class="err">●</span>` : `<span class="muted">○</span>`);
+    const head = el("div", { className: "fact" });
+    head.innerHTML = `${dot} <b>${esc(s.name)}</b> <span class="muted">${esc(s.transport)}</span>`;
+    const toggle = el("button", { className: "ghost",
+      textContent: s.enabled ? "disable" : "enable" });
+    toggle.addEventListener("click", async () => {
+      await fetch(`/api/mcp/servers/${s.id}`, { method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !s.enabled }) });
+      loadMcp();
+    });
+    const del = el("button", { className: "ghost", textContent: "✕" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete MCP server "${s.name}"?`)) return;
+      await fetch(`/api/mcp/servers/${s.id}`, { method: "DELETE" });
+      loadMcp();
+    });
+    head.append(el("span", { style: "flex:1" }), toggle, del);
+    card.append(head);
+
+    const launch = s.transport === "http" ? esc(s.url || "")
+      : esc([s.command, ...(s.args || [])].join(" "));
+    card.append(el("div", { className: "muted", style: "font-family:ui-monospace,monospace;font-size:12px;margin-top:6px",
+      textContent: launch }));
+    if (s.env_ref) card.append(el("div", { className: "muted", innerHTML: `secret env: <code>${esc(s.env_ref)}</code> (value from .env)` }));
+    if (s.error) card.append(el("div", { className: "err", textContent: s.error }));
+    if (s.tools && s.tools.length)
+      card.append(el("div", { innerHTML: s.tools.map((t) => `<span class="pill">${esc(t)}</span>`).join("") }));
+    root.append(card);
+  }
+
+  // add-server form
+  const form = el("div", { className: "group" }, el("h2", { textContent: "Add server" }));
+  const f = {};
+  const field = (key, ph) => { const i = el("input", { placeholder: ph, style: "width:100%;margin-bottom:6px" }); f[key] = i; return i; };
+  form.append(
+    field("name", "name (e.g. weather)"),
+    field("command", "command (stdio, e.g. python)"),
+    field("args", "args, space-separated (e.g. mcp_servers/weather.py)"),
+    field("env_ref", "secret env var name (optional, e.g. HUE_TOKEN)"),
+  );
+  const add = el("button", { className: "act", textContent: "Add (stdio)" });
+  add.addEventListener("click", async () => {
+    const body = {
+      name: f.name.value.trim(),
+      transport: "stdio",
+      command: f.command.value.trim() || null,
+      args: f.args.value.trim() ? f.args.value.trim().split(/\s+/) : [],
+      env_ref: f.env_ref.value.trim() || null,
+      enabled: true,
+    };
+    if (!body.name) { setStatus("name required", "err"); return; }
+    const r = await fetch("/api/mcp/servers", { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    setStatus(r.ok ? "server added — Reload to connect" : "add failed", r.ok ? "ok" : "err");
+    loadMcp();
+  });
+  form.append(add);
+  root.append(form);
 }
 
 // ---- live log feed ----

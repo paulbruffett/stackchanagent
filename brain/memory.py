@@ -23,6 +23,12 @@ One DB per device at ~/.stackchan/memory.db. Three tables:
       value is a JSON-encoded scalar; absent keys fall back to the
       code defaults in config.py.
 
+  mcp_servers(id, name, transport, command, args_json, url, env_ref, enabled)
+      MCP servers the agent can pull tools from (Phase 9b). NO secret
+      values are stored here — env_ref names an environment variable
+      (loaded from .env) that the client injects when launching a
+      stdio server. transport is "stdio" or "http".
+
 Persists across WS reconnects so the robot remembers prior chats
 within and across sessions.
 """
@@ -73,6 +79,17 @@ CREATE TABLE IF NOT EXISTS config (
     value TEXT NOT NULL,
     updated_ts REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL DEFAULT 'stdio',
+    command TEXT,
+    args_json TEXT NOT NULL DEFAULT '[]',
+    url TEXT,
+    env_ref TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -96,6 +113,18 @@ class Fact:
     id: int
     ts: float
     fact: str
+
+
+@dataclass(frozen=True)
+class McpServer:
+    id: int
+    name: str
+    transport: str          # "stdio" | "http"
+    command: str | None     # stdio: executable
+    args: list[str]         # stdio: argv after command
+    url: str | None         # http: endpoint
+    env_ref: str | None     # name of a .env var to inject (no value stored)
+    enabled: bool
 
 
 class Memory:
@@ -231,6 +260,80 @@ class Memory:
             (key, json.dumps(value), time.time()),
         )
         self._conn.commit()
+
+    # --- MCP server registry (Phase 9b) -------------------------------
+
+    def list_mcp_servers(self) -> list[McpServer]:
+        rows = self._conn.execute(
+            "SELECT id, name, transport, command, args_json, url, env_ref, "
+            "enabled FROM mcp_servers ORDER BY id"
+        ).fetchall()
+        return [self._mcp_row(r) for r in rows]
+
+    @staticmethod
+    def _mcp_row(r: sqlite3.Row) -> McpServer:
+        return McpServer(
+            id=r["id"],
+            name=r["name"],
+            transport=r["transport"],
+            command=r["command"],
+            args=json.loads(r["args_json"] or "[]"),
+            url=r["url"],
+            env_ref=r["env_ref"],
+            enabled=bool(r["enabled"]),
+        )
+
+    def add_mcp_server(
+        self,
+        name: str,
+        transport: str = "stdio",
+        command: str | None = None,
+        args: list[str] | None = None,
+        url: str | None = None,
+        env_ref: str | None = None,
+        enabled: bool = True,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO mcp_servers(name, transport, command, args_json, "
+            "url, env_ref, enabled) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, transport, command, json.dumps(args or []), url, env_ref,
+             int(enabled)),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def update_mcp_server(self, server_id: int, **fields: Any) -> bool:
+        """Update any subset of {name, transport, command, args, url,
+        env_ref, enabled}. `args` is stored JSON-encoded; `enabled` as int."""
+        cols: list[str] = []
+        vals: list[Any] = []
+        for key, value in fields.items():
+            if key == "args":
+                cols.append("args_json = ?")
+                vals.append(json.dumps(value or []))
+            elif key == "enabled":
+                cols.append("enabled = ?")
+                vals.append(int(bool(value)))
+            elif key in ("name", "transport", "command", "url", "env_ref"):
+                cols.append(f"{key} = ?")
+                vals.append(value)
+            else:
+                raise KeyError(f"unknown mcp_server field: {key}")
+        if not cols:
+            return False
+        vals.append(server_id)
+        cur = self._conn.execute(
+            f"UPDATE mcp_servers SET {', '.join(cols)} WHERE id = ?", vals
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_mcp_server(self, server_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM mcp_servers WHERE id = ?", (server_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def close(self) -> None:
         self._conn.close()

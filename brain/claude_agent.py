@@ -90,6 +90,7 @@ class AgentSession:
         memory: Memory,
         get_latest_jpeg: Callable[[], bytes | None] | None = None,
         on_external_head_move: Callable[[float, float], None] | None = None,
+        mcp: Any = None,
     ) -> None:
         self.ws = ws
         self.client = AsyncAnthropic()
@@ -118,6 +119,7 @@ class AgentSession:
             on_external_head_move=(
                 on_external_head_move or (lambda y, p: None)
             ),
+            mcp=mcp,
         )
 
     async def respond(self, user_text: str, speak: SpeakFn) -> str:
@@ -189,6 +191,13 @@ class AgentSession:
         system[-1]["cache_control"] = {"type": "ephemeral"}
         return system
 
+    def _tool_defs(self) -> list[dict[str, Any]]:
+        """Native tools plus any tools the MCP servers currently expose."""
+        defs = list(tools.TOOL_DEFS)
+        if self._tool_ctx.mcp is not None:
+            defs += self._tool_ctx.mcp.tool_defs()
+        return defs
+
     async def _run_loop(self, speak: SpeakFn) -> str:
         assembled: list[str] = []
         while True:
@@ -197,7 +206,7 @@ class AgentSession:
                 model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=self._build_system(),
-                tools=tools.TOOL_DEFS,
+                tools=self._tool_defs(),
                 messages=self.messages,
             ) as stream:
                 async for delta in stream.text_stream:
