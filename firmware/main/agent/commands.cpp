@@ -68,6 +68,22 @@ void apply_look_at(JsonDocument& doc)
     mclog::tagInfo(TAG, "look_at: yaw={}° pitch={}° speed={}", yaw_deg, pitch_deg, speed);
 }
 
+// On-screen "thinking" indicator the brain raises while a slow tool call
+// runs and clears when the reply starts. Uses the avatar's speech bubble
+// (otherwise unused in the agent flow) so it doesn't clobber whatever
+// emotion the agent set via set_expression.
+void apply_set_busy(JsonDocument& doc)
+{
+    bool on = doc["on"] | false;
+    LvglLockGuard lock;
+    if (on) {
+        GetStackChan().avatar().setSpeech("...");
+    } else {
+        GetStackChan().avatar().clearSpeech();
+    }
+    mclog::tagInfo(TAG, "busy: {}", on);
+}
+
 }  // namespace
 
 void dispatch(std::string_view json)
@@ -99,6 +115,8 @@ void dispatch(std::string_view json)
         apply_set_expression(doc);
     } else if (c == "look_at") {
         apply_look_at(doc);
+    } else if (c == "set_busy") {
+        apply_set_busy(doc);
     } else {
         mclog::tagWarn(TAG, "unknown cmd: {}", c);
     }

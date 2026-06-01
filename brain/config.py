@@ -38,6 +38,10 @@ class Spec:
     restart: bool      # True = applies only after a process restart
     group: str         # UI grouping
     help: str
+    # Excluded from describe() so it doesn't render in the generic config
+    # grid — used for values that need a bespoke panel (e.g. the multi-line
+    # system prompt). Still a normal hot knob for get()/set()/reload().
+    hidden: bool = False
 
 
 # The knob catalog. Keys mirror the original module constant names so the
@@ -138,6 +142,59 @@ SPECS: dict[str, Spec] = {
     # MCP server reads them from its environment (HUE_BRIDGE_IP passes
     # through the child env; HUE_TOKEN is injected via the server's
     # env_ref). Set once out-of-band; see mcp_servers/README.md.
+
+    # --- Responsiveness during slow tool calls (hot) --------------------
+    # int 0/1 are used as booleans (the config layer has no bool type);
+    # `get()` returns the int and truthiness works at the use site.
+    "ACK_FILLER": Spec(
+        1, "int", False, "responsiveness",
+        "Speak a short canned acknowledgement (e.g. 'Let me check on "
+        "that.') when a tool call runs and the model hasn't already said "
+        "something, so there's audio within ~1s even on a slow tool. "
+        "1=on, 0=off.",
+    ),
+    "ACK_FILLER_PHRASES": Spec(
+        "Let me check on that.|One sec.|Let me take a look.|"
+        "Give me just a moment.",
+        "str", False, "responsiveness",
+        "Pipe-separated acknowledgement phrases; one is chosen at random "
+        "each time. Leave empty to disable the spoken ack regardless of "
+        "ACK_FILLER.",
+    ),
+    "BUSY_INDICATOR": Spec(
+        1, "int", False, "responsiveness",
+        "Show an on-screen 'thinking' indicator (a '…' speech bubble) "
+        "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
+        "Requires firmware with the set_busy command.",
+    ),
+
+    # --- Memory / summarizer (hot) --------------------------------------
+    "SUMMARIZE_TRIGGER": Spec(
+        20, "int", False, "memory",
+        "Unsummarized-turn backlog that triggers a background fold into a "
+        "summary. Lower = summarize more eagerly (smaller prompts, more "
+        "LLM calls).",
+    ),
+    "KEEP_RECENT_TURNS": Spec(
+        10, "int", False, "memory",
+        "How many of the most recent turns to always keep verbatim (never "
+        "fold into a summary).",
+    ),
+    "SUMMARIZE_SYSTEM": Spec(
+        "", "str", False, "memory",
+        "Override for the summarizer's system prompt. Empty = built-in "
+        "default (claude_agent.DEFAULT_SUMMARIZE_SYSTEM). Read per fold.",
+        hidden=True,
+    ),
+
+    # --- Persona (hot; edited via its own console panel, not the grid) ---
+    "SYSTEM_PROMPT": Spec(
+        "", "str", False, "persona",
+        "Override for the robot's core persona/system prompt. Empty = use "
+        "the built-in default (claude_agent.DEFAULT_SYSTEM_PROMPT). Read "
+        "per-turn, so an edit applies on the next conversation turn.",
+        hidden=True,
+    ),
 }
 
 
@@ -193,6 +250,8 @@ class Config:
         """Snapshot for the web UI: every knob with current/default/meta."""
         out = []
         for key, spec in SPECS.items():
+            if spec.hidden:
+                continue
             out.append({
                 "key": key,
                 "value": self.get(key),
