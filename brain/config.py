@@ -38,6 +38,10 @@ class Spec:
     restart: bool      # True = applies only after a process restart
     group: str         # UI grouping
     help: str
+    # Excluded from describe() so it doesn't render in the generic config
+    # grid — used for values that need a bespoke panel (e.g. the multi-line
+    # system prompt). Still a normal hot knob for get()/set()/reload().
+    hidden: bool = False
 
 
 # The knob catalog. Keys mirror the original module constant names so the
@@ -163,6 +167,15 @@ SPECS: dict[str, Spec] = {
         "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
         "Requires firmware with the set_busy command.",
     ),
+
+    # --- Persona (hot; edited via its own console panel, not the grid) ---
+    "SYSTEM_PROMPT": Spec(
+        "", "str", False, "persona",
+        "Override for the robot's core persona/system prompt. Empty = use "
+        "the built-in default (claude_agent.DEFAULT_SYSTEM_PROMPT). Read "
+        "per-turn, so an edit applies on the next conversation turn.",
+        hidden=True,
+    ),
 }
 
 
@@ -218,6 +231,8 @@ class Config:
         """Snapshot for the web UI: every knob with current/default/meta."""
         out = []
         for key, spec in SPECS.items():
+            if spec.hidden:
+                continue
             out.append({
                 "key": key,
                 "value": self.get(key),

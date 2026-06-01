@@ -72,7 +72,11 @@ def _pick_filler() -> str:
 
 log = logging.getLogger("brain.agent")
 
-SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a face, two servos to point your head, a camera, a microphone, and a speaker. The user is talking to you out loud — your replies are spoken aloud, so:
+# The built-in persona. Editable at runtime: an override is persisted under
+# config key SYSTEM_PROMPT (empty = use this default) and read per-turn in
+# _build_system, so a web-UI edit applies on the next conversation turn with
+# no restart. Kept here as the fallback / "reset to default" target.
+DEFAULT_SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a face, two servos to point your head, a camera, a microphone, and a speaker. The user is talking to you out loud — your replies are spoken aloud, so:
 
 - Keep replies short (one or two sentences usually).
 - No markdown, lists, code blocks, or special characters that don't read well aloud.
@@ -195,8 +199,12 @@ class AgentSession:
         self.memory.append_turn(message["role"], message["content"])
 
     def _build_system(self) -> list[dict[str, Any]]:
+        # Per-turn persona: the web-UI override if set, else the built-in
+        # default. Read here (not cached at construction) so an edit in the
+        # console takes effect on the next turn.
+        override = (get_config().get("SYSTEM_PROMPT") or "").strip()
         system: list[dict[str, Any]] = [
-            {"type": "text", "text": SYSTEM_PROMPT}
+            {"type": "text", "text": override or DEFAULT_SYSTEM_PROMPT}
         ]
 
         facts = self.memory.list_facts()

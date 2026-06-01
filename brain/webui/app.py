@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from claude_agent import DEFAULT_SYSTEM_PROMPT
 from config import Config
 from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
@@ -60,6 +61,36 @@ def create_app(memory: Memory, config: Config, mcp: Any = None) -> FastAPI:
             raise HTTPException(400, f"bad value: {exc}")
         spec = next(i for i in config.describe() if i["key"] == key)
         return {"key": key, "value": value, "restart": spec["restart"]}
+
+    # --- persona / system prompt --------------------------------------
+    # The persona is a hot config knob (SYSTEM_PROMPT) but too large for the
+    # generic config grid, so it gets its own panel. An empty override means
+    # "use the built-in default"; we echo the default so the UI can prefill
+    # the editor and offer a reset.
+    @app.get("/api/system_prompt")
+    async def get_system_prompt() -> dict[str, Any]:
+        override = (config.get("SYSTEM_PROMPT") or "").strip()
+        return {
+            "prompt": override or DEFAULT_SYSTEM_PROMPT,
+            "default": DEFAULT_SYSTEM_PROMPT,
+            "overridden": bool(override),
+        }
+
+    @app.put("/api/system_prompt")
+    async def set_system_prompt(body: dict[str, Any]) -> dict[str, Any]:
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str):
+            raise HTTPException(400, "missing 'prompt'")
+        prompt = prompt.strip()
+        # Empty, or verbatim-equal to the default, both collapse to "no
+        # override" so the device tracks future default changes.
+        if prompt == DEFAULT_SYSTEM_PROMPT.strip():
+            prompt = ""
+        config.set("SYSTEM_PROMPT", prompt)
+        return {
+            "prompt": prompt or DEFAULT_SYSTEM_PROMPT,
+            "overridden": bool(prompt),
+        }
 
     # --- memories -----------------------------------------------------
     @app.get("/api/memories/facts")

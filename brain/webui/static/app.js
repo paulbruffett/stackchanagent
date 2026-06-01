@@ -17,6 +17,7 @@ $$("nav button").forEach((b) =>
     $$(".tab").forEach((t) => t.classList.toggle("active", t.id === b.dataset.tab));
     if (b.dataset.tab === "memories") loadMemories();
     if (b.dataset.tab === "config") loadConfig();
+    if (b.dataset.tab === "persona") loadPersona();
     if (b.dataset.tab === "mcp") loadMcp();
   })
 );
@@ -64,6 +65,52 @@ async function saveConfig(key, value, restart) {
   }
   setStatus(restart ? `${key} saved — applies on restart` : `${key} saved`, "ok");
   loadConfig();
+}
+
+// ---- persona / system prompt ----
+async function loadPersona() {
+  const root = $("#persona");
+  root.innerHTML = "";
+  const data = await (await fetch("/api/system_prompt")).json();
+
+  const sec = el("div", { className: "group" },
+    el("h2", { textContent: "Core persona / system prompt" }));
+  sec.append(el("div", { className: "muted", style: "margin-bottom:8px",
+    textContent: "The robot's core identity, prepended to every turn. Changes apply on the "
+      + "next conversation turn — no restart. Leave it matching the default to track future "
+      + "default changes; edit to override." }));
+
+  const ta = el("textarea", { className: "prompt", spellcheck: false });
+  ta.value = data.prompt;
+  const counter = el("span", { className: "muted" });
+  const count = (suffix) => counter.textContent = `${ta.value.length} chars${suffix || ""}`;
+  count(data.overridden ? " · overridden" : " · default");
+  ta.addEventListener("input", () => count());
+
+  const save = el("button", { className: "act", textContent: "Save" });
+  save.addEventListener("click", () => savePersona(ta.value));
+  const reset = el("button", { className: "ghost", textContent: "Reset to default" });
+  reset.addEventListener("click", () => {
+    if (confirm("Reset the persona to the built-in default?")) savePersona("");
+  });
+
+  const bar = el("div", { className: "toolbar" },
+    counter, el("span", { style: "flex:1" }), reset, save);
+  sec.append(ta, bar);
+  root.append(sec);
+}
+
+async function savePersona(prompt) {
+  const res = await fetch("/api/system_prompt", {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt }),
+  });
+  if (!res.ok) {
+    setStatus(`save failed: ${(await res.json()).detail}`, "err");
+    return;
+  }
+  setStatus("persona saved — applies next turn", "ok");
+  loadPersona();
 }
 
 // ---- memories ----

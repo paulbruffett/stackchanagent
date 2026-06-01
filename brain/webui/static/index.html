@@ -47,6 +47,9 @@
     .tx .meta { color:var(--muted); font-size:11px; margin-top:4px; }
     .pill { font-size:10px; background:var(--line); padding:1px 7px; border-radius:99px; margin-right:4px; }
     .ok { color:#4ade80; } .err { color:#ff6b6b; }
+    textarea.prompt { width:100%; min-height:340px; background:var(--bg); border:1px solid var(--line);
+                      color:var(--fg); border-radius:8px; padding:10px; resize:vertical;
+                      font:13px/1.55 ui-monospace,monospace; margin-bottom:8px; }
   </style>
 </head>
 <body>
@@ -54,6 +57,7 @@
     <h1>🤖 Stack-Chan brain</h1>
     <nav>
       <button data-tab="config" class="active">Config</button>
+      <button data-tab="persona">Persona</button>
       <button data-tab="memories">Memories</button>
       <button data-tab="mcp">MCP</button>
       <button data-tab="transactions">Transactions</button>
@@ -63,6 +67,7 @@
   </header>
   <main>
     <section id="config" class="tab active"></section>
+    <section id="persona" class="tab"></section>
     <section id="memories" class="tab"></section>
     <section id="mcp" class="tab"></section>
     <section id="transactions" class="tab">
