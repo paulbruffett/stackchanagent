@@ -168,6 +168,25 @@ SPECS: dict[str, Spec] = {
         "Requires firmware with the set_busy command.",
     ),
 
+    # --- Memory / summarizer (hot) --------------------------------------
+    "SUMMARIZE_TRIGGER": Spec(
+        20, "int", False, "memory",
+        "Unsummarized-turn backlog that triggers a background fold into a "
+        "summary. Lower = summarize more eagerly (smaller prompts, more "
+        "LLM calls).",
+    ),
+    "KEEP_RECENT_TURNS": Spec(
+        10, "int", False, "memory",
+        "How many of the most recent turns to always keep verbatim (never "
+        "fold into a summary).",
+    ),
+    "SUMMARIZE_SYSTEM": Spec(
+        "", "str", False, "memory",
+        "Override for the summarizer's system prompt. Empty = built-in "
+        "default (claude_agent.DEFAULT_SUMMARIZE_SYSTEM). Read per fold.",
+        hidden=True,
+    ),
+
     # --- Persona (hot; edited via its own console panel, not the grid) ---
     "SYSTEM_PROMPT": Spec(
         "", "str", False, "persona",

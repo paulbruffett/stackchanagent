@@ -8,7 +8,7 @@ stop_reason == tool_use dispatch tools and loop again, else done.
 
 Prompt structure (cached prefix in *brackets*):
   system: [
-    [base SYSTEM_PROMPT],
+    [persona prompt: SYSTEM_PROMPT override or DEFAULT_SYSTEM_PROMPT],
     [known_facts text, if any],
     [summaries text, if any],            ← cache_control here
   ]
@@ -31,7 +31,7 @@ from websockets.asyncio.server import ServerConnection
 
 import tools
 from config import get_config
-from memory import Memory, Turn
+from memory import Memory, Summary, Turn
 
 # Sentence-end punctuation followed by whitespace (or end of buffer). The
 # lookbehind requires an alphanumeric or closing quote/paren so we don't
@@ -98,14 +98,14 @@ Stay in character: curious, friendly, a little informal."""
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
 
-# Rolling summarizer thresholds. Once the unsummarized backlog reaches
-# SUMMARIZE_TRIGGER, fold the oldest half into a Haiku summary, keeping
-# at least KEEP_RECENT_TURNS verbatim. Numbers picked so the verbatim
-# tail still contains 4–5 user turns of context.
-SUMMARIZE_TRIGGER = 20
-KEEP_RECENT_TURNS = 10
+# Rolling summarizer thresholds are now hot config knobs (config.py):
+#   SUMMARIZE_TRIGGER  — backlog size that triggers a background fold
+#   KEEP_RECENT_TURNS  — verbatim tail always preserved
+# Read at the use sites via get_config().get(...).
 
-SUMMARIZE_SYSTEM = (
+# The summarizer system prompt. Editable at runtime via the SUMMARIZE_SYSTEM
+# config override (empty = this default), same pattern as the persona.
+DEFAULT_SUMMARIZE_SYSTEM = (
     "You are summarizing a conversation between a user and Stack-Chan, "
     "a small desktop robot. Produce a concise summary (2-4 sentences) "
     "that preserves: who said what, any facts mentioned about the user "
@@ -113,6 +113,33 @@ SUMMARIZE_SYSTEM = (
     "Write in past tense. Do not include greetings or pleasantries that "
     "weren't substantive."
 )
+
+# Prompt for LLM-driven fact consolidation (web UI "Compact facts").
+CONSOLIDATE_FACTS_SYSTEM = (
+    "You are tidying the list of facts a small desktop robot has chosen to "
+    "remember about its user. Merge duplicates and near-duplicates, drop "
+    "anything stale or contradicted by a later fact, and keep each surviving "
+    "fact a single concise third-person statement. Preserve a fact verbatim "
+    "when it's still useful and already concise. Output ONLY the cleaned "
+    "facts, one per line, with no numbering, bullets, blank lines, or "
+    "commentary."
+)
+
+
+def _summarize_system() -> str:
+    return (get_config().get("SUMMARIZE_SYSTEM") or "").strip() or DEFAULT_SUMMARIZE_SYSTEM
+
+
+def _parse_fact_lines(text: str) -> list[str]:
+    """Pull clean fact lines out of an LLM listing, tolerating stray
+    bullets/numbering the model may add despite instructions."""
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip().lstrip("-*•").strip()
+        s = re.sub(r"^\d+[.)]\s*", "", s)
+        if s:
+            out.append(s)
+    return out
 
 
 class AgentSession:
@@ -433,38 +460,59 @@ def _render_turn(turn: Turn) -> str:
     return f"{speaker}: <unrenderable>"
 
 
-async def _maybe_summarize(session: "AgentSession") -> None:
-    """Background: if the unsummarized backlog is large, summarize the
-    oldest complete-exchange chunk via Haiku and mark those rows
-    summarized. Uses the session's turn lock so it can't race with a
-    concurrent user turn rewriting self.messages."""
-    if session.memory.unsummarized_count() < SUMMARIZE_TRIGGER:
-        return
-    async with session._turn_lock:
-        turns = session.memory.list_unsummarized_turns()
-        if len(turns) < SUMMARIZE_TRIGGER:
-            return  # raced with another summarize
-        cutoff_id = _last_complete_assistant_id(
-            turns, len(turns) - KEEP_RECENT_TURNS
-        )
-        if cutoff_id is None:
-            log.warning(
-                "summarizer: no complete-exchange boundary in first %d turns",
-                len(turns) - KEEP_RECENT_TURNS,
+# Serializes summarization across the whole process: the per-session
+# background summarizer and any web-UI-triggered "summarize now" can't both
+# fold the same span concurrently. Module-level (not per-session) because the
+# web console has no AgentSession of its own.
+_SUMMARIZE_LOCK = asyncio.Lock()
+
+
+async def summarize_backlog(
+    memory: Memory,
+    client: AsyncAnthropic,
+    model: str,
+    *,
+    keep_recent: int,
+    trigger: int | None = None,
+    force: bool = False,
+) -> tuple[Summary | None, str]:
+    """Fold the oldest complete-exchange chunk of unsummarized turns into a
+    single summary row and mark those turns summarized. Always keeps the
+    most recent `keep_recent` turns verbatim and only splits on a complete
+    exchange (so a tool_use/tool_result pair is never torn apart).
+
+    When `force` is False, does nothing unless the backlog has reached
+    `trigger`. Returns (created Summary or None, human-readable reason).
+    Callers that hold live in-memory turn state must re-hydrate it after a
+    non-None result (the session wrapper below does)."""
+    async with _SUMMARIZE_LOCK:
+        turns = memory.list_unsummarized_turns()
+        if not force:
+            if trigger is None:
+                trigger = int(get_config().get("SUMMARIZE_TRIGGER"))
+            if len(turns) < trigger:
+                return None, f"backlog below trigger ({len(turns)}/{trigger})"
+        boundary_idx = len(turns) - keep_recent
+        if boundary_idx <= 0:
+            return None, (
+                f"nothing to fold: {len(turns)} turns, keeping the most "
+                f"recent {keep_recent} verbatim"
             )
-            return
+        cutoff_id = _last_complete_assistant_id(turns, boundary_idx)
+        if cutoff_id is None:
+            return None, "no complete-exchange boundary to split on yet"
         span = [t for t in turns if t.id <= cutoff_id]
         transcript = "\n".join(_render_turn(t) for t in span)
 
         log.info(
-            "summarizing turns %d..%d (%d msgs)",
-            span[0].id, span[-1].id, len(span),
+            "summarizing turns %d..%d (%d msgs, force=%s)",
+            span[0].id, span[-1].id, len(span), force,
         )
         try:
-            resp = await session.client.messages.create(
-                model=session.model,
+            resp = await client.messages.create(
+                model=model,
                 max_tokens=400,
-                system=[{"type": "text", "text": SUMMARIZE_SYSTEM}],
+                system=[{"type": "text", "text": _summarize_system()}],
                 messages=[{"role": "user", "content": transcript}],
             )
             summary = " ".join(
@@ -472,15 +520,63 @@ async def _maybe_summarize(session: "AgentSession") -> None:
             ).strip()
         except Exception:
             log.exception("summarizer call failed")
-            return
+            return None, "summarizer LLM call failed (see logs)"
 
         if not summary:
-            log.warning("summarizer returned empty text")
+            return None, "summarizer returned empty text"
+
+        sid = memory.save_summary(span[0].id, span[-1].id, summary)
+        log.info("summary %d saved (%d chars): %r", sid, len(summary), summary[:160])
+        return (
+            Summary(id=sid, summary=summary,
+                    span_from=span[0].id, span_to=span[-1].id),
+            "ok",
+        )
+
+
+async def consolidate_facts(
+    client: AsyncAnthropic, model: str, facts: list[str]
+) -> list[str]:
+    """Ask the LLM to merge/prune a fact list. Returns the proposed clean
+    list WITHOUT persisting it — the caller shows it for approval and then
+    calls memory.replace_facts(). Returns the input unchanged on an empty
+    list or an LLM error (so a failed call never silently drops facts)."""
+    if not facts:
+        return []
+    listing = "\n".join(f"- {f}" for f in facts)
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=1000,
+            system=[{"type": "text", "text": CONSOLIDATE_FACTS_SYSTEM}],
+            messages=[{"role": "user", "content": listing}],
+        )
+    except Exception:
+        log.exception("fact consolidation call failed")
+        return list(facts)
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    proposed = _parse_fact_lines(text)
+    return proposed or list(facts)
+
+
+async def _maybe_summarize(session: "AgentSession") -> None:
+    """Background: if the unsummarized backlog is large, fold the oldest
+    complete-exchange chunk and re-sync this session's in-memory thread.
+    Holds the session turn lock so it can't race with a concurrent user
+    turn rewriting self.messages."""
+    if session.memory.unsummarized_count() < int(get_config().get("SUMMARIZE_TRIGGER")):
+        return
+    async with session._turn_lock:
+        result, reason = await summarize_backlog(
+            session.memory,
+            session.client,
+            session.model,
+            keep_recent=int(get_config().get("KEEP_RECENT_TURNS")),
+            force=False,
+        )
+        if result is None:
+            log.info("summarizer: %s", reason)
             return
-
-        session.memory.save_summary(span[0].id, span[-1].id, summary)
-        log.info("summary saved (%d chars): %r", len(summary), summary[:160])
-
         # Reset the in-memory thread to match the new persisted state.
         session.messages = [
             {"role": t.role, "content": t.content}

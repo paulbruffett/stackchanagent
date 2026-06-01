@@ -193,6 +193,35 @@ class Memory:
         self._conn.commit()
         return cur.lastrowid
 
+    def update_summary(self, summary_id: int, summary: str) -> bool:
+        """Edit a summary's text in place (web UI). Span is unchanged."""
+        cur = self._conn.execute(
+            "UPDATE summaries SET summary = ?, ts = ? WHERE id = ?",
+            (summary, time.time(), summary_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_summary(self, summary_id: int, unmark_turns: bool = True) -> bool:
+        """Delete a summary. When `unmark_turns` (the default), clear the
+        `summarized` flag on the turns it covered so they replay verbatim
+        again — i.e. "un-summarize" that span. Spans don't overlap (each
+        fold takes a contiguous oldest chunk), so this is safe."""
+        row = self._conn.execute(
+            "SELECT span_from, span_to FROM summaries WHERE id = ?",
+            (summary_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute("DELETE FROM summaries WHERE id = ?", (summary_id,))
+        if unmark_turns:
+            self._conn.execute(
+                "UPDATE turns SET summarized = 0 WHERE id BETWEEN ? AND ?",
+                (row["span_from"], row["span_to"]),
+            )
+        self._conn.commit()
+        return True
+
     def add_fact(self, fact: str) -> int:
         cur = self._conn.execute(
             "INSERT INTO known_facts(ts, fact) VALUES (?, ?)",
@@ -228,6 +257,22 @@ class Memory:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def replace_facts(self, facts: list[str]) -> None:
+        """Atomically replace the entire fact set. Used by LLM fact
+        compaction to apply an approved, consolidated list. Order is
+        preserved (facts are injected oldest-first into the prompt)."""
+        now = time.time()
+        try:
+            self._conn.execute("DELETE FROM known_facts")
+            self._conn.executemany(
+                "INSERT INTO known_facts(ts, fact) VALUES (?, ?)",
+                [(now, f) for f in facts],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def recent_turns(self, limit: int = 50) -> list[Turn]:
         """Most-recent turns (any summarized state), oldest-first within

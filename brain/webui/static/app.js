@@ -123,8 +123,8 @@ async function loadMemories() {
     (await fetch("/api/memories/turns?limit=40")).json(),
   ]);
 
+  // --- facts ---
   const fsec = el("div", { className: "group" }, el("h2", { textContent: `Known facts (${facts.facts.length})` }));
-  if (!facts.facts.length) fsec.append(el("div", { className: "muted", textContent: "none yet" }));
   for (const f of facts.facts) {
     const input = el("input", { value: f.fact });
     const save = el("button", { className: "ghost", textContent: "save" });
@@ -142,18 +142,69 @@ async function loadMemories() {
     });
     fsec.append(el("div", { className: "card fact" }, input, save, del));
   }
+  // add-fact row
+  const addInput = el("input", { placeholder: "add a fact (third person, e.g. 'The user likes tea')" });
+  const addBtn = el("button", { className: "act", textContent: "Add" });
+  addBtn.addEventListener("click", async () => {
+    const fact = addInput.value.trim();
+    if (!fact) return;
+    const r = await fetch("/api/memories/facts", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fact }),
+    });
+    if (r.ok) { setStatus("fact added", "ok"); loadMemories(); }
+    else setStatus("add failed", "err");
+  });
+  fsec.append(el("div", { className: "card fact" }, addInput, addBtn));
+  // compact-facts (LLM)
+  const compact = el("button", { className: "ghost", textContent: "Compact facts (LLM)" });
+  compact.addEventListener("click", compactFacts);
+  const compactBar = el("div", { className: "toolbar" },
+    el("div", { className: "muted", textContent:
+      "Ask the model to merge duplicates and drop stale facts — you approve before anything changes." }),
+    el("span", { style: "flex:1" }), compact);
+  fsec.append(compactBar);
+  fsec.append(el("div", { id: "compact-out" }));
   root.append(fsec);
 
+  // --- summaries ---
   const ssec = el("div", { className: "group" }, el("h2", { textContent: `Summaries (${summaries.summaries.length})` }));
+  const sumNow = el("button", { className: "act", textContent: "Summarize now" });
+  sumNow.addEventListener("click", summarizeNow);
+  ssec.append(el("div", { className: "toolbar" },
+    el("div", { className: "muted", textContent:
+      "Fold the oldest backlog into a summary now (keeps the most recent turns verbatim)." }),
+    el("span", { style: "flex:1" }), sumNow));
   if (!summaries.summaries.length) ssec.append(el("div", { className: "muted", textContent: "none yet" }));
   for (const s of summaries.summaries) {
     const c = el("div", { className: "card" });
-    c.append(el("div", { className: "muted", textContent: `turns ${s.span_from}–${s.span_to}` }),
-             el("div", { textContent: s.summary }));
+    const ta = el("textarea", { className: "sm" });
+    ta.value = s.summary;
+    const save = el("button", { className: "ghost", textContent: "save" });
+    save.addEventListener("click", async () => {
+      const r = await fetch(`/api/memories/summaries/${s.id}`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ summary: ta.value }),
+      });
+      setStatus(r.ok ? "summary updated" : "update failed", r.ok ? "ok" : "err");
+    });
+    const del = el("button", { className: "ghost", textContent: "delete" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete this summary? Turns ${s.span_from}–${s.span_to} will replay verbatim again.`)) return;
+      const r = await fetch(`/api/memories/summaries/${s.id}?unmark=true`, { method: "DELETE" });
+      setStatus(r.ok ? "summary deleted — turns restored" : "delete failed", r.ok ? "ok" : "err");
+      loadMemories();
+    });
+    c.append(
+      el("div", { className: "muted", textContent: `#${s.id} · turns ${s.span_from}–${s.span_to}` }),
+      ta,
+      el("div", { className: "toolbar" }, el("span", { style: "flex:1" }), del, save),
+    );
     ssec.append(c);
   }
   root.append(ssec);
 
+  // --- recent turns (read-only) ---
   const tsec = el("div", { className: "group" }, el("h2", { textContent: "Recent turns" }));
   for (const t of turns.turns) {
     tsec.append(el("div", { className: "card" },
@@ -161,6 +212,49 @@ async function loadMemories() {
       el("div", { innerHTML: renderContent(t.content) })));
   }
   root.append(tsec);
+}
+
+async function summarizeNow() {
+  setStatus("summarizing…");
+  const r = await fetch("/api/memories/summarize", { method: "POST" });
+  const j = await r.json();
+  if (j.ok) { setStatus(`summary created (turns ${j.summary.span_from}–${j.summary.span_to})`, "ok"); loadMemories(); }
+  else setStatus(`nothing summarized: ${j.reason}`, "err");
+}
+
+async function compactFacts() {
+  const out = $("#compact-out");
+  out.innerHTML = "";
+  setStatus("asking the model to consolidate…");
+  const r = await fetch("/api/memories/facts/compact", { method: "POST" });
+  if (!r.ok) { setStatus("compaction failed", "err"); return; }
+  const { original, proposed } = await r.json();
+  setStatus(`proposed ${original.length} → ${proposed.length} facts — review and apply`, "ok");
+
+  // Editable proposed list so the operator can tweak before applying.
+  const ta = el("textarea", { className: "sm" });
+  ta.value = proposed.join("\n");
+  ta.style.minHeight = "160px";
+  const apply = el("button", { className: "act", textContent: `Apply (${proposed.length})` });
+  apply.addEventListener("click", async () => {
+    const facts = ta.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!confirm(`Replace all known facts with these ${facts.length}? This cannot be undone.`)) return;
+    const a = await fetch("/api/memories/facts/apply", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ facts }),
+    });
+    setStatus(a.ok ? "facts replaced" : "apply failed", a.ok ? "ok" : "err");
+    if (a.ok) loadMemories();
+  });
+  const cancel = el("button", { className: "ghost", textContent: "Discard" });
+  cancel.addEventListener("click", () => { out.innerHTML = ""; setStatus(""); });
+  const card = el("div", { className: "card" });
+  card.append(
+    el("div", { className: "muted", textContent: `Proposed consolidated facts (was ${original.length}, now ${proposed.length}) — one per line, editable:` }),
+    ta,
+    el("div", { className: "toolbar" }, el("span", { style: "flex:1" }), cancel, apply),
+  );
+  out.append(card);
 }
 
 function renderContent(content) {

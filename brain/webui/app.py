@@ -16,7 +16,13 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from claude_agent import DEFAULT_SYSTEM_PROMPT
+from anthropic import AsyncAnthropic
+
+from claude_agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    consolidate_facts,
+    summarize_backlog,
+)
 from config import Config
 from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
@@ -26,6 +32,16 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 def create_app(memory: Memory, config: Config, mcp: Any = None) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
+
+    # Lazy Anthropic client for operator-triggered LLM jobs (summarize now,
+    # fact compaction). Created on first use inside the app's event loop and
+    # reused; the agent has its own per-session client.
+    _llm: dict[str, AsyncAnthropic] = {}
+
+    def llm_client() -> AsyncAnthropic:
+        if "c" not in _llm:
+            _llm["c"] = AsyncAnthropic()
+        return _llm["c"]
 
     @app.middleware("http")
     async def revalidate_static(request: Request, call_next):
@@ -111,11 +127,37 @@ def create_app(memory: Memory, config: Config, mcp: Any = None) -> FastAPI:
             raise HTTPException(404, "no such fact")
         return {"ok": True}
 
+    @app.post("/api/memories/facts")
+    async def add_fact(body: dict[str, Any]) -> dict[str, Any]:
+        fact = (body.get("fact") or "").strip() if isinstance(body.get("fact"), str) else ""
+        if not fact:
+            raise HTTPException(400, "missing 'fact'")
+        return {"id": memory.add_fact(fact)}
+
     @app.delete("/api/memories/facts/{fact_id}")
     async def delete_fact(fact_id: int) -> dict[str, Any]:
         if not memory.delete_fact(fact_id):
             raise HTTPException(404, "no such fact")
         return {"ok": True}
+
+    # LLM fact compaction: propose a consolidated list (no write), then the
+    # client POSTs the approved set to /apply.
+    @app.post("/api/memories/facts/compact")
+    async def compact_facts() -> dict[str, Any]:
+        facts = memory.list_facts()
+        proposed = await consolidate_facts(
+            llm_client(), config.get("MODEL"), facts
+        )
+        return {"original": facts, "proposed": proposed}
+
+    @app.post("/api/memories/facts/apply")
+    async def apply_facts(body: dict[str, Any]) -> dict[str, Any]:
+        facts = body.get("facts")
+        if not isinstance(facts, list) or not all(isinstance(f, str) for f in facts):
+            raise HTTPException(400, "'facts' must be a list of strings")
+        cleaned = [f.strip() for f in facts if f.strip()]
+        memory.replace_facts(cleaned)
+        return {"ok": True, "count": len(cleaned)}
 
     @app.get("/api/memories/summaries")
     async def list_summaries() -> dict[str, Any]:
@@ -129,6 +171,44 @@ def create_app(memory: Memory, config: Config, mcp: Any = None) -> FastAPI:
                 }
                 for s in memory.list_summaries()
             ]
+        }
+
+    @app.put("/api/memories/summaries/{summary_id}")
+    async def edit_summary(summary_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        text = body.get("summary")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(400, "missing 'summary'")
+        if not memory.update_summary(summary_id, text.strip()):
+            raise HTTPException(404, "no such summary")
+        return {"ok": True}
+
+    @app.delete("/api/memories/summaries/{summary_id}")
+    async def delete_summary(summary_id: int, unmark: bool = True) -> dict[str, Any]:
+        # `unmark` (default true) un-summarizes the covered turns so they
+        # replay verbatim again instead of being silently dropped.
+        if not memory.delete_summary(summary_id, unmark_turns=unmark):
+            raise HTTPException(404, "no such summary")
+        return {"ok": True, "unmarked_turns": unmark}
+
+    @app.post("/api/memories/summarize")
+    async def summarize_now() -> dict[str, Any]:
+        # Force a fold of the current backlog (down to the keep-recent tail),
+        # ignoring the trigger threshold.
+        result, reason = await summarize_backlog(
+            memory,
+            llm_client(),
+            config.get("MODEL"),
+            keep_recent=int(config.get("KEEP_RECENT_TURNS")),
+            force=True,
+        )
+        if result is None:
+            return {"ok": False, "reason": reason}
+        return {
+            "ok": True,
+            "summary": {
+                "id": result.id, "summary": result.summary,
+                "span_from": result.span_from, "span_to": result.span_to,
+            },
         }
 
     @app.get("/api/memories/turns")
