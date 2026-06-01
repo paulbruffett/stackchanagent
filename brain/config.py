@@ -86,6 +86,12 @@ SPECS: dict[str, Spec] = {
         8.0, "float", False, "capture",
         "How long the mic stays open after a reply without re-saying the wakeword.",
     ),
+    "FOLLOW_UP_GUARD_S": Spec(
+        0.5, "float", False, "capture",
+        "Extra delay after TTS playback finishes before reopening the mic for "
+        "the follow-up window, so the robot doesn't hear its own voice tail. "
+        "Raise if the robot replies to itself; lower for snappier follow-ups.",
+    ),
 
     # --- Behavior / vision (hot) ----------------------------------------
     "GREETING_COOLDOWN_S": Spec(
