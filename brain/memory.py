@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     env_ref TEXT,
     enabled INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS a2a_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    env_ref TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -124,6 +132,15 @@ class McpServer:
     args: list[str]         # stdio: argv after command
     url: str | None         # http: endpoint
     env_ref: str | None     # name of a .env var to inject (no value stored)
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class A2aServer:
+    id: int
+    name: str
+    url: str                # agent base URL or /.well-known/agent.json card URL
+    env_ref: str | None     # name of a .env var holding a bearer token (optional)
     enabled: bool
 
 
@@ -376,6 +393,67 @@ class Memory:
     def delete_mcp_server(self, server_id: int) -> bool:
         cur = self._conn.execute(
             "DELETE FROM mcp_servers WHERE id = ?", (server_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # --- A2A server registry (Phase 9c) -------------------------------
+
+    def list_a2a_servers(self) -> list[A2aServer]:
+        rows = self._conn.execute(
+            "SELECT id, name, url, env_ref, enabled FROM a2a_servers ORDER BY id"
+        ).fetchall()
+        return [
+            A2aServer(
+                id=r["id"],
+                name=r["name"],
+                url=r["url"],
+                env_ref=r["env_ref"],
+                enabled=bool(r["enabled"]),
+            )
+            for r in rows
+        ]
+
+    def add_a2a_server(
+        self,
+        name: str,
+        url: str,
+        env_ref: str | None = None,
+        enabled: bool = True,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO a2a_servers(name, url, env_ref, enabled) "
+            "VALUES (?, ?, ?, ?)",
+            (name, url, env_ref, int(enabled)),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def update_a2a_server(self, server_id: int, **fields: Any) -> bool:
+        """Update any subset of {name, url, env_ref, enabled}."""
+        cols: list[str] = []
+        vals: list[Any] = []
+        for key, value in fields.items():
+            if key == "enabled":
+                cols.append("enabled = ?")
+                vals.append(int(bool(value)))
+            elif key in ("name", "url", "env_ref"):
+                cols.append(f"{key} = ?")
+                vals.append(value)
+            else:
+                raise KeyError(f"unknown a2a_server field: {key}")
+        if not cols:
+            return False
+        vals.append(server_id)
+        cur = self._conn.execute(
+            f"UPDATE a2a_servers SET {', '.join(cols)} WHERE id = ?", vals
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_a2a_server(self, server_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM a2a_servers WHERE id = ?", (server_id,)
         )
         self._conn.commit()
         return cur.rowcount > 0

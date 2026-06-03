@@ -19,6 +19,7 @@ $$("nav button").forEach((b) =>
     if (b.dataset.tab === "config") loadConfig();
     if (b.dataset.tab === "persona") loadPersona();
     if (b.dataset.tab === "mcp") loadMcp();
+    if (b.dataset.tab === "a2a") loadA2a();
   })
 );
 
@@ -345,6 +346,84 @@ async function loadMcp() {
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     setStatus(r.ok ? "server added — Reload to connect" : "add failed", r.ok ? "ok" : "err");
     loadMcp();
+  });
+  form.append(add);
+  root.append(form);
+}
+
+// ---- A2A ----
+async function loadA2a() {
+  const root = $("#a2a");
+  root.innerHTML = "";
+  const data = await (await fetch("/api/a2a/servers")).json();
+
+  const bar = el("div", { className: "toolbar" });
+  const reload = el("button", { className: "act", textContent: "Reload A2A" });
+  reload.addEventListener("click", async () => {
+    setStatus("reloading A2A…");
+    const r = await fetch("/api/a2a/reload", { method: "POST" });
+    setStatus(r.ok ? "A2A reloaded" : "reload failed", r.ok ? "ok" : "err");
+    loadA2a();
+  });
+  bar.append(el("div", { className: "muted",
+    textContent: "Agent2Agent endpoints. Edits persist immediately; click Reload to (re)fetch agent cards and apply." }),
+    el("span", { style: "flex:1" }), reload);
+  root.append(bar);
+
+  for (const s of data.servers) {
+    const card = el("div", { className: "card" });
+    const dot = s.connected ? `<span class="ok">●</span>` : (s.enabled ? `<span class="err">●</span>` : `<span class="muted">○</span>`);
+    const head = el("div", { className: "fact" });
+    head.innerHTML = `${dot} <b>${esc(s.name)}</b>` + (s.agent ? ` <span class="muted">${esc(s.agent)}</span>` : "");
+    const toggle = el("button", { className: "ghost",
+      textContent: s.enabled ? "disable" : "enable" });
+    toggle.addEventListener("click", async () => {
+      await fetch(`/api/a2a/servers/${s.id}`, { method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !s.enabled }) });
+      loadA2a();
+    });
+    const del = el("button", { className: "ghost", textContent: "✕" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete A2A server "${s.name}"?`)) return;
+      await fetch(`/api/a2a/servers/${s.id}`, { method: "DELETE" });
+      loadA2a();
+    });
+    head.append(el("span", { style: "flex:1" }), toggle, del);
+    card.append(head);
+
+    card.append(el("div", { className: "muted", style: "font-family:ui-monospace,monospace;font-size:12px;margin-top:6px",
+      textContent: s.url }));
+    if (s.env_ref) card.append(el("div", { className: "muted", innerHTML: `bearer token env: <code>${esc(s.env_ref)}</code> (value from .env)` }));
+    if (s.error) card.append(el("div", { className: "err", textContent: s.error }));
+    if (s.delegates && s.delegates.length)
+      card.append(el("div", { innerHTML: s.delegates.map((d) => `<span class="pill">${esc(d)}</span>`).join("") }));
+    root.append(card);
+  }
+
+  // add-server form
+  const form = el("div", { className: "group" }, el("h2", { textContent: "Add endpoint" }));
+  const f = {};
+  const field = (key, ph) => { const i = el("input", { placeholder: ph, style: "width:100%;margin-bottom:6px" }); f[key] = i; return i; };
+  form.append(
+    field("name", "name (e.g. hermes)"),
+    field("url", "url (agent base or /.well-known/agent.json, e.g. http://192.168.4.30:8080)"),
+    field("env_ref", "bearer token env var name (optional)"),
+  );
+  const add = el("button", { className: "act", textContent: "Add" });
+  add.addEventListener("click", async () => {
+    const body = {
+      name: f.name.value.trim(),
+      url: f.url.value.trim(),
+      env_ref: f.env_ref.value.trim() || null,
+      enabled: true,
+    };
+    if (!body.name) { setStatus("name required", "err"); return; }
+    if (!body.url) { setStatus("url required", "err"); return; }
+    const r = await fetch("/api/a2a/servers", { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    setStatus(r.ok ? "endpoint added — Reload to connect" : "add failed", r.ok ? "ok" : "err");
+    loadA2a();
   });
   form.append(add);
   root.append(form);

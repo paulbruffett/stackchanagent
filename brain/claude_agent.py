@@ -174,6 +174,7 @@ class AgentSession:
         get_latest_jpeg: Callable[[], bytes | None] | None = None,
         on_external_head_move: Callable[[float, float], None] | None = None,
         mcp: Any = None,
+        a2a: Any = None,
     ) -> None:
         self.ws = ws
         self.client = AsyncAnthropic()
@@ -203,6 +204,7 @@ class AgentSession:
                 on_external_head_move or (lambda y, p: None)
             ),
             mcp=mcp,
+            a2a=a2a,
         )
 
     async def respond(self, user_text: str, speak: SpeakFn) -> str:
@@ -279,10 +281,13 @@ class AgentSession:
         return system
 
     def _tool_defs(self) -> list[dict[str, Any]]:
-        """Native tools plus any tools the MCP servers currently expose."""
+        """Native tools plus any tools the MCP servers and A2A agents
+        currently expose."""
         defs = list(tools.TOOL_DEFS)
         if self._tool_ctx.mcp is not None:
             defs += self._tool_ctx.mcp.tool_defs()
+        if self._tool_ctx.a2a is not None:
+            defs += self._tool_ctx.a2a.tool_defs()
         return defs
 
     async def _set_busy(self, on: bool) -> None:

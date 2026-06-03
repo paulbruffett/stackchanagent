@@ -39,6 +39,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from behavior import IdleBehavior
 from claude_agent import AgentSession
 from config import get_config, init_config
+from a2a_client import A2aClient
 from mcp_client import McpClient
 from memory import Memory
 from stt import Transcriber
@@ -81,6 +82,9 @@ memory = Memory()
 # Shared MCP client (Phase 9b): one set of server connections for the
 # whole process. Started in main(); tools merged into every agent turn.
 mcp_client = McpClient(memory)
+# Shared A2A client (Phase 9c): connects to Agent2Agent servers (e.g.
+# Hermes) and surfaces their sub-agents as delegation tools in every turn.
+a2a_client = A2aClient(memory)
 
 
 @dataclass
@@ -148,6 +152,7 @@ def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
             get_latest_jpeg=lambda: state.latest_jpeg,
             on_external_head_move=state.behavior.notify_head_moved,
             mcp=mcp_client,
+            a2a=a2a_client,
         )
     return state.agent
 
@@ -572,6 +577,17 @@ def _seed_default_mcp_servers() -> None:
     log.info("seeded default MCP servers: weather (on), hue (off)")
 
 
+def _seed_default_a2a_servers() -> None:
+    """Register the Hermes A2A endpoint once (empty registry), disabled
+    until the user confirms the URL and toggles it on (like Hue)."""
+    if memory.list_a2a_servers():
+        return
+    memory.add_a2a_server(
+        "hermes", "http://192.168.4.30:8080", enabled=False,
+    )
+    log.info("seeded default A2A server: hermes (off)")
+
+
 async def main() -> None:
     global stt, tts
     logging.basicConfig(
@@ -596,6 +612,11 @@ async def main() -> None:
     _seed_default_mcp_servers()
     await mcp_client.start()
 
+    # A2A servers (Phase 9c): seed Hermes (disabled) on first run, then
+    # connect any enabled endpoints — best-effort, like MCP.
+    _seed_default_a2a_servers()
+    await a2a_client.start()
+
     # Web console: tee brain.* logs to the live feed and serve the
     # FastAPI app in-process on WEB_PORT, sharing memory + config + mcp.
     loop = asyncio.get_running_loop()
@@ -604,7 +625,7 @@ async def main() -> None:
     logging.getLogger("brain").addHandler(WebUILogHandler())
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg, mcp_client),
+            create_app(memory, cfg, mcp_client, a2a_client),
             host=HOST, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
@@ -625,6 +646,7 @@ async def main() -> None:
         web.should_exit = True
         await web_task
         await mcp_client.aclose()
+        await a2a_client.aclose()
         if zc is not None and info is not None:
             zc.unregister_service(info)
             zc.close()

@@ -46,6 +46,10 @@ class ToolContext:
     # are namespaced `mcp__<server>__<tool>` and routed here before the
     # native tool ladder below. None if MCP is disabled/unavailable.
     mcp: Any = None
+    # A2A client (Phase 9c), shared across connections. Tools it exposes
+    # are namespaced `a2a__<server>__<agent>` and routed here before the
+    # native tool ladder below. None if A2A is disabled/unavailable.
+    a2a: Any = None
 
 
 # Schemas exposed to Claude. Keep tight — descriptions are what drive
@@ -192,10 +196,13 @@ async def dispatch(
     """Send a tool's JSON command to the firmware (or run the brain-local
     handler). Returns the tool_result content string for the next agent
     turn."""
-    # MCP tools (Phase 9b) take priority — they're namespaced so they
-    # can't collide with the native tools below.
+    # MCP (Phase 9b) and A2A (Phase 9c) tools take priority — they're
+    # namespaced (`mcp__…` / `a2a__…`) so they can't collide with the
+    # native tools below.
     if ctx.mcp is not None and ctx.mcp.is_mcp_tool(name):
         return await ctx.mcp.dispatch(name, input_)
+    if ctx.a2a is not None and ctx.a2a.is_a2a_tool(name):
+        return await ctx.a2a.dispatch(name, input_)
     if name == "set_expression":
         await ctx.ws.send(
             json.dumps({"cmd": "set_expression", "value": input_["expression"]})
