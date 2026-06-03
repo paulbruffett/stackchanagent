@@ -109,6 +109,9 @@ extern "C" void app_main(void)
     agent::transport::start(BRAIN_HOST, BRAIN_PORT);
     agent::speaker_play::start();
     agent::wakeword::on_detected([](const std::string& w) {
+        // Relight the screen first if we were asleep (instant, local —
+        // doesn't wait on the brain round-trip).
+        agent::commands::wake_face();
         agent::transport::send_event_json(
             std::string("{\"event\":\"wakeword\",\"word\":\"") + w + "\"}");
         agent::state::transition(agent::state::Mode::Listening);
@@ -116,6 +119,24 @@ extern "C" void app_main(void)
     agent::wakeword::start();
     agent::mic_pump::start();
     agent::camera_pump::start();
+
+    // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
+    // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so
+    // Press is unused). Treat a debounced Press while idle exactly like the
+    // wake word: relight the screen if asleep, notify the brain, and start
+    // listening. Gated to IDLE so a touch can't interrupt an active turn.
+    GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
+        if (gesture != HeadPetGesture::Press) return;
+        if (agent::state::current() != agent::state::Mode::Idle) return;
+        static uint32_t last_tap_ms = 0;
+        uint32_t now = GetHAL().millis();
+        if (now - last_tap_ms < 800) return;  // debounce repeated touches
+        last_tap_ms = now;
+        agent::commands::wake_face();
+        agent::transport::send_event_json("{\"event\":\"tap\"}");
+        agent::state::transition(agent::state::Mode::Listening);
+        mclog::tagInfo(TAG, "head tap → listening");
+    });
 
     mclog::tagInfo(TAG, "running — listening for wakeword");
 

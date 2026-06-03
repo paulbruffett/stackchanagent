@@ -98,6 +98,13 @@ SPECS: dict[str, Spec] = {
     ),
 
     # --- Behavior / vision (hot) ----------------------------------------
+    "SLEEP_TIMEOUT_S": Spec(
+        300.0, "float", False, "behavior",
+        "Sleep after this many seconds with no interaction (conversation, "
+        "wake word, or head tap). Sleeping turns off the screen and stops "
+        "look-around + face detection until a wake word or tap. 0 = never "
+        "sleep.",
+    ),
     "GREETING_COOLDOWN_S": Spec(
         1800.0, "float", False, "behavior",
         "Minimum time between proactive greetings.",

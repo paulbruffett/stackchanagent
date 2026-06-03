@@ -110,6 +110,15 @@ class ConnState:
     last_user_interaction_s: float = 0.0
     last_greeting_s: float = 0.0
     last_detect_s: float = 0.0
+    # True while asleep: screen is off, look-around and face detection are
+    # suspended. Cleared by a wake word or head tap. Driven by SLEEP_TIMEOUT_S.
+    asleep: bool = False
+    # monotonic time of the last interaction that should keep the device
+    # awake (conversation, wake word, tap). Seeded at connect so a fresh
+    # connection doesn't immediately sleep. Distinct from
+    # last_user_interaction_s (which gates greetings) so sleep timing and
+    # greeting suppression stay independent.
+    last_activity_s: float = 0.0
     # monotonic time the most recent TTS playback is expected to finish on
     # the device. The brain sends audio faster than real time, so when the
     # speaker worker returns the device still has buffered audio playing;
@@ -279,6 +288,7 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     })
 
     state.last_user_interaction_s = time.monotonic()
+    state.last_activity_s = time.monotonic()
 
     # If the agent chose to stay silent (typical on a follow-up that
     # wasn't directed at us), close out — no further window.
@@ -346,6 +356,61 @@ def _cancel_follow_up_timeout(state: ConnState) -> None:
     if state.follow_up_timeout is not None and not state.follow_up_timeout.done():
         state.follow_up_timeout.cancel()
     state.follow_up_timeout = None
+
+
+def _should_sleep(state: ConnState) -> bool:
+    """True when the inactivity timeout has elapsed and we're idle. A
+    SLEEP_TIMEOUT_S of 0 disables sleeping entirely."""
+    if state.asleep or state.listening or state.speaking:
+        return False
+    # Don't drop the screen mid-sweep, or the head would keep moving while
+    # "asleep". A sweep is short (~16 s) and infrequent; just wait it out.
+    if state.behavior.look_around_in_progress:
+        return False
+    timeout = get_config().get("SLEEP_TIMEOUT_S")
+    if not timeout or timeout <= 0:
+        return False
+    return time.monotonic() - state.last_activity_s >= timeout
+
+
+async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
+    """Enter sleep: tell the firmware to turn the screen off (it sets a
+    sleepy face first), and stop look-around + face detection. The wake
+    word and head tap stay armed on the firmware as the only way out."""
+    state.asleep = True
+    log.info("sleeping (idle %.0fs)", time.monotonic() - state.last_activity_s)
+    try:
+        await ws.send(json.dumps({"cmd": "sleep"}))
+    except Exception:
+        log.exception("sleep cmd send failed")
+
+
+def wake_up(state: ConnState) -> None:
+    """Clear the sleep state on a wake word / tap. The firmware relights
+    its own screen locally on the same trigger (instant, offline-safe), so
+    no wake command is sent from here — we just resume brain-side behavior
+    and reset the look-around clock so a sweep doesn't fire immediately."""
+    if state.asleep:
+        log.info("waking")
+    state.asleep = False
+    state.behavior.last_look_around_s = time.monotonic()
+
+
+def _on_wake_trigger(state: ConnState) -> None:
+    """Shared handling for a wake word OR a head tap: wake if asleep and arm
+    a listening capture. The firmware has already transitioned itself to
+    LISTENING (and relit the screen), so the brain only sets up VAD state."""
+    _cancel_follow_up_timeout(state)
+    wake_up(state)
+    state.listening = True
+    state.follow_up = False
+    state.speech_buf = bytearray()
+    state.voiced_ms = 0
+    state.trailing_silence_ms = 0
+    state.started_at = time.monotonic()
+    now = time.monotonic()
+    state.last_user_interaction_s = now
+    state.last_activity_s = now
 
 
 async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
@@ -436,6 +501,9 @@ async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
 async def handle(ws: ServerConnection) -> None:
     log.info("esp32 connected: %s", ws.remote_address)
     state = ConnState()
+    # Seed the sleep clock at connect so a fresh link doesn't immediately
+    # sleep before any interaction.
+    state.last_activity_s = time.monotonic()
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -490,6 +558,17 @@ async def handle(ws: ServerConnection) -> None:
                 # Always keep the latest frame around for describe_view,
                 # but only RUN detection at the configured cadence.
                 state.latest_jpeg = jpeg
+                # While asleep: no look-around, no face detection — the wake
+                # word / tap is the only way out. Frames keep arriving (cheap)
+                # so describe_view still has a recent one after waking.
+                if state.asleep:
+                    continue
+                # Awake + idle long enough → sleep. Checked on each frame
+                # (~every 1.5 s), which is a fine cadence for a minutes-scale
+                # timeout.
+                if _should_sleep(state):
+                    await go_to_sleep(ws, state)
+                    continue
                 interval = (
                     DETECT_INTERVAL_LOOK_AROUND_S
                     if state.behavior.look_around_in_progress
@@ -505,16 +584,12 @@ async def handle(ws: ServerConnection) -> None:
                     log.warning("bad json from esp32: %r", msg[:120])
                     continue
                 log.info("event: %s", payload)
-                if payload.get("event") == "wakeword":
-                    # Wakeword overrides any in-progress follow-up window.
-                    _cancel_follow_up_timeout(state)
-                    state.listening = True
-                    state.follow_up = False
-                    state.speech_buf = bytearray()
-                    state.voiced_ms = 0
-                    state.trailing_silence_ms = 0
-                    state.started_at = time.monotonic()
-                    state.last_user_interaction_s = time.monotonic()
+                if payload.get("event") in ("wakeword", "tap"):
+                    # Wake word or head tap: wake (if asleep) and start a
+                    # listening capture, overriding any follow-up window. The
+                    # firmware has already switched itself to LISTENING and
+                    # relit the screen on the same trigger.
+                    _on_wake_trigger(state)
             elif isinstance(msg, bytes):
                 log.warning(
                     "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)

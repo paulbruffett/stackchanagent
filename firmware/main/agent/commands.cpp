@@ -1,5 +1,6 @@
 #include "commands.h"
 
+#include <atomic>
 #include <string>
 #include <string_view>
 
@@ -18,6 +19,24 @@ namespace {
 constexpr const char* TAG = "agent.cmd";
 
 using stackchan::avatar::Emotion;
+
+// Sleep state. The brain's JSON task sets it on the inactivity timeout;
+// the wake word / head-touch tasks clear it via wake_face(). Atomic so the
+// cross-task reads/writes are well-defined.
+std::atomic<bool> g_face_off{false};
+std::atomic<uint8_t> g_saved_brightness{255};
+
+void sleep_face()
+{
+    if (g_face_off.exchange(true)) return;  // already asleep
+    LvglLockGuard lock;
+    uint8_t cur = GetHAL().getBackLightBrightness();
+    if (cur > 0) g_saved_brightness.store(cur);
+    GetStackChan().avatar().setEmotion(Emotion::Sleepy);
+    GetHAL().setBackLightBrightness(0);
+    mclog::tagInfo(TAG, "sleep: screen off (saved brightness {})",
+                   g_saved_brightness.load());
+}
 
 Emotion parse_emotion(std::string_view name)
 {
@@ -86,6 +105,16 @@ void apply_set_busy(JsonDocument& doc)
 
 }  // namespace
 
+void wake_face()
+{
+    if (!g_face_off.exchange(false)) return;  // wasn't asleep
+    LvglLockGuard lock;
+    GetHAL().setBackLightBrightness(g_saved_brightness.load());
+    GetStackChan().avatar().setEmotion(Emotion::Neutral);
+    mclog::tagInfo(TAG, "wake: screen on (brightness {})",
+                   g_saved_brightness.load());
+}
+
 void dispatch(std::string_view json)
 {
     JsonDocument doc;
@@ -117,6 +146,10 @@ void dispatch(std::string_view json)
         apply_look_at(doc);
     } else if (c == "set_busy") {
         apply_set_busy(doc);
+    } else if (c == "sleep") {
+        sleep_face();
+    } else if (c == "wake") {
+        wake_face();
     } else {
         mclog::tagWarn(TAG, "unknown cmd: {}", c);
     }
