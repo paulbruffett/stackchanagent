@@ -125,12 +125,27 @@ extern "C" void app_main(void)
     // Press is unused). Treat a debounced Press while idle exactly like the
     // wake word: relight the screen if asleep, notify the brain, and start
     // listening. Gated to IDLE so a touch can't interrupt an active turn.
+    //
+    // Every gesture is logged (the sensor only emits on actual touch, so this
+    // isn't spammy) to make tap detection visible in the serial monitor.
     GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
+        const char* gname =
+            gesture == HeadPetGesture::Press ? "Press" :
+            gesture == HeadPetGesture::Release ? "Release" :
+            gesture == HeadPetGesture::SwipeForward ? "SwipeForward" :
+            gesture == HeadPetGesture::SwipeBackward ? "SwipeBackward" : "None";
+        mclog::tagInfo(TAG, "head gesture: {}", gname);
         if (gesture != HeadPetGesture::Press) return;
-        if (agent::state::current() != agent::state::Mode::Idle) return;
+        if (agent::state::current() != agent::state::Mode::Idle) {
+            mclog::tagInfo(TAG, "tap ignored (not idle)");
+            return;
+        }
         static uint32_t last_tap_ms = 0;
         uint32_t now = GetHAL().millis();
-        if (now - last_tap_ms < 800) return;  // debounce repeated touches
+        if (now - last_tap_ms < 800) {  // debounce repeated touches
+            mclog::tagInfo(TAG, "tap ignored (debounce)");
+            return;
+        }
         last_tap_ms = now;
         agent::commands::wake_face();
         agent::transport::send_event_json("{\"event\":\"tap\"}");
