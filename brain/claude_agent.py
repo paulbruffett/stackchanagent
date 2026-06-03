@@ -70,6 +70,26 @@ def _pick_filler() -> str:
     phrases = [p.strip() for p in raw.split("|") if p.strip()]
     return random.choice(phrases) if phrases else ""
 
+
+# Native tools fast enough that no "working…" feedback is warranted: each is
+# a single WebSocket send or a local DB write and returns in well under a
+# second. Everything else — describe_view (a vision-model call) and any MCP
+# tool (`mcp__…`, e.g. weather or Hue lights, which round-trips an external
+# server) — is treated as slow, so we show the busy indicator and speak a
+# canned ack while it runs.
+_FAST_TOOLS = frozenset(
+    {"set_expression", "look_at", "remember_fact", "end_conversation"}
+)
+
+
+def _response_has_slow_tool(response: Any) -> bool:
+    """True if the turn's pending tool_use blocks include a genuinely slow
+    tool. Unknown tools default to slow (the safe choice for feedback)."""
+    return any(
+        b.type == "tool_use" and b.name not in _FAST_TOOLS
+        for b in response.content
+    )
+
 log = logging.getLogger("brain.agent")
 
 # The built-in persona. Editable at runtime: an override is persisted under
@@ -360,20 +380,27 @@ class AgentSession:
                     asyncio.create_task(_maybe_summarize(self))
                     return full
 
-                # Tool-use turn: show we're working and — if the model went
-                # straight to a tool without saying anything — speak a short
-                # canned ack so the user hears feedback within ~1s even when
-                # the tool (weather, vision, lights) is slow. `assembled`
-                # being empty means nothing real was spoken yet, which also
-                # de-dupes against any pre-tool commentary the model emitted.
-                if not busy:
-                    await self._set_busy(True)
-                    busy = True
-                if not assembled and not filler_spoken:
-                    filler = _pick_filler()
-                    if filler:
-                        filler_spoken = True
-                        await speak(filler)
+                # Tool-use turn: for a genuinely slow tool (weather, vision,
+                # lights) show we're working and — if the model went straight
+                # to a tool without saying anything — speak a short canned ack
+                # so the user hears feedback within ~1s. `assembled` being
+                # empty means nothing real was spoken yet, which also de-dupes
+                # against any pre-tool commentary the model emitted.
+                #
+                # Skip both for fast tools (set_expression, look_at, etc.),
+                # which return instantly: a bubble or "just a moment" before
+                # them is jarring. The new-person greeting is the clearest
+                # case — the model sets a happy expression / points its head
+                # *then* says "welcome", and the ack would wedge in between.
+                if _response_has_slow_tool(response):
+                    if not busy:
+                        await self._set_busy(True)
+                        busy = True
+                    if not assembled and not filler_spoken:
+                        filler = _pick_filler()
+                        if filler:
+                            filler_spoken = True
+                            await speak(filler)
 
                 tool_results: list[dict[str, Any]] = []
                 for block in response.content:
