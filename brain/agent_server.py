@@ -445,6 +445,22 @@ async def handle(ws: ServerConnection) -> None:
                     state.trailing_silence_ms = 0
                 else:
                     state.trailing_silence_ms += FRAME_MS
+                    # Decay un-established speech: if a full silence-tail
+                    # passes without ever reaching the speech-lead threshold,
+                    # the voiced frames so far were noise (a creak, a distant
+                    # voice, the TTS tail) — not a real utterance onset. Drop
+                    # them so scattered blips can't accumulate to the lead
+                    # threshold and falsely end an otherwise-silent follow-up
+                    # window seconds early (the window's own timer should
+                    # govern when the user stays quiet). Once real speech
+                    # establishes (voiced_ms >= lead) this no longer fires and
+                    # end_by_silence below governs end-of-utterance as before.
+                    if (
+                        state.voiced_ms < cfg.get("SPEECH_LEAD_MS")
+                        and state.trailing_silence_ms >= cfg.get("SILENCE_TAIL_MS")
+                    ):
+                        state.voiced_ms = 0
+                        state.trailing_silence_ms = 0
 
                 elapsed_ms = int((time.monotonic() - state.started_at) * 1000)
 
