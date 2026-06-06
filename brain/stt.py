@@ -69,6 +69,12 @@ class Transcriber:
         audio = (
             np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         )
+        # Signal level, as % of full scale. A healthy speech utterance peaks
+        # ~30-90% with rms ~5-20%; peak below ~5% means the mic gain is too
+        # low (Whisper hallucinates plausible-but-wrong text on weak audio),
+        # near 100% means clipping. Logged every turn to diagnose STT errors.
+        peak_pct = float(np.max(np.abs(audio))) * 100.0 if audio.size else 0.0
+        rms_pct = float(np.sqrt(np.mean(audio**2))) * 100.0 if audio.size else 0.0
         t0 = time.monotonic()
         segments, _info = model.transcribe(
             audio,
@@ -80,5 +86,8 @@ class Transcriber:
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         ms = int((time.monotonic() - t0) * 1000)
-        log.info("stt: %d ms, %d bytes → %r", ms, len(pcm), text)
+        log.info(
+            "stt: %d ms, %d bytes (peak=%.1f%% rms=%.1f%%) → %r",
+            ms, len(pcm), peak_pct, rms_pct, text,
+        )
         return Transcript(text=text, latency_ms=ms)

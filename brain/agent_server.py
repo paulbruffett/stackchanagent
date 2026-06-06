@@ -22,6 +22,7 @@ import logging
 import socket
 import sys
 import time
+import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -232,6 +233,24 @@ async def _drive_agent_turn(
         await speaker
 
 
+def _dump_capture(pcm: bytes) -> None:
+    """Write a captured utterance to ~/.stackchan/captures/*.wav (16 kHz mono
+    s16le) so the raw STT input can be listened to. Gated by STT_DEBUG_DUMP;
+    best-effort — never let a debug write break a turn."""
+    try:
+        out_dir = Path.home() / ".stackchan" / "captures"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"utt-{int(time.time() * 1000)}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm)
+        log.info("saved capture: %s (%.2fs)", path, len(pcm) / (SAMPLE_RATE * 2))
+    except Exception:
+        log.exception("capture dump failed")
+
+
 async def respond(ws: ServerConnection, state: ConnState) -> None:
     """Run STT → streaming agent → sentence-chunked TTS, then either
     open a follow-up window (if we actually spoke) or go idle."""
@@ -251,6 +270,8 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     await ws.send(json.dumps({"cmd": "stop_listening"}))
 
+    if get_config().get("STT_DEBUG_DUMP"):
+        _dump_capture(pcm)
     transcript = stt.transcribe(pcm)
     if not transcript.text:
         log.info("empty transcript — going idle")

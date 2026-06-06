@@ -68,6 +68,12 @@ SPECS: dict[str, Spec] = {
         "small.en", "str", True, "voice",
         "faster-whisper model size.",
     ),
+    "STT_DEBUG_DUMP": Spec(
+        0, "int", False, "voice",
+        "Write each captured utterance to ~/.stackchan/captures/*.wav so the "
+        "raw STT input can be listened to when transcription is wrong. "
+        "1=on, 0=off. Hot — no restart needed.",
+    ),
 
     # --- VAD / capture (hot) --------------------------------------------
     "SPEECH_RMS": Spec(
