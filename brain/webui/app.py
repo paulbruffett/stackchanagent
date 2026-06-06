@@ -9,6 +9,7 @@ No auth — the LAN is trusted.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+log = logging.getLogger("brain.webui")
 
 
 def create_app(
@@ -357,18 +360,29 @@ def create_app(
         try:
             body = await request.json()
         except Exception:
+            log.warning("buddy: /buddy/permission got non-JSON body from %s",
+                        request.client.host if request.client else "?")
             body = {}
         tool = (body.get("tool") or "a tool").strip()
         hint = (body.get("hint") or "").strip()
+        client = request.client.host if request.client else "?"
+        log.info("buddy: /buddy/permission received from %s tool=%r hint=%r",
+                 client, tool, hint[:120])
         if buddy is None:
+            log.warning("buddy: Buddy not wired into the web app (buddy=None) "
+                        "→ returning 'ask' for %r", tool)
             return {"decision": "ask"}
         perm = asyncio.ensure_future(buddy.request_permission(tool, hint))
         try:
             while True:
                 done, _ = await asyncio.wait({perm}, timeout=0.5)
                 if perm in done:
-                    return {"decision": perm.result()}
+                    decision = perm.result()
+                    log.info("buddy: /buddy/permission for %r → %s", tool, decision)
+                    return {"decision": decision}
                 if await request.is_disconnected():
+                    log.info("buddy: caller for %r disconnected before a tap "
+                             "(handled in the Claude session) → ask", tool)
                     perm.cancel()
                     try:
                         await perm
