@@ -180,6 +180,16 @@ SPECS: dict[str, Spec] = {
         "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
         "Requires firmware with the set_busy command.",
     ),
+    "FOLLOW_UP_THINKING": Spec(
+        1, "int", False, "responsiveness",
+        "Give the model a private extended-thinking channel on follow-up "
+        "and stage-direction (event) turns — the turns where it has to "
+        "judge whether speech is even directed at it. Reasoning then lands "
+        "in thinking (never spoken) instead of leaking into the spoken "
+        "reply, and 'stay silent' becomes an empty spoken turn. Initial "
+        "wake-word request/response turns never think (kept snappy). "
+        "1=on, 0=off. Adds some latency/tokens on those turns.",
+    ),
 
     # --- Memory / summarizer (hot) --------------------------------------
     "SUMMARIZE_TRIGGER": Spec(

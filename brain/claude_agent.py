@@ -118,6 +118,14 @@ Stay in character: curious, friendly, a little informal."""
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
 
+# Extended-thinking budget for the turns that opt in (follow-ups and
+# stage-direction events, gated by the FOLLOW_UP_THINKING knob). Gives the
+# model a private channel to reason about whether an utterance is even
+# directed at it, instead of narrating that reasoning into spoken text. When
+# thinking is on, max_tokens must exceed the budget, so we add it on top of
+# MAX_TOKENS (which still covers the spoken reply). 1024 is the API minimum.
+THINKING_BUDGET = 1024
+
 # Rolling summarizer thresholds are now hot config knobs (config.py):
 #   SUMMARIZE_TRIGGER  — backlog size that triggers a background fold
 #   KEEP_RECENT_TURNS  — verbatim tail always preserved
@@ -216,7 +224,8 @@ class AgentSession:
         text for logging."""
         async with self._turn_lock:
             self._append({"role": "user", "content": user_text})
-            return await self._run_loop(speak)
+            # Initial wake-word turns stay snappy: no extended thinking.
+            return await self._run_loop(speak, thinking=False)
 
     async def respond_to_event(
         self, stage_direction: str, speak: SpeakFn
@@ -227,7 +236,7 @@ class AgentSession:
         kicks in."""
         async with self._turn_lock:
             self._append({"role": "user", "content": f"[{stage_direction}]"})
-            return await self._run_loop(speak)
+            return await self._run_loop(speak, thinking=self._thinking_enabled())
 
     async def respond_follow_up(self, user_text: str, speak: SpeakFn) -> str:
         """Run an agent turn on speech captured during the post-reply
@@ -240,7 +249,13 @@ class AgentSession:
             self._append(
                 {"role": "user", "content": f"[follow-up] {user_text}"}
             )
-            return await self._run_loop(speak)
+            return await self._run_loop(speak, thinking=self._thinking_enabled())
+
+    @staticmethod
+    def _thinking_enabled() -> bool:
+        """Whether follow-up / event turns get a private thinking channel.
+        Hot knob, read per turn so a web-console toggle applies immediately."""
+        return bool(get_config().get("FOLLOW_UP_THINKING"))
 
     def _append(self, message: dict[str, Any]) -> None:
         """Append to the live thread AND persist to SQLite."""
@@ -302,7 +317,7 @@ class AgentSession:
         except Exception:
             log.exception("set_busy send failed")
 
-    async def _run_loop(self, speak: SpeakFn) -> str:
+    async def _run_loop(self, speak: SpeakFn, thinking: bool = False) -> str:
         assembled: list[str] = []
         # Whether the on-screen busy indicator is currently shown, and
         # whether we've already spoken a canned ack this turn. Both reset
@@ -315,13 +330,24 @@ class AgentSession:
             while True:
                 buf = ""
                 bracket_depth = 0
-                async with self.client.messages.stream(
-                    model=self.model,
-                    max_tokens=MAX_TOKENS,
-                    system=self._build_system(),
-                    tools=self._tool_defs(),
-                    messages=self.messages,
-                ) as stream:
+                stream_kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "max_tokens": MAX_TOKENS,
+                    "system": self._build_system(),
+                    "tools": self._tool_defs(),
+                    "messages": self.messages,
+                }
+                if thinking:
+                    # Private reasoning channel. text_stream only yields text
+                    # deltas, so thinking blocks are never spoken. max_tokens
+                    # must exceed the budget, so the spoken-reply allowance
+                    # (MAX_TOKENS) rides on top of it.
+                    stream_kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": THINKING_BUDGET,
+                    }
+                    stream_kwargs["max_tokens"] = MAX_TOKENS + THINKING_BUDGET
+                async with self.client.messages.stream(**stream_kwargs) as stream:
                     async for delta in stream.text_stream:
                         # Never speak [bracketed] text. Brackets are reserved
                         # for system stage directions in the prompt; the model
