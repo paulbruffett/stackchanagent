@@ -31,7 +31,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 def create_app(
-    memory: Memory, config: Config, mcp: Any = None, a2a: Any = None
+    memory: Memory, config: Config, mcp: Any = None, a2a: Any = None,
+    buddy: Any = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
@@ -343,6 +344,27 @@ def create_app(
             raise HTTPException(503, "A2A client not available")
         await a2a.reload()
         return {"servers": a2a.status()}
+
+    # --- Claude Buddy (Option C, Milestone 0) -------------------------
+    @app.post("/buddy/permission")
+    async def buddy_permission(body: dict[str, Any]) -> dict[str, Any]:
+        """Blocking permission gate for a Claude Code PreToolUse hook. Surfaces
+        the pending tool on the robot and waits for tap (allow) / wake word
+        (deny) / timeout. Returns {"decision": allow|deny|ask}. Never errors —
+        a missing buddy or a failure falls back to a safe default so the
+        caller's Claude session never hangs."""
+        tool = (body.get("tool") or "a tool").strip()
+        hint = (body.get("hint") or "").strip()
+        if buddy is None:
+            return {"decision": config.get("BUDDY_PERMISSION_FALLBACK")}
+        decision = await buddy.request_permission(tool, hint)
+        return {"decision": decision}
+
+    @app.get("/buddy/status")
+    async def buddy_status() -> dict[str, Any]:
+        if buddy is None:
+            return {"available": False}
+        return {"available": True, **buddy.status()}
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")

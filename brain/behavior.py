@@ -123,6 +123,19 @@ class IdleBehavior:
             self.look_around_in_progress = True
             asyncio.create_task(self._look_around(ws))
 
+    async def glance_at_user(self, ws: ServerConnection) -> None:
+        """A quick attention glance toward the user: look up to eye level, then
+        settle back to rest. Reused by Claude Buddy to draw attention when an
+        approval is pending. Uses the same look_at primitive as idle motion."""
+        await self._send_look_at(
+            ws, REST_YAW_DEG, 50.0, source="buddy-glance",
+            speed=get_config().get("LOOK_AROUND_SPEED"),
+        )
+        await asyncio.sleep(0.6)
+        await self._send_look_at(
+            ws, REST_YAW_DEG, REST_PITCH_DEG, source="buddy-glance-rest",
+        )
+
     async def _center_on_face(
         self, ws: ServerConnection, face: Face
     ) -> None:

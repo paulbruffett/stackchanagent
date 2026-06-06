@@ -200,6 +200,36 @@ SPECS: dict[str, Spec] = {
         hidden=True,
     ),
 
+    # --- Claude Buddy (hot) — Option C Milestone 0 ----------------------
+    "BUDDY_MODE": Spec(
+        1, "int", False, "buddy",
+        "Enable Claude Buddy: surface Claude Code tool-permission prompts on "
+        "the robot (tap to approve, wake word to deny). 1=on, 0=off (the "
+        "/buddy/permission endpoint then returns the fallback decision).",
+    ),
+    "BUDDY_PERMISSION_TIMEOUT_S": Spec(
+        60.0, "float", False, "buddy",
+        "How long to wait for a tap/wake-word approval before falling back to "
+        "BUDDY_PERMISSION_FALLBACK.",
+    ),
+    "BUDDY_PERMISSION_FALLBACK": Spec(
+        "ask", "str", False, "buddy",
+        "Decision returned when no one responds in time, the robot is "
+        "disconnected, or Buddy is off: 'ask' (normal Claude Code prompt), "
+        "'deny', or 'allow'. 'ask' is safest — never auto-approves and never "
+        "hangs the session.",
+    ),
+    "BUDDY_WAITING_EXPRESSION": Spec(
+        "surprised", "str", False, "buddy",
+        "Facial expression shown while awaiting an approval (maps via "
+        "set_expression; 'surprised' renders as the Doubt face).",
+    ),
+    "BUDDY_SPEAK_PROMPTS": Spec(
+        1, "int", False, "buddy",
+        "Speak the pending tool name aloud when an approval is needed "
+        "(e.g. 'Approve Bash?'), so it's usable without looking. 1=on, 0=off.",
+    ),
+
     # --- Persona (hot; edited via its own console panel, not the grid) ---
     "SYSTEM_PROMPT": Spec(
         "", "str", False, "persona",
