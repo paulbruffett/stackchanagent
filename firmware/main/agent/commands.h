@@ -10,6 +10,11 @@
  * Sleep (brain inactivity timer):
  *   {"cmd":"sleep"}            screen off + sleepy face (wake word/tap wakes)
  *   {"cmd":"wake"}             restore screen (also done locally on input)
+ *
+ * The screen is also relit automatically by any activity command
+ * (set_expression / look_at / set_busy / start_speaking), so the device
+ * can never move or speak with the screen off even if the brain's notion
+ * of sleep has drifted from the firmware's (e.g. after a brain restart).
  */
 #pragma once
 

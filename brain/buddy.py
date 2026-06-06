@@ -116,6 +116,11 @@ class Buddy:
             fut: asyncio.Future[str] = loop.create_future()
             self._pending = fut
             ws, state = self._ws, self._state
+            # If the device was asleep, a Claude prompt is an allowed reason to
+            # wake it (the firmware relights on the activity commands below),
+            # but we should return it to sleep when done so it doesn't end up
+            # awake-screen / brain-dormant. Capture the prior state to restore.
+            was_asleep = bool(getattr(state, "asleep", False))
             log.info("buddy: awaiting tap-to-approve for %r (%s)", tool, hint[:80])
             try:
                 await self._enter_waiting(ws, state, tool, hint)
@@ -126,7 +131,7 @@ class Buddy:
                 return decision
             finally:
                 self._pending = None
-                await asyncio.shield(self._exit_waiting(ws, state))
+                await asyncio.shield(self._exit_waiting(ws, state, was_asleep))
 
     # -- robot experience (face / bubble / glance / voice) --
     async def _enter_waiting(
@@ -158,13 +163,20 @@ class Buddy:
             except Exception:
                 log.exception("buddy speak failed")
 
-    async def _exit_waiting(self, ws: Any, state: Any) -> None:
+    async def _exit_waiting(self, ws: Any, state: Any, was_asleep: bool) -> None:
         await self._send(ws, {"cmd": "set_busy", "on": False})
-        await self._send(ws, {"cmd": "set_expression", "value": "neutral"})
         # The tap/wake word locally flips the firmware into LISTENING; since we
         # consumed the event for a decision (not a voice turn), put it back to
         # idle so the wake word re-arms.
         await self._send(ws, {"cmd": "stop_listening"})
+        if was_asleep:
+            # We woke a sleeping device for this prompt; return it to sleep so
+            # the screen goes back off and the brain's dormant state (which we
+            # left untouched) stays consistent with the firmware. A wake word
+            # or head tap is still the way to actually start using it.
+            await self._send(ws, {"cmd": "sleep"})
+        else:
+            await self._send(ws, {"cmd": "set_expression", "value": "neutral"})
 
     @staticmethod
     async def _send(ws: Any, cmd: dict[str, Any]) -> None:

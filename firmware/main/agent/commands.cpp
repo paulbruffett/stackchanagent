@@ -137,14 +137,24 @@ void dispatch(std::string_view json)
         // pauses the wakeword so it doesn't double-fire on speech.
         state::transition(state::Mode::Listening);
     } else if (c == "start_speaking") {
+        // Any visible/audible activity implies the screen must be on. The
+        // firmware owns the backlight, so relight here regardless of what
+        // the brain believes its sleep state to be — this keeps "screen on
+        // while moving/speaking" true even if brain and firmware desync
+        // (e.g. the brain restarted while the device was asleep). wake_face()
+        // is a no-op when already awake, so it never clobbers a live turn.
+        wake_face();
         state::transition(state::Mode::Speaking);
     } else if (c == "stop_speaking") {
         state::transition(state::Mode::Idle);
     } else if (c == "set_expression") {
+        wake_face();
         apply_set_expression(doc);
     } else if (c == "look_at") {
+        wake_face();
         apply_look_at(doc);
     } else if (c == "set_busy") {
+        wake_face();
         apply_set_busy(doc);
     } else if (c == "sleep") {
         sleep_face();

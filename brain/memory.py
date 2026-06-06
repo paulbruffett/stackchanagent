@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS config (
     updated_ts REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_ts REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -317,6 +323,29 @@ class Memory:
     def set_config(self, key: str, value: Any) -> None:
         self._conn.execute(
             "INSERT INTO config(key, value, updated_ts) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_ts = excluded.updated_ts",
+            (key, json.dumps(value), time.time()),
+        )
+        self._conn.commit()
+
+    # --- runtime state (survives a process restart) -------------------
+    # Small key→JSON store for transient device/session state that should
+    # persist across a brain restart, unlike a per-connection ConnState
+    # (which resets to defaults each reconnect). Distinct from `config`,
+    # which is the operator-tunable knob catalog. First user: the sleep
+    # flag, so a brain restart while the device is asleep doesn't make the
+    # brain resume autonomous behavior against a still-dark screen.
+
+    def get_runtime_state(self, key: str, default: Any = None) -> Any:
+        row = self._conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?", (key,)
+        ).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def set_runtime_state(self, key: str, value: Any) -> None:
+        self._conn.execute(
+            "INSERT INTO runtime_state(key, value, updated_ts) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
             "updated_ts = excluded.updated_ts",
             (key, json.dumps(value), time.time()),

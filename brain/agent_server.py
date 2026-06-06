@@ -414,6 +414,10 @@ async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
     sleepy face first), and stop look-around + face detection. The wake
     word and head tap stay armed on the firmware as the only way out."""
     state.asleep = True
+    # Persist so a brain restart while asleep resumes in the asleep state
+    # instead of re-running autonomous behavior (look-around / face-detect
+    # greet) against a still-dark firmware screen.
+    memory.set_runtime_state("asleep", True)
     log.info("sleeping (idle %.0fs)", time.monotonic() - state.last_activity_s)
     try:
         await ws.send(json.dumps({"cmd": "sleep"}))
@@ -429,6 +433,7 @@ def wake_up(state: ConnState) -> None:
     if state.asleep:
         log.info("waking")
     state.asleep = False
+    memory.set_runtime_state("asleep", False)
     state.behavior.last_look_around_s = time.monotonic()
 
 
@@ -540,6 +545,15 @@ async def handle(ws: ServerConnection) -> None:
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.
     state.last_activity_s = time.monotonic()
+    # Restore the persisted sleep flag: if the device was asleep when the
+    # brain last ran (or restarted), stay dormant — keep look-around and
+    # face detection suppressed so we don't act against a dark screen — and
+    # let only a wake word / head tap (which the firmware lights locally)
+    # bring it back. The firmware is still backlit-off from its earlier
+    # `sleep`, so the two stay consistent without sending any command.
+    if bool(memory.get_runtime_state("asleep", False)):
+        state.asleep = True
+        log.info("restored sleep state on connect: asleep")
     # Register this connection with Claude Buddy so /buddy/permission can drive
     # the robot and so tap/wake word can resolve a pending approval.
     buddy.attach(ws, state, lambda text: speak_phrase(ws, state, text))
