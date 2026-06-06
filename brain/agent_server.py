@@ -41,7 +41,7 @@ from behavior import IdleBehavior
 from claude_agent import AgentSession
 from config import get_config, init_config
 from a2a_client import A2aClient
-from buddy import ALLOW, DENY, Buddy
+from buddy import Buddy
 from mcp_client import McpClient
 from memory import Memory
 from stt import Transcriber
@@ -625,16 +625,13 @@ async def handle(ws: ServerConnection) -> None:
                 log.info("event: %s", payload)
                 event = payload.get("event")
                 if event in ("wakeword", "tap"):
-                    # Claude Buddy: while an approval is pending, a tap APPROVES
-                    # and the wake word DENIES — consume the event instead of
-                    # starting a voice turn. The firmware locally flipped to
-                    # LISTENING on the trigger; buddy sends stop_listening when
-                    # it clears the prompt.
-                    if buddy.pending and buddy.resolve(
-                        ALLOW if event == "tap" else DENY
-                    ):
-                        log.info("buddy: %s → %s", event,
-                                 ALLOW if event == "tap" else DENY)
+                    # Claude Buddy: while an approval is pending, a head TAP
+                    # approves it — consume the tap instead of starting a voice
+                    # turn. There is no deny gesture; the wake word always falls
+                    # through to normal voice. (Firmware flipped itself to
+                    # LISTENING on the tap; buddy sends stop_listening on clear.)
+                    if event == "tap" and buddy.pending and buddy.approve():
+                        log.info("buddy: tap → approve")
                         continue
                     # Wake word or head tap: wake (if asleep) and start a
                     # listening capture, overriding any follow-up window. The

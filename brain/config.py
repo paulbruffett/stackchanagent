@@ -204,20 +204,10 @@ SPECS: dict[str, Spec] = {
     "BUDDY_MODE": Spec(
         1, "int", False, "buddy",
         "Enable Claude Buddy: surface Claude Code tool-permission prompts on "
-        "the robot (tap to approve, wake word to deny). 1=on, 0=off (the "
-        "/buddy/permission endpoint then returns the fallback decision).",
-    ),
-    "BUDDY_PERMISSION_TIMEOUT_S": Spec(
-        60.0, "float", False, "buddy",
-        "How long to wait for a tap/wake-word approval before falling back to "
-        "BUDDY_PERMISSION_FALLBACK.",
-    ),
-    "BUDDY_PERMISSION_FALLBACK": Spec(
-        "ask", "str", False, "buddy",
-        "Decision returned when no one responds in time, the robot is "
-        "disconnected, or Buddy is off: 'ask' (normal Claude Code prompt), "
-        "'deny', or 'allow'. 'ask' is safest — never auto-approves and never "
-        "hangs the session.",
+        "the robot — tap the head to approve. There is no deny gesture; an "
+        "un-tapped prompt stays open until you handle it in the Claude "
+        "session. 1=on, 0=off (the /buddy/permission endpoint then defers to "
+        "the normal Claude Code prompt).",
     ),
     "BUDDY_WAITING_EXPRESSION": Spec(
         "surprised", "str", False, "buddy",

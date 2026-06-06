@@ -3,15 +3,17 @@ Option C, Milestone 0).
 
 A Claude Code `PreToolUse` hook POSTs a pending tool-permission request to the
 brain's `/buddy/permission` endpoint (see webui/app.py + buddy_hook_client.py).
-That call blocks here in `request_permission()` until the user resolves it on the
-robot — a **head tap = approve**, a **wake word = deny** — or a timeout falls back
-to a safe default. While pending, the robot shows a "waiting" face + speech bubble,
-glances at the user, and (optionally) speaks the tool name.
+That call blocks here in `request_permission()` until the user **taps the head to
+approve**. There is no deny gesture and no timeout: an un-tapped prompt stays open
+until it's handled in the Claude session — at which point the hook process goes
+away, the web route cancels this wait, and the robot UI clears. While pending, the
+robot shows a "waiting" face + speech bubble, glances at the user, and (optionally)
+speaks the tool name.
 
 This is the transport-agnostic experience layer the plan calls for: it knows
 nothing about HTTP or BLE. The HTTP route calls `request_permission()`; the
-WebSocket event loop (agent_server) calls `attach`/`detach` and `resolve()` when a
-tap/wake-word arrives. A later BLE ingress (Option B) can drive the same methods.
+WebSocket event loop (agent_server) calls `attach`/`detach` and `approve()` when a
+head tap arrives. A later BLE ingress (Option B) can drive the same methods.
 
 Milestone 0 handles one pending permission at a time (serialized by a lock); the
 priority model vs. live conversations is a Phase-1 concern.
@@ -29,10 +31,10 @@ from config import get_config
 log = logging.getLogger("brain.buddy")
 
 # Decisions we hand back to the Claude Code hook (its permissionDecision values).
+# Only ALLOW (tap) and ASK (defer to the Claude session) are used — there is no
+# deny gesture by design.
 ALLOW = "allow"
-DENY = "deny"
 ASK = "ask"
-_VALID_FALLBACKS = {ALLOW, DENY, ASK, "defer"}
 
 SpeakFn = Callable[[str], Awaitable[None]]
 
@@ -47,8 +49,14 @@ class Buddy:
         self._state: Any = None
         self._speak: SpeakFn | None = None
         self._pending: asyncio.Future[str] | None = None
-        # One permission at a time in Milestone 0.
-        self._lock = asyncio.Lock()
+        # One permission at a time in Milestone 0. Created lazily so
+        # constructing Buddy() at import time (no running loop on py3.9) is safe.
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # -- connection lifecycle (called by agent_server.handle) --
     def attach(self, ws: Any, state: Any, speak: SpeakFn) -> None:
@@ -57,8 +65,9 @@ class Buddy:
     def detach(self, ws: Any) -> None:
         if self._ws is ws:
             self._ws = self._state = self._speak = None
-            # Don't leave a hook hanging if the robot drops mid-prompt.
-            self._resolve(get_config().get("BUDDY_PERMISSION_FALLBACK"))
+            # Robot dropped mid-prompt: can't be tapped, so defer to the
+            # Claude session rather than leaving the hook hanging.
+            self._resolve(ASK)
 
     @property
     def connected(self) -> bool:
@@ -69,11 +78,12 @@ class Buddy:
         return self._pending is not None and not self._pending.done()
 
     # -- robot input → decision (called by agent_server event loop) --
-    def resolve(self, decision: str) -> bool:
-        """Resolve the pending permission (tap→allow, wake word→deny). Returns
-        True if there was something to resolve (so the caller knows to swallow
-        the event instead of starting a voice turn)."""
-        return self._resolve(decision)
+    def approve(self) -> bool:
+        """Approve the pending permission (a head tap). Returns True if there
+        was something to resolve (so the caller swallows the tap instead of
+        starting a voice turn). There is no deny gesture by design — an
+        un-tapped prompt stays open until the Claude session is dealt with."""
+        return self._resolve(ALLOW)
 
     def _resolve(self, decision: str) -> bool:
         if self._pending is not None and not self._pending.done():
@@ -84,43 +94,39 @@ class Buddy:
     # -- HTTP/BLE ingress → blocking request (called by webui route) --
     async def request_permission(self, tool: str, hint: str) -> str:
         """Surface a pending tool permission on the robot and block until the
-        user taps (allow) / says the wake word (deny), or we time out. Returns
-        one of allow/deny/ask. Never raises — a failure path returns the
-        configured fallback so the caller's Claude session never hangs."""
+        user taps the head to approve. There is **no timeout and no deny** — the
+        prompt stays open until a tap (→ allow) or until the caller goes away
+        (the Claude session is dealt with directly): the awaiting task is then
+        cancelled by the web route on client disconnect, which clears the robot
+        UI. If Buddy is off or the robot is disconnected, returns 'ask'
+        immediately so the normal Claude Code prompt handles it."""
         cfg = get_config()
-        fallback = cfg.get("BUDDY_PERMISSION_FALLBACK")
-        if fallback not in _VALID_FALLBACKS:
-            fallback = ASK
         if not cfg.get("BUDDY_MODE") or not self.connected:
             log.info(
-                "buddy: %s permission → %s (mode=%s connected=%s)",
-                tool, fallback, cfg.get("BUDDY_MODE"), self.connected,
+                "buddy: %s → ask (mode=%s connected=%s)",
+                tool, cfg.get("BUDDY_MODE"), self.connected,
             )
-            return fallback
+            return ASK
 
         # Serialize: if a prompt is already up, queue behind it.
-        async with self._lock:
+        async with self._get_lock():
             if not self.connected:  # robot dropped while we waited for the lock
-                return fallback
+                return ASK
             loop = asyncio.get_running_loop()
             fut: asyncio.Future[str] = loop.create_future()
             self._pending = fut
             ws, state = self._ws, self._state
-            log.info("buddy: awaiting approval for %r (%s)", tool, hint[:80])
+            log.info("buddy: awaiting tap-to-approve for %r (%s)", tool, hint[:80])
             try:
                 await self._enter_waiting(ws, state, tool, hint)
-                try:
-                    decision = await asyncio.wait_for(
-                        fut, cfg.get("BUDDY_PERMISSION_TIMEOUT_S")
-                    )
-                    log.info("buddy: %r → %s", tool, decision)
-                except asyncio.TimeoutError:
-                    decision = fallback
-                    log.info("buddy: %r timed out → %s", tool, decision)
+                # Wait indefinitely for a tap; cancellation (client disconnect)
+                # propagates through the finally, which clears the robot UI.
+                decision = await fut
+                log.info("buddy: %r → %s", tool, decision)
+                return decision
             finally:
                 self._pending = None
-                await self._exit_waiting(ws, state)
-            return decision
+                await asyncio.shield(self._exit_waiting(ws, state))
 
     # -- robot experience (face / bubble / glance / voice) --
     async def _enter_waiting(
@@ -148,7 +154,7 @@ class Buddy:
             and not getattr(state, "speaking", False)
         ):
             try:
-                await self._speak(f"Approve {tool}?")
+                await self._speak(f"Tap to approve {tool}.")
             except Exception:
                 log.exception("buddy speak failed")
 

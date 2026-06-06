@@ -5,6 +5,10 @@ Reads the PreToolUse hook payload on stdin, asks the brain to surface the
 pending tool on the robot, blocks until the user taps (approve) / says the wake
 word (deny) / it times out, then emits a PreToolUse permission decision.
 
+There is no deny: tap the robot's head to approve. Otherwise the prompt stays
+open until this hook's `timeout` (below) expires — at which point Claude Code
+falls back to its normal permission prompt, i.e. you handle it in the session.
+
 Install (no repo dependency — just point a hook at this file). In
 ~/.claude/settings.json (user-wide) or a project's .claude/settings.json:
 
@@ -17,7 +21,7 @@ Install (no repo dependency — just point a hook at this file). In
               {
                 "type": "command",
                 "command": "python3 /Users/paul/code/stackchan/brain/buddy_hook_client.py",
-                "timeout": 120
+                "timeout": 300
               }
             ]
           }
@@ -26,11 +30,13 @@ Install (no repo dependency — just point a hook at this file). In
     }
 
 Use "matcher": "*" to gate every tool, or e.g. "Bash|Edit|Write" for a subset.
-Set the hook `timeout` larger than the brain's BUDDY_PERMISSION_TIMEOUT_S.
+The hook `timeout` is how long the prompt stays open on the robot before Claude
+Code gives up waiting and shows its own prompt — set it to taste.
 
 Env:
-  BUDDY_BRAIN_URL   brain base URL (default http://127.0.0.1:8080)
-  BUDDY_HTTP_TIMEOUT seconds to wait on the brain (default 110)
+  BUDDY_BRAIN_URL    brain base URL (default http://127.0.0.1:8080)
+  BUDDY_HTTP_TIMEOUT optional seconds to wait on the brain; unset/0 = no client
+                     timeout (the hook `timeout` above is the real bound)
 
 On any failure (brain unreachable, bad response) it emits "ask" so the normal
 Claude Code permission prompt appears — it never auto-approves and never hangs.
@@ -59,7 +65,11 @@ def _hint(tool: str, tool_input: dict) -> str:
 
 def _decide(tool: str, hint: str) -> str:
     base = os.environ.get("BUDDY_BRAIN_URL", "http://127.0.0.1:8080").rstrip("/")
-    timeout = float(os.environ.get("BUDDY_HTTP_TIMEOUT", "110"))
+    raw = os.environ.get("BUDDY_HTTP_TIMEOUT", "").strip()
+    # No client timeout by default — the prompt stays open on the robot; the
+    # hook's settings.json `timeout` is the real bound (Claude Code then falls
+    # back to its own prompt). A positive value caps the wait client-side.
+    timeout = float(raw) if raw and float(raw) > 0 else None
     payload = json.dumps({"tool": tool, "hint": hint}).encode("utf-8")
     req = urllib.request.Request(
         base + "/buddy/permission", data=payload,

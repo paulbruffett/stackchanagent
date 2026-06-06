@@ -347,18 +347,37 @@ def create_app(
 
     # --- Claude Buddy (Option C, Milestone 0) -------------------------
     @app.post("/buddy/permission")
-    async def buddy_permission(body: dict[str, Any]) -> dict[str, Any]:
+    async def buddy_permission(request: Request) -> dict[str, Any]:
         """Blocking permission gate for a Claude Code PreToolUse hook. Surfaces
-        the pending tool on the robot and waits for tap (allow) / wake word
-        (deny) / timeout. Returns {"decision": allow|deny|ask}. Never errors —
-        a missing buddy or a failure falls back to a safe default so the
-        caller's Claude session never hangs."""
+        the pending tool on the robot and waits — with no timeout — for a head
+        tap (→ allow). There is no deny gesture: if the prompt is instead
+        handled in the Claude session, that hook process goes away and the
+        client disconnects, so we cancel the wait (clearing the robot UI) and
+        return 'ask'. Returns {"decision": allow|ask}; never hangs the caller."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
         tool = (body.get("tool") or "a tool").strip()
         hint = (body.get("hint") or "").strip()
         if buddy is None:
-            return {"decision": config.get("BUDDY_PERMISSION_FALLBACK")}
-        decision = await buddy.request_permission(tool, hint)
-        return {"decision": decision}
+            return {"decision": "ask"}
+        perm = asyncio.ensure_future(buddy.request_permission(tool, hint))
+        try:
+            while True:
+                done, _ = await asyncio.wait({perm}, timeout=0.5)
+                if perm in done:
+                    return {"decision": perm.result()}
+                if await request.is_disconnected():
+                    perm.cancel()
+                    try:
+                        await perm
+                    except asyncio.CancelledError:
+                        pass
+                    return {"decision": "ask"}
+        except asyncio.CancelledError:
+            perm.cancel()
+            raise
 
     @app.get("/buddy/status")
     async def buddy_status() -> dict[str, Any]:
