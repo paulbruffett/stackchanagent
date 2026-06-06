@@ -64,7 +64,7 @@ def _hint(tool: str, tool_input: dict) -> str:
 
 
 def _decide(tool: str, hint: str) -> str:
-    base = os.environ.get("BUDDY_BRAIN_URL", "http://192.168.1.150:8080").rstrip("/")
+    base = os.environ.get("BUDDY_BRAIN_URL", "http://192.168.4.150:8080").rstrip("/")
     raw = os.environ.get("BUDDY_HTTP_TIMEOUT", "").strip()
     # No client timeout by default — the prompt stays open on the robot; the
     # hook's settings.json `timeout` is the real bound (Claude Code then falls
