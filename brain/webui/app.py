@@ -365,14 +365,18 @@ def create_app(
             body = {}
         tool = (body.get("tool") or "a tool").strip()
         hint = (body.get("hint") or "").strip()
+        session_id = (body.get("session_id") or "").strip()
         client = request.client.host if request.client else "?"
-        log.info("buddy: /buddy/permission received from %s tool=%r hint=%r",
-                 client, tool, hint[:120])
+        log.info("buddy: /buddy/permission received from %s tool=%r hint=%r "
+                 "session=%s", client, tool, hint[:120],
+                 session_id[:12] or "?")
         if buddy is None:
             log.warning("buddy: Buddy not wired into the web app (buddy=None) "
                         "→ returning 'ask' for %r", tool)
             return {"decision": "ask"}
-        perm = asyncio.ensure_future(buddy.request_permission(tool, hint))
+        perm = asyncio.ensure_future(
+            buddy.request_permission(tool, hint, session_id)
+        )
         try:
             while True:
                 done, _ = await asyncio.wait({perm}, timeout=0.5)

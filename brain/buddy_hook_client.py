@@ -2,12 +2,13 @@
 """Claude Code PreToolUse hook → Stack-Chan Buddy (Option C, Milestone 0).
 
 Reads the PreToolUse hook payload on stdin, asks the brain to surface the
-pending tool on the robot, blocks until the user taps (approve) / says the wake
-word (deny) / it times out, then emits a PreToolUse permission decision.
+pending tool on the robot, blocks until the user taps the head to approve (→
+allow), the brain's permission window lapses (→ ask), or the brain is
+unreachable (→ ask), then emits a PreToolUse permission decision.
 
-There is no deny: tap the robot's head to approve. Otherwise the prompt stays
-open until this hook's `timeout` (below) expires — at which point Claude Code
-falls back to its normal permission prompt, i.e. you handle it in the session.
+There is no deny: tap to approve. Otherwise the robot reverts to normal after
+BUDDY_PERMISSION_TIMEOUT_S (on the brain) and Claude Code falls back to its
+normal permission prompt, i.e. you handle it in the session.
 
 Install (no repo dependency — just point a hook at this file). In
 ~/.claude/settings.json (user-wide) or a project's .claude/settings.json:
@@ -34,12 +35,18 @@ The hook `timeout` is how long the prompt stays open on the robot before Claude
 Code gives up waiting and shows its own prompt — set it to taste.
 
 Env:
-  BUDDY_BRAIN_URL    brain base URL (default http://127.0.0.1:8080)
-  BUDDY_HTTP_TIMEOUT optional seconds to wait on the brain; unset/0 = no client
-                     timeout (the hook `timeout` above is the real bound)
+  BUDDY_BRAIN_URL    brain base URL (default http://192.168.4.150:8080)
+  BUDDY_HTTP_TIMEOUT seconds to wait on the brain (default 300). The brain has
+                     its own BUDDY_PERMISSION_TIMEOUT_S and returns 'ask' when
+                     that lapses, so this is just a backstop against an
+                     unreachable/hung brain — keep it >= the brain timeout so a
+                     late tap still resolves. Set 0 to wait indefinitely (not
+                     recommended: a never-closing connection leaves a stale
+                     prompt on the robot, which is exactly what this avoids).
 
-On any failure (brain unreachable, bad response) it emits "ask" so the normal
-Claude Code permission prompt appears — it never auto-approves and never hangs.
+On any failure (brain unreachable, bad response, timeout) it emits "ask" so the
+normal Claude Code permission prompt appears — it never auto-approves, and the
+bounded timeout means it never blocks the session or orphans a process.
 """
 
 from __future__ import annotations
@@ -63,14 +70,19 @@ def _hint(tool: str, tool_input: dict) -> str:
     return ""
 
 
-def _decide(tool: str, hint: str) -> str:
+def _decide(tool: str, hint: str, session_id: str) -> str:
     base = os.environ.get("BUDDY_BRAIN_URL", "http://192.168.4.150:8080").rstrip("/")
     raw = os.environ.get("BUDDY_HTTP_TIMEOUT", "").strip()
-    # No client timeout by default — the prompt stays open on the robot; the
-    # hook's settings.json `timeout` is the real bound (Claude Code then falls
-    # back to its own prompt). A positive value caps the wait client-side.
-    timeout = float(raw) if raw and float(raw) > 0 else None
-    payload = json.dumps({"tool": tool, "hint": hint}).encode("utf-8")
+    # Bounded by default (300s) so a hung/unreachable brain can never block the
+    # session or orphan this process holding a connection open. The brain
+    # resolves within BUDDY_PERMISSION_TIMEOUT_S, so a healthy brain always
+    # answers first; this only bites if the brain is dead. 0 = wait forever.
+    timeout: float | None = float(raw) if raw else 300.0
+    if timeout is not None and timeout <= 0:
+        timeout = None
+    payload = json.dumps(
+        {"tool": tool, "hint": hint, "session_id": session_id}
+    ).encode("utf-8")
     req = urllib.request.Request(
         base + "/buddy/permission", data=payload,
         headers={"content-type": "application/json"}, method="POST",
@@ -87,9 +99,10 @@ def main() -> None:
         data = {}
     tool = data.get("tool_name", "a tool")
     hint = _hint(tool, data.get("tool_input", {}) or {})
+    session_id = str(data.get("session_id", "") or "")
 
     try:
-        decision = _decide(tool, hint)
+        decision = _decide(tool, hint, session_id)
     except Exception as exc:  # brain down / timeout / bad response
         print(f"buddy hook: falling back to {FALLBACK} ({exc})", file=sys.stderr)
         decision = FALLBACK

@@ -229,6 +229,14 @@ SPECS: dict[str, Spec] = {
         "Speak the pending tool name aloud when an approval is needed "
         "(e.g. 'Approve Bash?'), so it's usable without looking. 1=on, 0=off.",
     ),
+    "BUDDY_PERMISSION_TIMEOUT_S": Spec(
+        120.0, "float", False, "buddy",
+        "How long a permission prompt stays open on the robot with no head "
+        "tap before it's discarded — the robot reverts to normal and the "
+        "request returns 'ask' so the Claude session handles it the usual "
+        "way. Prevents stale prompts from piling up when the originating "
+        "session never taps. 0 = wait indefinitely (the old behavior).",
+    ),
 
     # --- Persona (hot; edited via its own console panel, not the grid) ---
     "SYSTEM_PROMPT": Spec(

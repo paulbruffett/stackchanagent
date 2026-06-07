@@ -92,25 +92,37 @@ class Buddy:
         return False
 
     # -- HTTP/BLE ingress → blocking request (called by webui route) --
-    async def request_permission(self, tool: str, hint: str) -> str:
+    async def request_permission(
+        self, tool: str, hint: str, session_id: str = ""
+    ) -> str:
         """Surface a pending tool permission on the robot and block until the
-        user taps the head to approve. There is **no timeout and no deny** — the
-        prompt stays open until a tap (→ allow) or until the caller goes away
-        (the Claude session is dealt with directly): the awaiting task is then
-        cancelled by the web route on client disconnect, which clears the robot
-        UI. If Buddy is off or the robot is disconnected, returns 'ask'
-        immediately so the normal Claude Code prompt handles it."""
+        user taps the head to approve (→ allow), the configured window elapses
+        (→ ask, the robot reverts to normal), or the caller goes away (the
+        Claude session handled it directly → the web route cancels this on
+        client disconnect, clearing the robot UI).
+
+        Coalesces: only one prompt at a time. If one is already showing, a new
+        request returns 'ask' immediately rather than queuing behind it — one
+        device, one human, so a backlog of stacked approvals is never built.
+        Also returns 'ask' immediately if Buddy is off or the robot is gone."""
         cfg = get_config()
+        sid = session_id[:12] if session_id else "?"
         if not cfg.get("BUDDY_MODE") or not self.connected:
             log.info(
-                "buddy: %s → ask (mode=%s connected=%s)",
-                tool, cfg.get("BUDDY_MODE"), self.connected,
+                "buddy: %s → ask (mode=%s connected=%s session=%s)",
+                tool, cfg.get("BUDDY_MODE"), self.connected, sid,
             )
             return ASK
 
-        # Serialize: if a prompt is already up, queue behind it.
-        async with self._get_lock():
-            if not self.connected:  # robot dropped while we waited for the lock
+        # Coalesce instead of queue: if a prompt is already up (or being set
+        # up under the lock), defer this one to the Claude session.
+        lock = self._get_lock()
+        if lock.locked() or self.pending:
+            log.info("buddy: %s → ask (a prompt is already showing, session=%s)",
+                     tool, sid)
+            return ASK
+        async with lock:
+            if not self.connected or self.pending:  # raced between check + lock
                 return ASK
             loop = asyncio.get_running_loop()
             fut: asyncio.Future[str] = loop.create_future()
@@ -121,13 +133,23 @@ class Buddy:
             # but we should return it to sleep when done so it doesn't end up
             # awake-screen / brain-dormant. Capture the prior state to restore.
             was_asleep = bool(getattr(state, "asleep", False))
-            log.info("buddy: awaiting tap-to-approve for %r (%s)", tool, hint[:80])
+            timeout = cfg.get("BUDDY_PERMISSION_TIMEOUT_S")
+            log.info("buddy: awaiting tap-to-approve for %r (%s) [session=%s, "
+                     "timeout=%ss]", tool, hint[:80], sid, timeout or "none")
             try:
                 await self._enter_waiting(ws, state, tool, hint)
-                # Wait indefinitely for a tap; cancellation (client disconnect)
-                # propagates through the finally, which clears the robot UI.
-                decision = await fut
-                log.info("buddy: %r → %s", tool, decision)
+                # Wait for a tap, the timeout, or cancellation (client
+                # disconnect) — all land in the finally, which clears the UI.
+                if timeout and timeout > 0:
+                    try:
+                        decision = await asyncio.wait_for(fut, timeout)
+                    except asyncio.TimeoutError:
+                        decision = ASK
+                        log.info("buddy: %r timed out after %ss → ask "
+                                 "(reverting)", tool, timeout)
+                else:
+                    decision = await fut
+                log.info("buddy: %r → %s (session=%s)", tool, decision, sid)
                 return decision
             finally:
                 self._pending = None
