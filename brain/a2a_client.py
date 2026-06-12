@@ -132,6 +132,10 @@ class _A2aConn:
         self.error: str | None = None
         self.card: dict[str, Any] = {}
         self.delegates: list[_Delegate] = []
+        # Send method that this server actually accepts. Some servers (e.g.
+        # Hermes) advertise protocol 0.2.0 but only implement the pre-0.2
+        # "tasks/send"; discovered on first call and remembered.
+        self.method: str | None = None
 
     def _headers(self) -> dict[str, str]:
         ref = self.spec.env_ref
@@ -211,38 +215,72 @@ class _A2aConn:
         return " ".join(lines)[:1024]
 
     async def call(self, http: httpx.AsyncClient, url: str, request: str) -> str:
-        msg_id = uuid.uuid4().hex
+        method = self.method or "message/send"
+        env = await self._rpc(http, url, method, request)
+        err = env.get("error")
+        if (
+            err and err.get("code") == -32601 and method == "message/send"
+        ):
+            log.info(
+                "a2a %s: message/send unsupported, retrying with tasks/send",
+                self.spec.name,
+            )
+            method = "tasks/send"
+            env = await self._rpc(http, url, method, request)
+            err = env.get("error")
+        if err:
+            log.warning("a2a %s %s error: %s", self.spec.name, method, err)
+            return f"[a2a error] {err.get('message', err)}"
+        self.method = method
+        result = env.get("result")
+        result = await self._await_task(http, url, result)
+        text = _result_text(result)
+        if text:
+            log.info("a2a %s %s ok: %d chars", self.spec.name, method, len(text))
+        else:
+            log.warning(
+                "a2a %s: no text in %s result (keys=%s)", self.spec.name, method,
+                sorted(result.keys()) if isinstance(result, dict)
+                else type(result).__name__,
+            )
+        return text or "(the agent returned no text)"
+
+    async def _rpc(
+        self, http: httpx.AsyncClient, url: str, method: str, request: str
+    ) -> dict[str, Any]:
+        message = {
+            "role": "user",
+            # Both part discriminators, for 0.2.x ("kind") and legacy ("type")
+            # servers alike.
+            "parts": [{"kind": "text", "type": "text", "text": request}],
+            "messageId": uuid.uuid4().hex,
+        }
+        params: dict[str, Any] = {"message": message}
+        if method == "tasks/send":
+            params["id"] = uuid.uuid4().hex  # legacy servers require a task id
         payload = {
-            "jsonrpc": "2.0",
-            "id": uuid.uuid4().hex,
-            "method": "message/send",
-            "params": {
-                "message": {
-                    "role": "user",
-                    "parts": [{"kind": "text", "text": request}],
-                    "messageId": msg_id,
-                }
-            },
+            "jsonrpc": "2.0", "id": uuid.uuid4().hex,
+            "method": method, "params": params,
         }
         r = await http.post(
             url, json=payload, headers=self._headers(), timeout=CALL_TIMEOUT_S
         )
         r.raise_for_status()
-        env = r.json()
-        if env.get("error"):
-            err = env["error"]
-            return f"[a2a error] {err.get('message', err)}"
-        result = env.get("result")
-        result = await self._await_task(http, url, result)
-        text = _result_text(result)
-        return text or "(the agent returned no text)"
+        return r.json()
 
     async def _await_task(
         self, http: httpx.AsyncClient, url: str, result: Any
     ) -> Any:
         """If the result is a still-running Task, poll tasks/get until it
         reaches a terminal state or the poll budget runs out."""
-        if not isinstance(result, dict) or result.get("kind") != "task":
+        if not isinstance(result, dict):
+            return result
+        # 0.2.x tasks carry kind=="task"; legacy (tasks/send) results have no
+        # kind but are tasks iff they carry an id + status.state.
+        is_task = result.get("kind") == "task" or (
+            result.get("id") and isinstance(result.get("status"), dict)
+        )
+        if not is_task:
             return result
         task_id = result.get("id")
         waited = 0.0
