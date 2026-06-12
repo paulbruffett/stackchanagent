@@ -20,26 +20,24 @@ set(STACK_CHAN_INCLUDE_DIRS
 )
 list(APPEND STACK_CHAN_SOURCES main.cpp)
 
-# Define source files
+# Define source files.
+#
+# Deliberately NOT compiled from xiaozhi (we run our own app_main, not
+# Application::Start()): application.cc, mcp_server.cc, the mqtt/websocket
+# protocol stacks, the codec drivers for other boards, LED drivers, and the
+# board commons for other hardware. Kept xiaozhi TUs still reference the
+# Application singleton on never-executed paths; those symbols come from
+# main/hal/board/application_stub.cc. protocol.cc / ota.cc /
+# device_state_machine.cc stay because Application's members odr-use their
+# dtors/ctors via the stub.
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
             "audio/demuxer/ogg_demuxer.cc"
-            "audio/codecs/no_audio_codec.cc"
-            "audio/codecs/box_audio_codec.cc"
-            "audio/codecs/es8311_audio_codec.cc"
-            "audio/codecs/es8374_audio_codec.cc"
-            "audio/codecs/es8388_audio_codec.cc"
-            "audio/codecs/es8389_audio_codec.cc"
-            "audio/codecs/dummy_audio_codec.cc"
             "audio/processors/audio_debugger.cc"
-            "led/single_led.cc"
-            "led/circular_strip.cc"
-            "led/gpio_led.cc"
             "display/display.cc"
             "display/lcd_display.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
-            # "display/emote_display.cc"
             "display/lvgl_display/emoji_collection.cc"
             "display/lvgl_display/lvgl_theme.cc"
             "display/lvgl_display/lvgl_font.cc"
@@ -49,16 +47,11 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lvgl_display/jpg/image_to_jpeg.cpp"
             "display/lvgl_display/jpg/jpeg_to_image.c"
             "protocols/protocol.cc"
-            "protocols/mqtt_protocol.cc"
-            "protocols/websocket_protocol.cc"
-            "mcp_server.cc"
             "system_info.cc"
-            "application.cc"
             "ota.cc"
             "settings.cc"
             "device_state_machine.cc"
             "assets.cc"
-            # "main.cc"
             )
 
 # Transform relative paths to absolute paths from xiaozhi-esp32/main
@@ -68,25 +61,14 @@ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg"
 # Transform include dirs to absolute paths from xiaozhi-esp32/main
 list(TRANSFORM INCLUDE_DIRS PREPEND "${XIAOZHI_MAIN_DIR}/")
 
-# Add board common files
+# Add board common files (only what the CoreS3 StackChan board actually uses)
 list(APPEND SOURCES
     "${XIAOZHI_MAIN_DIR}/boards/common/board.cc"
     "${XIAOZHI_MAIN_DIR}/boards/common/wifi_board.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/ml307_board.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/nt26_board.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/dual_network_board.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/adc_battery_monitor.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/afsk_demod.cc"
     "${XIAOZHI_MAIN_DIR}/boards/common/axp2101.cc"
     "${XIAOZHI_MAIN_DIR}/boards/common/backlight.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/button.cc"
     "${XIAOZHI_MAIN_DIR}/boards/common/i2c_device.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/knob.cc"
     "${XIAOZHI_MAIN_DIR}/boards/common/power_save_timer.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/press_to_talk_mcp_tool.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/sleep_timer.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/sy6970.cc"
-    "${XIAOZHI_MAIN_DIR}/boards/common/system_reset.cc"
     ${STACK_CHAN_SOURCES}
 )
 list(APPEND INCLUDE_DIRS ${XIAOZHI_MAIN_DIR}/boards/common ${STACK_CHAN_INCLUDE_DIRS})

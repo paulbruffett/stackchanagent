@@ -11,7 +11,6 @@
 #include <nvs_flash.h>
 #include <driver/gpio.h>
 #include <esp_event.h>
-#include <application.h>
 #include <board.h>
 #include <display.h>
 #include <mutex>
@@ -63,18 +62,6 @@ TouchPoint_t get_touch_point()
     return _data.touchPoint;
 }
 
-bool is_xiaozhi_mode()
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _data.isXiaozhiMode;
-}
-
-void set_xiaozhi_mode(bool mode)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    _data.isXiaozhiMode = mode;
-}
-
 /* -------------------------------------------------------------------------- */
 /*                                   Display                                  */
 /* -------------------------------------------------------------------------- */
@@ -108,16 +95,6 @@ void xiaozhi_board_init()
     auto& board = Board::GetInstance();
 }
 
-void start_xiaozhi_app()
-{
-    set_xiaozhi_mode(true);
-
-    // Initialize and run the application
-    auto& app = Application::GetInstance();
-    app.Initialize();
-    app.Run();  // This function runs the main event loop and never returns
-}
-
 XiaozhiConfig_t get_xiaozhi_config()
 {
     XiaozhiConfig_t config;
@@ -139,12 +116,6 @@ void set_xiaozhi_config(const XiaozhiConfig_t& config)
     settings.SetInt(_xiaozhi_config_idle_shutdown_time_key.data(), config.idleShutdownTimeSeconds);
     settings.SetBool(_xiaozhi_config_allow_shutdown_when_charging_key.data(), config.allowShutdownWhenCharging);
     settings.SetInt(_xiaozhi_config_idle_random_movement_key.data(), config.idleRandomMovementLevel);
-}
-
-void app_play_sound(const std::string_view& sound)
-{
-    auto& app = Application::GetInstance();
-    app.PlaySound(sound);
 }
 
 }  // namespace hal_bridge

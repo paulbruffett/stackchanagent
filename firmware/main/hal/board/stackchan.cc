@@ -2,7 +2,6 @@
 #include "cores3_audio_codec.h"
 #include "display/lcd_display.h"
 #include "stackchan_display.h"
-#include "application.h"
 #include "config.h"
 #include "power_save_timer.h"
 #include "i2c_device.h"
@@ -648,14 +647,4 @@ uint8_t hal_bridge::board_get_speaker_volume()
         volume = 10;
     }
     return volume;
-}
-
-void hal_bridge::toggle_xiaozhi_chat_state()
-{
-    auto& app = Application::GetInstance();
-    if (app.GetDeviceState() == kDeviceStateStarting) {
-        // EnterWifiConfigMode();
-        return;
-    }
-    app.ToggleChatState();
 }

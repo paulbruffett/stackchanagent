@@ -402,8 +402,8 @@ bool StackChanCamera::Capture()
         return false;
     }
 
-    // Play shutter sfx
-    hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
+    // (Shutter sfx removed with the xiaozhi Application strip — the agent
+    // uses StreamCaptures(), which never had one; Capture() is unused.)
 
     for (int i = 0; i < 3; i++) {
         struct v4l2_buffer buf = {};

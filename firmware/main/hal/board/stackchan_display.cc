@@ -253,11 +253,8 @@ void StackChanAvatarDisplay::SetupUI()
 
     auto avatar = std::make_unique<DefaultAvatar>();
     avatar->init(lv_screen_active());
-    avatar->getPanel()->onClick().connect([]() {
-        if (hal_bridge::is_xiaozhi_ready()) {
-            hal_bridge::toggle_xiaozhi_chat_state();
-        }
-    });
+    // (The factory firmware wired the avatar's onClick to xiaozhi's chat
+    // toggle here; our agent uses the head-touch sensor instead.)
 
     stackchan.attachAvatar(std::move(avatar));
     stackchan.addModifier(std::make_unique<BreathModifier>());
