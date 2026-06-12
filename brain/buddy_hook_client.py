@@ -44,9 +44,11 @@ Env:
                      recommended: a never-closing connection leaves a stale
                      prompt on the robot, which is exactly what this avoids).
 
-On any failure (brain unreachable, bad response, timeout) it emits "ask" so the
-normal Claude Code permission prompt appears — it never auto-approves, and the
-bounded timeout means it never blocks the session or orphans a process.
+On anything but a tap (brain unreachable, timeout, coalesced, mode off) it
+emits NO decision, so Claude Code's normal permission flow applies unchanged —
+allowlisted/auto-mode commands run, gated ones get the usual terminal prompt.
+It never auto-approves, and the bounded timeout means it never blocks the
+session or orphans a process.
 """
 
 from __future__ import annotations
@@ -107,13 +109,20 @@ def main() -> None:
         print(f"buddy hook: falling back to {FALLBACK} ({exc})", file=sys.stderr)
         decision = FALLBACK
 
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": decision,
-            "permissionDecisionReason": f"Stack-Chan Buddy: {decision}",
-        }
-    }))
+    if decision == "allow":
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "Stack-Chan Buddy: tap-approved",
+            }
+        }))
+    else:
+        # No decision: defer to Claude Code's normal permission flow. Emitting
+        # "ask" here would FORCE a terminal prompt even for allowlisted /
+        # auto-mode commands — an un-tapped robot prompt must leave the
+        # session's behavior unchanged, not make it stricter.
+        print("{}")
     sys.exit(0)
 
 
