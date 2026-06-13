@@ -29,4 +29,12 @@ void dispatch(std::string_view json);
 // instant and works even if the brain link is down. Idempotent.
 void wake_face();
 
+// Turn the screen off + show the sleepy face. Idempotent. Used by the
+// brain's {"cmd":"sleep"} and by the BLE buddy to restore the off state
+// after a prompt that arrived while asleep resolves.
+void sleep_face();
+
+// True while the screen is currently off for sleep.
+bool face_is_off();
+
 }  // namespace agent::commands

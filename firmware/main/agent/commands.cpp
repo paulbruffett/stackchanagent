@@ -26,18 +26,6 @@ using stackchan::avatar::Emotion;
 std::atomic<bool> g_face_off{false};
 std::atomic<uint8_t> g_saved_brightness{255};
 
-void sleep_face()
-{
-    if (g_face_off.exchange(true)) return;  // already asleep
-    LvglLockGuard lock;
-    uint8_t cur = GetHAL().getBackLightBrightness();
-    if (cur > 0) g_saved_brightness.store(cur);
-    GetStackChan().avatar().setEmotion(Emotion::Sleepy);
-    GetHAL().setBackLightBrightness(0);
-    mclog::tagInfo(TAG, "sleep: screen off (saved brightness {})",
-                   g_saved_brightness.load());
-}
-
 Emotion parse_emotion(std::string_view name)
 {
     if (name == "happy") return Emotion::Happy;
@@ -113,6 +101,23 @@ void wake_face()
     GetStackChan().avatar().setEmotion(Emotion::Neutral);
     mclog::tagInfo(TAG, "wake: screen on (brightness {})",
                    g_saved_brightness.load());
+}
+
+void sleep_face()
+{
+    if (g_face_off.exchange(true)) return;  // already asleep
+    LvglLockGuard lock;
+    uint8_t cur = GetHAL().getBackLightBrightness();
+    if (cur > 0) g_saved_brightness.store(cur);
+    GetStackChan().avatar().setEmotion(Emotion::Sleepy);
+    GetHAL().setBackLightBrightness(0);
+    mclog::tagInfo(TAG, "sleep: screen off (saved brightness {})",
+                   g_saved_brightness.load());
+}
+
+bool face_is_off()
+{
+    return g_face_off.load();
 }
 
 void dispatch(std::string_view json)
