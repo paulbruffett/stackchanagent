@@ -311,6 +311,7 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     pcm = bytes(state.speech_buf)
     state.speech_buf = bytearray()
     state.listening = False
+    voiced_ms = state.voiced_ms  # snapshot before reset; used by the follow-up gate
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
 
@@ -327,6 +328,34 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     if not transcript.text:
         log.info("empty transcript — going idle")
         return
+
+    # Follow-up false-trigger gate (M6.7). A follow-up turn needs no wakeword,
+    # so a noise blip hallucinated into text would otherwise start a turn and
+    # open yet another window (a self-perpetuating loop). Drop it if Whisper is
+    # unconfident OR the capture is a clipping blip too short to be speech.
+    # Wakeword turns are never gated here.
+    if follow_up_turn:
+        cfg = get_config()
+        weak_conf = (
+            transcript.no_speech_prob >= cfg.get("FOLLOWUP_MAX_NO_SPEECH_PROB")
+            or transcript.avg_logprob <= cfg.get("FOLLOWUP_MIN_AVG_LOGPROB")
+        )
+        bad_quality = (
+            transcript.peak_pct >= cfg.get("FOLLOWUP_CLIP_PEAK_PCT")
+            and voiced_ms < cfg.get("FOLLOWUP_MIN_VOICED_MS")
+        )
+        if weak_conf or bad_quality:
+            log.info(
+                "dropped follow-up (%s): %r (no_speech=%.2f avg_logprob=%.2f "
+                "peak=%.1f%% voiced=%d ms)",
+                "low confidence" if weak_conf else "noise blip",
+                transcript.text,
+                transcript.no_speech_prob,
+                transcript.avg_logprob,
+                transcript.peak_pct,
+                voiced_ms,
+            )
+            return
 
     log.info(
         "transcript: %r (%d ms)%s",

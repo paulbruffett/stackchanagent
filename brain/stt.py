@@ -29,6 +29,14 @@ DEFAULT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "float16")
 class Transcript:
     text: str
     latency_ms: int
+    # Worst-case per-segment confidence from faster-whisper, plus the
+    # captured signal level. Surfaced so the caller can gate noise/
+    # hallucinations on follow-up turns (see agent_server.respond). Neutral
+    # defaults (high confidence, no signal) for the empty-audio path.
+    no_speech_prob: float = 0.0
+    avg_logprob: float = 0.0
+    peak_pct: float = 0.0
+    rms_pct: float = 0.0
 
 
 class Transcriber:
@@ -84,10 +92,23 @@ class Transcriber:
             vad_filter=False,
             condition_on_previous_text=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        # Materialize the generator once so we can both join the text and read
+        # per-segment confidence. Aggregate worst-case (a single bad segment is
+        # what we want to catch): highest no_speech_prob, lowest avg_logprob.
+        segs = list(segments)
+        text = " ".join(seg.text.strip() for seg in segs).strip()
+        no_speech_prob = max((s.no_speech_prob for s in segs), default=0.0)
+        avg_logprob = min((s.avg_logprob for s in segs), default=0.0)
         ms = int((time.monotonic() - t0) * 1000)
         log.info(
             "stt: %d ms, %d bytes (peak=%.1f%% rms=%.1f%%) → %r",
             ms, len(pcm), peak_pct, rms_pct, text,
         )
-        return Transcript(text=text, latency_ms=ms)
+        return Transcript(
+            text=text,
+            latency_ms=ms,
+            no_speech_prob=no_speech_prob,
+            avg_logprob=avg_logprob,
+            peak_pct=peak_pct,
+            rms_pct=rms_pct,
+        )
