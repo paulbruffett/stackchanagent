@@ -125,7 +125,7 @@ async function loadMemories() {
   ]);
 
   // --- facts ---
-  const fsec = el("div", { className: "group" }, el("h2", { textContent: `Known facts (${facts.facts.length})` }));
+  const fsec = el("div", { className: "group" }, el("h2", { textContent: `Permanent knowledge (${facts.facts.length})` }));
   for (const f of facts.facts) {
     const input = el("input", { value: f.fact });
     const save = el("button", { className: "ghost", textContent: "save" });
@@ -169,12 +169,12 @@ async function loadMemories() {
   root.append(fsec);
 
   // --- summaries ---
-  const ssec = el("div", { className: "group" }, el("h2", { textContent: `Summaries (${summaries.summaries.length})` }));
+  const ssec = el("div", { className: "group" }, el("h2", { textContent: `Recent conversation summaries (${summaries.summaries.length}) — older ones auto-expire` }));
   const sumNow = el("button", { className: "act", textContent: "Summarize now" });
   sumNow.addEventListener("click", summarizeNow);
   ssec.append(el("div", { className: "toolbar" },
     el("div", { className: "muted", textContent:
-      "Fold the oldest backlog into a summary now (keeps the most recent turns verbatim)." }),
+      "Episodic memory. Folds the oldest backlog into a summary now (keeps the most recent turns verbatim). Beyond the SUMMARY_RETENTION window, old summaries and their turns are purged automatically — enduring facts are lifted into Permanent knowledge first." }),
     el("span", { style: "flex:1" }), sumNow));
   if (!summaries.summaries.length) ssec.append(el("div", { className: "muted", textContent: "none yet" }));
   for (const s of summaries.summaries) {

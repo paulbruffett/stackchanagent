@@ -209,6 +209,26 @@ SPECS: dict[str, Spec] = {
         "default (claude_agent.DEFAULT_SUMMARIZE_SYSTEM). Read per fold.",
         hidden=True,
     ),
+    "SUMMARY_RETENTION": Spec(
+        12, "int", False, "memory",
+        "Max episodic conversation summaries to keep. After each background "
+        "fold, older summaries — and the raw turns they covered — are "
+        "permanently purged. Durable facts are extracted first, so nothing "
+        "lasting is lost. 0 = keep all (no purge).",
+    ),
+    "AUTO_FACT_EXTRACTION": Spec(
+        1, "int", False, "memory",
+        "On each summary fold, automatically extract enduring facts (names, "
+        "location, occupation, lasting preferences) from the folded turns "
+        "into permanent memory. 0 = off (rely only on the remember_fact tool "
+        "and manual web-UI edits).",
+    ),
+    "EXTRACT_FACTS_SYSTEM": Spec(
+        "", "str", False, "memory",
+        "Override for the durable-fact extraction system prompt. Empty = "
+        "built-in default (claude_agent.DEFAULT_EXTRACT_FACTS_SYSTEM).",
+        hidden=True,
+    ),
 
     # --- Claude Buddy (hot) — Option C Milestone 0 ----------------------
     "BUDDY_MODE": Spec(
