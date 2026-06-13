@@ -152,9 +152,10 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "Switch the robot's persona mode. 'rocky' adopts the Rocky "
             "character (broken-English alien engineer) and, when configured, "
             "the Rocky voice; 'normal' restores the default Stack-Chan "
-            "persona and voice. Call this when the user asks to enter or "
-            "leave Rocky mode (e.g. 'rocky mode', 'be Rocky', 'normal mode', "
-            "'stop being Rocky'). The change applies on the next reply."
+            "persona and voice. Call with 'rocky' when the user asks for the "
+            "Rocky voice / to talk 'as Rocky' / 'rocky mode'; call with "
+            "'normal' on 'Rocky stop', 'stop Rocky', or 'normal mode'. The "
+            "change applies on the next reply."
         ),
         "input_schema": {
             "type": "object",
