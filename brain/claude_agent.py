@@ -395,7 +395,7 @@ class AgentSession:
                     "max_tokens": MAX_TOKENS,
                     "system": self._build_system(),
                     "tools": self._tool_defs(),
-                    "messages": self.messages,
+                    "messages": _sanitize_for_api(self.messages),
                 }
                 if thinking:
                     # Private reasoning channel. text_stream only yields text
@@ -517,6 +517,63 @@ class AgentSession:
         finally:
             if busy:
                 await self._set_busy(False)
+
+
+def _content_blocks(content: Any) -> list[dict[str, Any]]:
+    """Normalize a message's `content` (str or block list) to a block list."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if isinstance(content, list):
+        return list(content)
+    return []
+
+
+def _sanitize_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return an API-valid copy of the message thread.
+
+    Drops any `tool_use` block that isn't answered by a `tool_result` in the
+    immediately-following message. A process killed (or a tool dispatch that
+    raised) between persisting an assistant tool_use turn and appending its
+    tool_result leaves such a dangling block in the persisted history; once
+    it's replayed every turn fails with a 400 ('tool_use ids were found
+    without tool_result blocks immediately after'). Messages emptied by the
+    drop are removed, and consecutive same-role messages are then merged so
+    roles still strictly alternate. Operates on a copy — persisted history is
+    left as-is and self-heals when those turns are later summarized away."""
+    def result_ids(msg: dict[str, Any]) -> set[Any]:
+        ids: set[Any] = set()
+        for b in _content_blocks(msg.get("content")):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                ids.add(b.get("tool_use_id"))
+        return ids
+
+    cleaned: list[dict[str, Any]] = []
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if msg.get("role") == "assistant" and isinstance(content, list):
+            answered = result_ids(messages[i + 1]) if i + 1 < len(messages) else set()
+            kept = [
+                b for b in content
+                if not (
+                    isinstance(b, dict)
+                    and b.get("type") == "tool_use"
+                    and b.get("id") not in answered
+                )
+            ]
+            if not kept:
+                continue  # tool_use-only turn with nothing answered → drop
+            msg = {**msg, "content": kept}
+        cleaned.append(msg)
+
+    merged: list[dict[str, Any]] = []
+    for msg in cleaned:
+        if merged and merged[-1].get("role") == msg.get("role"):
+            prev_blocks = _content_blocks(merged[-1].get("content"))
+            prev_blocks.extend(_content_blocks(msg.get("content")))
+            merged[-1] = {**merged[-1], "content": prev_blocks}
+        else:
+            merged.append(msg)
+    return merged
 
 
 _STREAM_ONLY_FIELDS = ("parsed_output",)
