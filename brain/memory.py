@@ -12,11 +12,18 @@ One DB per device at ~/.stackchan/memory.db. Three tables:
   summaries(id, ts, summary, span_from, span_to)
       A natural-language summary of turns whose id falls in
       [span_from, span_to]. Replayed to Claude as a leading
-      "earlier in our conversation:" message.
+      "earlier in our conversation:" message. EPISODIC + bounded: only
+      the most recent SUMMARY_RETENTION summaries are kept; older ones
+      are permanently purged after each background fold, and the raw
+      turn rows they covered are hard-deleted with them (true purge —
+      those turns are already marked summarized and never replayed).
 
   known_facts(id, ts, fact)
-      Things the agent has chosen to remember via the `remember_fact`
-      tool. Injected as a system block on every turn.
+      PERMANENT durable knowledge — user/owner names, the device's
+      location, the user's occupation, lasting preferences. Injected as
+      a system block on every turn. Grows automatically: each summary
+      fold extracts enduring facts from the folded span (AUTO_FACT_
+      EXTRACTION) on top of the model's own `remember_fact` tool calls.
 
   config(key, value, updated_ts)
       Runtime-tunable settings edited from the web UI (Phase 9a).
@@ -245,6 +252,41 @@ class Memory:
         self._conn.commit()
         return True
 
+    def prune_summaries(self, keep_recent: int) -> tuple[int, int]:
+        """Episodic-memory retention: keep only the most recent
+        `keep_recent` summaries; permanently purge older ones AND the raw
+        turn rows they covered. Returns (summaries_deleted, turns_deleted).
+
+        `keep_recent <= 0` is a no-op (keep everything). Spans are
+        contiguous oldest-first and never overlap (each fold takes the
+        oldest chunk — see save_summary / delete_summary), so the doomed
+        summaries' turns are exactly `turns.id <= max(span_to)` among the
+        already-summarized rows; the live verbatim tail (summarized = 0)
+        is untouched."""
+        if keep_recent <= 0:
+            return (0, 0)
+        doomed = self._conn.execute(
+            "SELECT id, span_to FROM summaries ORDER BY id DESC LIMIT -1 OFFSET ?",
+            (keep_recent,),
+        ).fetchall()
+        if not doomed:
+            return (0, 0)
+        ids = [r["id"] for r in doomed]
+        cutoff = max(r["span_to"] for r in doomed)
+        try:
+            tcur = self._conn.execute(
+                "DELETE FROM turns WHERE summarized = 1 AND id <= ?", (cutoff,)
+            )
+            scur = self._conn.execute(
+                f"DELETE FROM summaries WHERE id IN ({','.join('?' * len(ids))})",
+                ids,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return (scur.rowcount, tcur.rowcount)
+
     def add_fact(self, fact: str) -> int:
         cur = self._conn.execute(
             "INSERT INTO known_facts(ts, fact) VALUES (?, ?)",
@@ -296,6 +338,28 @@ class Memory:
         except Exception:
             self._conn.rollback()
             raise
+
+    def merge_facts(self, new_facts: list[str]) -> int:
+        """Append durable facts, skipping any that already exist
+        (case-insensitive exact match). Returns the number actually
+        added. Insertion order is preserved so facts inject oldest-first.
+        Used by the automatic fact extraction at summary-fold time —
+        distinct from the wholesale replace_facts (web-UI compaction)."""
+        existing = {f.casefold() for f in self.list_facts()}
+        added = 0
+        now = time.time()
+        for fact in new_facts:
+            fact = fact.strip()
+            if not fact or fact.casefold() in existing:
+                continue
+            self._conn.execute(
+                "INSERT INTO known_facts(ts, fact) VALUES (?, ?)", (now, fact)
+            )
+            existing.add(fact.casefold())
+            added += 1
+        if added:
+            self._conn.commit()
+        return added
 
     def recent_turns(self, limit: int = 50) -> list[Turn]:
         """Most-recent turns (any summarized state), oldest-first within

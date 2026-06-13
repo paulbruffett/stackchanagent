@@ -142,6 +142,20 @@ DEFAULT_SUMMARIZE_SYSTEM = (
     "weren't substantive."
 )
 
+# Prompt for automatic durable-fact extraction at summary-fold time.
+# Editable at runtime via the hidden EXTRACT_FACTS_SYSTEM override knob.
+DEFAULT_EXTRACT_FACTS_SYSTEM = (
+    "From this conversation transcript, extract only ENDURING facts worth "
+    "remembering permanently about the user(s) or the robot's situation: "
+    "people's names, the device's location, the user's occupation or how "
+    "they're employed, lasting preferences, and relationships. IGNORE one-off "
+    "chatter, questions, the weather, jokes, and anything that won't matter "
+    "next week. You are given the facts already known — return ONLY facts that "
+    "are genuinely new (not already covered). Each fact: one line, third "
+    "person, concise (e.g. 'The user's name is Paul.'). Output nothing at all "
+    "if there are no new enduring facts."
+)
+
 # Prompt for LLM-driven fact consolidation (web UI "Compact facts").
 CONSOLIDATE_FACTS_SYSTEM = (
     "You are tidying the list of facts a small desktop robot has chosen to "
@@ -156,6 +170,10 @@ CONSOLIDATE_FACTS_SYSTEM = (
 
 def _summarize_system() -> str:
     return (get_config().get("SUMMARIZE_SYSTEM") or "").strip() or DEFAULT_SUMMARIZE_SYSTEM
+
+
+def _extract_facts_system() -> str:
+    return (get_config().get("EXTRACT_FACTS_SYSTEM") or "").strip() or DEFAULT_EXTRACT_FACTS_SYSTEM
 
 
 def _parse_fact_lines(text: str) -> list[str]:
@@ -585,6 +603,21 @@ async def summarize_backlog(
 
         sid = memory.save_summary(span[0].id, span[-1].id, summary)
         log.info("summary %d saved (%d chars): %r", sid, len(summary), summary[:160])
+
+        # Harvest enduring facts from the same span into permanent memory.
+        # Best-effort: a failure here must never undo the summary we just
+        # saved, so it's fully guarded.
+        if get_config().get("AUTO_FACT_EXTRACTION"):
+            try:
+                new_facts = await extract_facts(
+                    client, model, transcript, memory.list_facts()
+                )
+                added = memory.merge_facts(new_facts) if new_facts else 0
+                if added:
+                    log.info("extracted %d durable fact(s): %r", added, new_facts)
+            except Exception:
+                log.exception("durable-fact extraction failed (summary kept)")
+
         return (
             Summary(id=sid, summary=summary,
                     span_from=span[0].id, span_to=span[-1].id),
@@ -617,6 +650,39 @@ async def consolidate_facts(
     return proposed or list(facts)
 
 
+async def extract_facts(
+    client: AsyncAnthropic,
+    model: str,
+    transcript: str,
+    existing_facts: list[str],
+) -> list[str]:
+    """Pull NEW enduring facts out of a folded transcript. The caller
+    merges the result into permanent memory (memory.merge_facts), which
+    also dedupes. Returns [] on empty input or any LLM error (never
+    raises — mirrors consolidate_facts' fail-safe contract)."""
+    if not transcript.strip():
+        return []
+    known = (
+        "Facts already known (do not repeat these):\n"
+        + "\n".join(f"- {f}" for f in existing_facts)
+        if existing_facts
+        else "No facts are known yet."
+    )
+    user = f"{known}\n\nTranscript:\n{transcript}"
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=400,
+            system=[{"type": "text", "text": _extract_facts_system()}],
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception:
+        log.exception("fact extraction call failed")
+        return []
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    return _parse_fact_lines(text)
+
+
 async def _maybe_summarize(session: "AgentSession") -> None:
     """Background: if the unsummarized backlog is large, fold the oldest
     complete-exchange chunk and re-sync this session's in-memory thread.
@@ -640,3 +706,10 @@ async def _maybe_summarize(session: "AgentSession") -> None:
             {"role": t.role, "content": t.content}
             for t in session.memory.list_unsummarized_turns()
         ]
+        # Episodic retention: ride the automatic fold path only (a forced
+        # web-UI summarize stays purely additive — never surprise-deletes).
+        retention = int(get_config().get("SUMMARY_RETENTION"))
+        s_del, t_del = session.memory.prune_summaries(retention)
+        if s_del:
+            log.info("pruned: %d summaries / %d turns (retention=%d)",
+                     s_del, t_del, retention)
