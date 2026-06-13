@@ -133,15 +133,19 @@ void apply_time(JsonArrayConst arr)
 
 void apply_snapshot(JsonDocument& doc)
 {
-    g_total.store(doc["total"] | 0);
-    g_running.store(doc["running"] | 0);
-    g_waiting.store(doc["waiting"] | 0);
+    int total = doc["total"] | 0;
+    int running = doc["running"] | 0;
+    int waiting = doc["waiting"] | 0;
+    g_total.store(total);
+    g_running.store(running);
+    g_waiting.store(waiting);
     g_last_snapshot_ms.store(GetHAL().millis());
 
     JsonObjectConst prompt = doc["prompt"];
+    const char* tool = "none";
     if (!prompt.isNull()) {
         const char* id = prompt["id"] | "";
-        const char* tool = prompt["tool"] | "tool";
+        tool = prompt["tool"] | "tool";
         {
             std::lock_guard<std::mutex> lk(g_prompt_mtx);
             g_prompt_id = id;
@@ -151,6 +155,10 @@ void apply_snapshot(JsonDocument& doc)
     } else {
         g_has_prompt.store(false);
     }
+    // Diagnostic: show exactly what the desktop reports so we can tell a
+    // "no prompt arrived" (desktop coverage) case from a render bug.
+    mclog::tagInfo(TAG, "snapshot: total={} running={} waiting={} prompt={}",
+                   total, running, waiting, tool);
 }
 
 void handle_command(std::string_view cmd, JsonDocument& doc)
