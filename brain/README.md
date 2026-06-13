@@ -66,3 +66,24 @@ Once that passes we layer in `faster-whisper` and `piper-tts` in phase 2.
 ## Env
 
 `ANTHROPIC_API_KEY` is required from phase 3 onward.
+
+### Rocky mode (optional)
+
+A device-wide character mode: the robot adopts the Rocky persona (the
+broken-English alien engineer from *Project Hail Mary*) and, when a Hume AI
+voice is configured, switches speech to a Hume cloud voice. Toggle it in the
+web Config tab (`ROCKY_MODE` under the **rocky** group) or by voice ("computer,
+rocky mode" / "normal mode").
+
+It degrades gracefully: with **no** Hume key the persona still works, spoken on
+the normal Piper voice. To enable the cloud voice, add to `../.env`:
+
+```
+HUME_API_KEY=...
+HUME_VOICE_ID=...          # a voice id, e.g. a cloned Rocky voice
+HUME_VOICE_PROVIDER=CUSTOM_VOICE   # or HUME_AI for a library voice by id
+HUME_FALLBACK_VOICE=...    # a Hume library voice *name*, used if no id is set
+```
+
+`ROCKY_SPEED` (rocky config group) sets the Hume speaking-rate multiplier
+(Piper ignores it).

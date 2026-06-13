@@ -258,6 +258,25 @@ SPECS: dict[str, Spec] = {
         "session never taps. 0 = wait indefinitely (the old behavior).",
     ),
 
+    # --- Rocky mode (hot) — Milestone 4 ---------------------------------
+    # Device-wide character mode: the Rocky persona (broken-English speech)
+    # plus, when a Hume voice is configured in .env, a cloud TTS voice.
+    # Degrades gracefully — persona-only on Piper when no Hume key is set.
+    "ROCKY_MODE": Spec(
+        0, "int", False, "rocky",
+        "Enable Rocky mode: the robot adopts the Rocky persona (broken "
+        "English, third-person self-reference, sentence-ending 'question'). "
+        "If HUME_API_KEY + a Hume voice are set in .env, speech also switches "
+        "to the Hume cloud voice; otherwise the persona runs on the normal "
+        "Piper voice. 1=on, 0=off. Also toggleable by voice ('rocky mode' / "
+        "'normal mode').",
+    ),
+    "ROCKY_SPEED": Spec(
+        1.25, "float", False, "rocky",
+        "Speaking-rate multiplier for the Hume Rocky voice (Hume only; no "
+        "effect on Piper). 1.0 = natural; the default speeds Rocky up a touch.",
+    ),
+
     # --- Persona (hot; edited via its own console panel, not the grid) ---
     "SYSTEM_PROMPT": Spec(
         "", "str", False, "persona",

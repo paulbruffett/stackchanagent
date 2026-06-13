@@ -27,6 +27,23 @@ DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_US-libritts_r-medium")
 TARGET_SR = 16000
 
 
+def resample_to_16k(pcm_int16: np.ndarray, src_sr: int) -> np.ndarray:
+    """Polyphase resample an int16 PCM array to 16 kHz (the firmware codec
+    rate). Returns the input unchanged when it's already 16 kHz. Shared by
+    every TTS backend (Piper at 22050 Hz, Hume at 48000 Hz) so they all hit
+    the same anti-aliased path — linear interpolation aliases audibly on the
+    AW88298."""
+    if src_sr == TARGET_SR:
+        return pcm_int16
+    g = gcd(TARGET_SR, src_sr)
+    up, down = TARGET_SR // g, src_sr // g
+    return (
+        resample_poly(pcm_int16.astype(np.float32), up, down)
+        .clip(-32768, 32767)
+        .astype(np.int16)
+    )
+
+
 class Synthesizer:
     """Lazy-loaded Piper voice. Resamples to 16 kHz on every call."""
 
@@ -66,17 +83,10 @@ class Synthesizer:
         # Concatenate int16 PCM from all chunks.
         pcm_int16 = np.concatenate([c.audio_int16_array for c in chunks])
 
-        if src_sr != TARGET_SR:
-            # Polyphase resample with a windowed-sinc anti-alias filter.
-            # For 22050 → 16000 the ratio reduces to 320/441. Linear interp
-            # (the old path) introduces audible aliasing on the AW88298.
-            g = gcd(TARGET_SR, src_sr)
-            up, down = TARGET_SR // g, src_sr // g
-            pcm_int16 = (
-                resample_poly(pcm_int16.astype(np.float32), up, down)
-                .clip(-32768, 32767)
-                .astype(np.int16)
-            )
+        # Polyphase resample with a windowed-sinc anti-alias filter (no-op
+        # when already 16 kHz). For 22050 → 16000 the ratio reduces to
+        # 320/441; linear interp (the old path) aliased audibly on the AW88298.
+        pcm_int16 = resample_to_16k(pcm_int16, src_sr)
 
         ms = int((time.monotonic() - t0) * 1000)
         log.info(

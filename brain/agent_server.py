@@ -46,6 +46,7 @@ from mcp_client import McpClient
 from memory import Memory
 from stt import Transcriber
 from tts import Synthesizer
+from tts_hume import HumeSynthesizer
 from vision import FaceDetector, FaceTracker
 from webui.app import create_app
 from webui.logbuf import LOGS, TURNS, WebUILogHandler, publish_turn
@@ -77,6 +78,35 @@ log = logging.getLogger("brain")
 # Lazy globals — one model load per process.
 stt = Transcriber()
 tts = Synthesizer()
+# Rocky-mode cloud voice (Milestone 4). Lazy — no HTTP client until first
+# use, and reports unavailable when no Hume key/voice is in .env, so this is
+# harmless to construct even with no Hume account.
+hume_tts = HumeSynthesizer()
+# Debounce so a Rocky-mode-without-Hume run logs the degradation once, not
+# per sentence.
+_rocky_no_hume_warned = False
+
+
+def _synthesize(sentence: str, use_rocky: bool, speed: float) -> bytes:
+    """Synthesize one sentence to 16 kHz PCM in a worker thread. In Rocky
+    mode with a Hume voice configured, use Hume; any Hume failure (network,
+    quota, malformed stream) falls back to Piper for that sentence so audio
+    is never dropped. Without Rocky mode — or without a Hume key — this is
+    plain Piper."""
+    global _rocky_no_hume_warned
+    if use_rocky:
+        if hume_tts.available:
+            try:
+                return hume_tts.synthesize(sentence, speed=speed)
+            except Exception:
+                log.warning("hume tts failed; falling back to piper", exc_info=True)
+        elif not _rocky_no_hume_warned:
+            log.warning(
+                "ROCKY_MODE on but no Hume voice configured — persona active, "
+                "voice stays Piper (set HUME_API_KEY + a voice in .env)"
+            )
+            _rocky_no_hume_warned = True
+    return tts.synthesize(sentence)
 # Single shared Memory across all WS connections, so the robot
 # remembers conversations even after a disconnect/reconnect or process
 # restart. Sqlite handles file locking; only one process should write.
@@ -185,6 +215,12 @@ async def run_speaker(
     state.speaking = True
     play_start: float | None = None
     total_audio_s = 0.0
+    # Pick the TTS backend once per turn (Rocky mode → Hume when configured).
+    # Read here in the event loop, not in the worker thread, per the config
+    # single-loop contract.
+    cfg = get_config()
+    use_rocky = bool(cfg.get("ROCKY_MODE"))
+    speed = float(cfg.get("ROCKY_SPEED"))
     try:
         while True:
             sentence = await queue.get()
@@ -194,7 +230,7 @@ async def run_speaker(
                 await ws.send(json.dumps({"cmd": "start_speaking"}))
                 started = True
             t0 = time.monotonic()
-            tts_pcm = await asyncio.to_thread(tts.synthesize, sentence)
+            tts_pcm = await asyncio.to_thread(_synthesize, sentence, use_rocky, speed)
             audio_s = len(tts_pcm) / (SAMPLE_RATE * 2)
             log.info(
                 "tts: %d ms, %.2fs audio, %r",

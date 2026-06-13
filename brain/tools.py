@@ -17,6 +17,7 @@ from typing import Any, Callable
 from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
+from config import get_config
 from memory import Memory
 
 log = logging.getLogger("brain.tools")
@@ -146,6 +147,24 @@ TOOL_DEFS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "set_persona_mode",
+        "description": (
+            "Switch the robot's persona mode. 'rocky' adopts the Rocky "
+            "character (broken-English alien engineer) and, when configured, "
+            "the Rocky voice; 'normal' restores the default Stack-Chan "
+            "persona and voice. Call this when the user asks to enter or "
+            "leave Rocky mode (e.g. 'rocky mode', 'be Rocky', 'normal mode', "
+            "'stop being Rocky'). The change applies on the next reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["normal", "rocky"]}
+            },
+            "required": ["mode"],
+        },
+    },
+    {
         "name": "end_conversation",
         "description": (
             "End the conversation gracefully. Use when the user says goodbye or "
@@ -228,6 +247,13 @@ async def dispatch(
         ctx.memory.add_fact(fact)
         log.info("remembered: %r", fact)
         return f"Remembered: {fact}"
+    if name == "set_persona_mode":
+        mode = input_.get("mode")
+        if mode not in ("normal", "rocky"):
+            return f"Unknown persona mode {mode!r}."
+        get_config().set("ROCKY_MODE", 1 if mode == "rocky" else 0)
+        log.info("persona mode → %s", mode)
+        return f"Persona mode set to {mode}."
     if name == "end_conversation":
         # No firmware-side cmd needed; the agent's reply is the goodbye.
         return "Conversation ended."
