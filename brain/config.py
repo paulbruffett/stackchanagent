@@ -102,6 +102,31 @@ SPECS: dict[str, Spec] = {
         "the follow-up window, so the robot doesn't hear its own voice tail. "
         "Raise if the robot replies to itself; lower for snappier follow-ups.",
     ),
+    # Follow-up false-trigger gate (M6.7). Applied ONLY to follow-up turns
+    # (no wakeword) — the path where a noise blip can be hallucinated into a
+    # transcript and start a turn. Wakeword turns are never gated by these.
+    "FOLLOWUP_MAX_NO_SPEECH_PROB": Spec(
+        0.6, "float", False, "capture",
+        "Follow-up only: drop the transcript if Whisper's worst-segment "
+        "no_speech_prob is >= this (likely noise/silence). Lower = stricter.",
+    ),
+    "FOLLOWUP_MIN_AVG_LOGPROB": Spec(
+        -0.8, "float", False, "capture",
+        "Follow-up only: drop the transcript if Whisper's worst-segment "
+        "avg_logprob is <= this (low confidence). Raise toward 0 = stricter.",
+    ),
+    "FOLLOWUP_CLIP_PEAK_PCT": Spec(
+        99.0, "float", False, "capture",
+        "Follow-up only: a capture peaking at/above this %% of full scale is "
+        "clipping; combined with FOLLOWUP_MIN_VOICED_MS it's treated as a blip, "
+        "not speech. Lower = stricter.",
+    ),
+    "FOLLOWUP_MIN_VOICED_MS": Spec(
+        400, "int", False, "capture",
+        "Follow-up only: a clipping capture with fewer voiced ms than this is "
+        "dropped as a noise blip rather than a real command. Raise = stricter "
+        "(risks dropping a very short real follow-up).",
+    ),
 
     # --- Behavior / vision (hot) ----------------------------------------
     "SLEEP_TIMEOUT_S": Spec(
