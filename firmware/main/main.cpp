@@ -22,6 +22,7 @@
 #include <board.h>
 #include <display/display.h>
 
+#include "agent/buddy_ble.h"
 #include "agent/camera_pump.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
@@ -120,6 +121,11 @@ extern "C" void app_main(void)
     agent::mic_pump::start();
     agent::camera_pump::start();
 
+    // Claude Desktop "Hardware Buddy" BLE link: advertises as "Claude
+    // StackChan", shows tool-approval prompts as a Doubt face + bubble, and
+    // approves on a head tap. Coexists with the Wi-Fi WS audio link.
+    agent::buddy_ble::start();
+
     // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
     // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so
     // Press is unused). Treat a debounced Press while idle exactly like the
@@ -127,11 +133,18 @@ extern "C" void app_main(void)
     // listening. Gated to IDLE so a touch can't interrupt an active turn.
     GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
         if (gesture != HeadPetGesture::Press) return;
-        if (agent::state::current() != agent::state::Mode::Idle) return;
         static uint32_t last_tap_ms = 0;
         uint32_t now = GetHAL().millis();
         if (now - last_tap_ms < 800) return;  // debounce repeated touches
         last_tap_ms = now;
+        // A waiting desktop permission prompt takes priority: tap = approve
+        // (decision "once"), and does NOT start a listening turn.
+        if (agent::buddy_ble::prompt_pending()) {
+            agent::buddy_ble::approve_pending();
+            mclog::tagInfo(TAG, "head tap → approve buddy prompt");
+            return;
+        }
+        if (agent::state::current() != agent::state::Mode::Idle) return;
         agent::commands::wake_face();
         agent::transport::send_event_json("{\"event\":\"tap\"}");
         agent::state::transition(agent::state::Mode::Listening);
@@ -169,6 +182,9 @@ extern "C" void app_main(void)
             LvglLockGuard lock;
             GetStackChan().update();
         }
+        // Buddy face/bubble arbitration — runs outside the LVGL lock (it
+        // takes the lock itself when it draws). Cheap when there's no link.
+        agent::buddy_ble::tick();
         uint32_t now = GetHAL().millis();
         if (now >= next_pose_log_ms) {
             next_pose_log_ms = now + 500;
