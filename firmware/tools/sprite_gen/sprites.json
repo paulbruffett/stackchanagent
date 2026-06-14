@@ -1,0 +1,63 @@
+{
+  "model": "google/gemini-3-pro-image-preview",
+  "output_dir": "../../main/stackchan/avatar/skins/rocky/assets/png",
+  "reference_image": "reference/rocky_neutral.png",
+  "default_size": 160,
+  "key_color": "#FF00FF",
+  "global_prefix": "Using the attached reference image of Rocky as the exact character design — same body shape, carapace, proportions, color palette, and art style — redraw only the pose described below. CRITICAL: Rocky has NO face — no eyes, no mouth, no nose, no facial features of any kind; he is an eyeless armored creature, keep him completely faceless. He has EXACTLY FIVE legs/arms total, never more than five. Keep the exact coloring from the reference (brown carapace with green glowing accents), consistent across the entire body. Low-res sprite/pixel-art look, single centered subject, square composition with about 10% padding, bold high-contrast colors, hard edges, no anti-aliasing, a light rim/outline so the body reads on a black background. Fill the ENTIRE background edge to edge with solid flat pure magenta (hex FF00FF) — a uniform chroma-key color, NOT a checkerboard, NOT a gradient, no shadows. Do not use magenta anywhere on the character. No text.",
+  "overlay_prefix": "Low-res sprite/pixel-art icon, single centered subject, bold high-contrast colors, hard edges, no anti-aliasing, no soft gradients. Fill the ENTIRE background edge to edge with solid flat pure magenta (hex FF00FF) — a uniform chroma-key color, NOT a checkerboard, NOT a gradient, no shadows. Do not use magenta anywhere on the icon. No text.",
+  "sprites": [
+    {
+      "name": "rocky_neutral",
+      "size": 160,
+      "prompt": "Rocky standing calmly, carapace level, five legs evenly planted, a slight inquisitive forward lean. Relaxed, content, neutral."
+    },
+    {
+      "name": "rocky_happy",
+      "size": 160,
+      "use_reference": false,
+      "prefix": "Draw Rocky, a faceless five-legged armored alien creature: a brown rocky carapace body with small glowing green accents at the joints, EXACTLY FIVE legs/arms, and absolutely NO face — no eyes, no mouth, no facial features of any kind. Low-res sprite/pixel-art look, single centered subject, square composition with about 10% padding, bold high-contrast colors, hard edges, no anti-aliasing, a light rim/outline so the body reads on a black background. Fill the ENTIRE background edge to edge with solid flat pure magenta (hex FF00FF) — a uniform chroma-key color, NOT a checkerboard, NOT a gradient, no shadows. Do not use magenta anywhere on the character. No text.",
+      "prompt": "He is happy and lively, both front legs lifted just slightly off the ground in a perky, bouncy stance, carapace tilted a little back, cheerful and content. A gentle upbeat pose — NOT arms thrown overhead. (Serves as both the happy and celebrate pose.)",
+      "harmonize": true
+    },
+    {
+      "name": "rocky_angry",
+      "size": 160,
+      "prompt": "Rocky hunched and braced, carapace pulled low, the other legs spread wide and tensed, one front leg raised aggressively, with a warm reddish rim light. Defiant, irritated."
+    },
+    {
+      "name": "rocky_doubt",
+      "size": 160,
+      "prompt": "Rocky tilted to one side, a single front leg raised and curled like a question mark, carapace cocked. Alert, questioning, waiting."
+    },
+    {
+      "name": "rocky_busy",
+      "size": 160,
+      "prompt": "Rocky leaning intently over a small handheld tool with a glowing weld, two front legs working, carapace focused downward. Industrious, absorbed."
+    },
+    {
+      "name": "decorator_dizzy_stars",
+      "size": 48,
+      "use_reference": false,
+      "prompt": "A small set of cartoon stars and tiny musical-note glyphs arranged in a circular orbit. Bright, simple, hard-edged."
+    },
+    {
+      "name": "decorator_confetti",
+      "size": 160,
+      "use_reference": false,
+      "prompt": "A spray of small colorful confetti pieces and sparkles scattered and falling. Festive, low-res, bold colors."
+    },
+    {
+      "name": "decorator_alert",
+      "size": 40,
+      "use_reference": false,
+      "prompt": "A single bold exclamation mark with two short radiating motion lines. High-contrast, attention-grabbing."
+    },
+    {
+      "name": "decorator_zzz",
+      "size": 48,
+      "use_reference": false,
+      "prompt": "Three white letter Z glyphs of increasing size rising diagonally (a 'ZZZ' sleep symbol), bold and clean. Simple, hard-edged."
+    }
+  ]
+}
