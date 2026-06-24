@@ -607,6 +607,17 @@ async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
 
 async def handle(ws: ServerConnection) -> None:
     log.info("esp32 connected: %s", ws.remote_address)
+    # Firmware turn-state recovery (brain-only; "Fix C"). If the brain was
+    # killed mid-turn, the firmware is stranded in LISTENING/SPEAKING — which
+    # pauses the wakeword and gates out head-tap (the firmware gates tap to
+    # IDLE), leaving the device unresponsive until a manual reboot even though
+    # it auto-reconnects. A new WS connection means no turn can be in progress,
+    # so force the firmware back to IDLE: stop_speaking transitions to IDLE from
+    # any mode (re-arming the wakeword, re-enabling tap) and leaves the screen
+    # untouched, so it's a no-op on a fresh boot and safe while asleep. The
+    # durable self-heal (firmware → IDLE on WS disconnect, "Fix A") is queued
+    # for the next reflash.
+    await ws.send(json.dumps({"cmd": "stop_speaking"}))
     state = ConnState()
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.
