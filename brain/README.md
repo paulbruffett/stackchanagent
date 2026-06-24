@@ -53,6 +53,19 @@ Listens on `0.0.0.0:8765`. Also attempts to advertise
 can be pointed at a literal IP via `idf.py menuconfig` → Stackchan
 Brain → Brain host).
 
+## Test
+
+```bash
+uv run --extra dev pytest        # or, in the venv: python -m pytest
+```
+
+`tests/` covers the conversation-state hardening (M6): atomic exchange
+persistence, tool-dispatch recovery, the message-thread contract
+(`validate_thread`) + read-time sanitizer, the startup integrity pass
+(`repair_memory`), and the follow-up false-trigger gate. The suite uses a
+scripted fake Anthropic client, so it runs offline with no API key or model
+download.
+
 ## Phase 1 verification
 
 1. Start `agent_server.py` on the Jetson.

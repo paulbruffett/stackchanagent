@@ -30,6 +30,7 @@ import time
 from websockets.asyncio.server import ServerConnection
 
 from config import get_config
+from tasks import spawn
 from vision import Face
 
 log = logging.getLogger("brain.behavior")
@@ -121,7 +122,7 @@ class IdleBehavior:
         if now - self.last_look_around_s >= get_config().get("LOOK_AROUND_INTERVAL_S"):
             self.last_look_around_s = now
             self.look_around_in_progress = True
-            asyncio.create_task(self._look_around(ws))
+            spawn(self._look_around(ws), "look_around")
 
     async def glance_at_user(self, ws: ServerConnection) -> None:
         """A quick attention glance toward the user: look up to eye level, then

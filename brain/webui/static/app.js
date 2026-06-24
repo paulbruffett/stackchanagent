@@ -205,6 +205,18 @@ async function loadMemories() {
   }
   root.append(ssec);
 
+  // --- conversation health (M6.5) ---
+  const hsec = el("div", { className: "group" }, el("h2", { textContent: "Conversation health" }));
+  const repair = el("button", { className: "ghost", textContent: "Repair conversation" });
+  repair.addEventListener("click", repairConversation);
+  const reset = el("button", { className: "ghost", textContent: "Reset conversation" });
+  reset.addEventListener("click", resetConversation);
+  hsec.append(el("div", { className: "toolbar" },
+    el("div", { className: "muted", textContent:
+      "Repair heals dangling tool-call corruption in the live turn tail (logs what it fixed). Reset deletes the unsummarized tail when a thread is wedged — summaries and permanent facts are kept." }),
+    el("span", { style: "flex:1" }), reset, repair));
+  root.append(hsec);
+
   // --- recent turns (read-only) ---
   const tsec = el("div", { className: "group" }, el("h2", { textContent: "Recent turns" }));
   for (const t of turns.turns) {
@@ -213,6 +225,25 @@ async function loadMemories() {
       el("div", { innerHTML: renderContent(t.content) })));
   }
   root.append(tsec);
+}
+
+async function repairConversation() {
+  setStatus("repairing…");
+  const r = await fetch("/api/memories/repair", { method: "POST" });
+  const j = await r.json();
+  const c = j.counts || {};
+  const fixed = (c.turns_rewritten || 0) + (c.turns_deleted || 0);
+  setStatus(fixed ? `repaired ${fixed} turn(s): ${JSON.stringify(c)}` : "conversation clean — nothing to repair", "ok");
+  loadMemories();
+}
+
+async function resetConversation() {
+  if (!confirm("Delete the entire unsummarized conversation tail? Summaries and permanent facts are kept. This cannot be undone.")) return;
+  setStatus("resetting…");
+  const r = await fetch("/api/memories/reset", { method: "POST" });
+  const j = await r.json();
+  setStatus(r.ok ? `conversation reset — deleted ${j.deleted} turn(s)` : "reset failed", r.ok ? "ok" : "err");
+  loadMemories();
 }
 
 async function summarizeNow() {
