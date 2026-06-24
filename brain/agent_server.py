@@ -41,7 +41,6 @@ from behavior import IdleBehavior
 from claude_agent import AgentSession, repair_memory
 from config import get_config, init_config
 from a2a_client import A2aClient
-from buddy import Buddy
 from mcp_client import McpClient
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up
@@ -133,10 +132,6 @@ mcp_client = McpClient(memory)
 # Shared A2A client (Phase 9c): connects to Agent2Agent servers (e.g.
 # Hermes) and surfaces their sub-agents as delegation tools in every turn.
 a2a_client = A2aClient(memory)
-# Claude Buddy (Option C, Milestone 0): bridges Claude Code tool-permission
-# prompts to the robot (tap=approve / wake word=deny). Attached to the active
-# connection in handle(); queried by the /buddy/permission web route.
-buddy = Buddy()
 
 
 @dataclass
@@ -266,16 +261,6 @@ async def run_speaker(
         state.est_playback_end_s = (
             play_start + total_audio_s if play_start is not None else 0.0
         )
-
-
-async def speak_phrase(ws: ServerConnection, state: ConnState, text: str) -> None:
-    """Speak a single canned phrase via the normal TTS speaker path. Used by
-    Claude Buddy to announce a pending approval; reuses run_speaker so the
-    speaking face + playback-end estimate behave like any other utterance."""
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
-    queue.put_nowait(text)
-    queue.put_nowait(None)
-    await run_speaker(ws, state, queue)
 
 
 async def _drive_agent_turn(
@@ -646,9 +631,6 @@ async def handle(ws: ServerConnection) -> None:
     if bool(memory.get_runtime_state("asleep", False)):
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
-    # Register this connection with Claude Buddy so /buddy/permission can drive
-    # the robot and so tap/wake word can resolve a pending approval.
-    buddy.attach(ws, state, lambda text: speak_phrase(ws, state, text))
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -731,14 +713,6 @@ async def handle(ws: ServerConnection) -> None:
                 log.info("event: %s", payload)
                 event = payload.get("event")
                 if event in ("wakeword", "tap"):
-                    # Claude Buddy: while an approval is pending, a head TAP
-                    # approves it — consume the tap instead of starting a voice
-                    # turn. There is no deny gesture; the wake word always falls
-                    # through to normal voice. (Firmware flipped itself to
-                    # LISTENING on the tap; buddy sends stop_listening on clear.)
-                    if event == "tap" and buddy.pending and buddy.approve():
-                        log.info("buddy: tap → approve")
-                        continue
                     # Wake word or head tap: wake (if asleep) and start a
                     # listening capture, overriding any follow-up window. The
                     # firmware has already switched itself to LISTENING and
@@ -753,7 +727,6 @@ async def handle(ws: ServerConnection) -> None:
     except Exception:
         log.exception("connection error")
     finally:
-        buddy.detach(ws)
         log.info("esp32 disconnected")
 
 
@@ -858,7 +831,7 @@ async def main() -> None:
     logging.getLogger("brain").addHandler(WebUILogHandler())
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg, mcp_client, a2a_client, buddy),
+            create_app(memory, cfg, mcp_client, a2a_client),
             host=HOST, port=WEB_PORT, loop="none", log_level="warning",
         )
     )

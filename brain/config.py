@@ -255,34 +255,6 @@ SPECS: dict[str, Spec] = {
         hidden=True,
     ),
 
-    # --- Claude Buddy (hot) — Option C Milestone 0 ----------------------
-    "BUDDY_MODE": Spec(
-        1, "int", False, "buddy",
-        "Enable Claude Buddy: surface Claude Code tool-permission prompts on "
-        "the robot — tap the head to approve. There is no deny gesture; an "
-        "un-tapped prompt stays open until you handle it in the Claude "
-        "session. 1=on, 0=off (the /buddy/permission endpoint then defers to "
-        "the normal Claude Code prompt).",
-    ),
-    "BUDDY_WAITING_EXPRESSION": Spec(
-        "surprised", "str", False, "buddy",
-        "Facial expression shown while awaiting an approval (maps via "
-        "set_expression; 'surprised' renders as the Doubt face).",
-    ),
-    "BUDDY_SPEAK_PROMPTS": Spec(
-        1, "int", False, "buddy",
-        "Speak the pending tool name aloud when an approval is needed "
-        "(e.g. 'Approve Bash?'), so it's usable without looking. 1=on, 0=off.",
-    ),
-    "BUDDY_PERMISSION_TIMEOUT_S": Spec(
-        120.0, "float", False, "buddy",
-        "How long a permission prompt stays open on the robot with no head "
-        "tap before it's discarded — the robot reverts to normal and the "
-        "request returns 'ask' so the Claude session handles it the usual "
-        "way. Prevents stale prompts from piling up when the originating "
-        "session never taps. 0 = wait indefinitely (the old behavior).",
-    ),
-
     # --- Rocky mode (hot) — Milestone 4 ---------------------------------
     # Device-wide character mode: the Rocky persona (broken-English speech)
     # plus, when a Hume voice is configured in .env, a cloud TTS voice.

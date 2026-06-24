@@ -8,7 +8,6 @@ No auth — the LAN is trusted.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -36,7 +35,6 @@ log = logging.getLogger("brain.webui")
 
 def create_app(
     memory: Memory, config: Config, mcp: Any = None, a2a: Any = None,
-    buddy: Any = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
@@ -367,61 +365,6 @@ def create_app(
             raise HTTPException(503, "A2A client not available")
         await a2a.reload()
         return {"servers": a2a.status()}
-
-    # --- Claude Buddy (Option C, Milestone 0) -------------------------
-    @app.post("/buddy/permission")
-    async def buddy_permission(request: Request) -> dict[str, Any]:
-        """Blocking permission gate for a Claude Code PreToolUse hook. Surfaces
-        the pending tool on the robot and waits — with no timeout — for a head
-        tap (→ allow). There is no deny gesture: if the prompt is instead
-        handled in the Claude session, that hook process goes away and the
-        client disconnects, so we cancel the wait (clearing the robot UI) and
-        return 'ask'. Returns {"decision": allow|ask}; never hangs the caller."""
-        try:
-            body = await request.json()
-        except Exception:
-            log.warning("buddy: /buddy/permission got non-JSON body from %s",
-                        request.client.host if request.client else "?")
-            body = {}
-        tool = (body.get("tool") or "a tool").strip()
-        hint = (body.get("hint") or "").strip()
-        session_id = (body.get("session_id") or "").strip()
-        client = request.client.host if request.client else "?"
-        log.info("buddy: /buddy/permission received from %s tool=%r hint=%r "
-                 "session=%s", client, tool, hint[:120],
-                 session_id[:12] or "?")
-        if buddy is None:
-            log.warning("buddy: Buddy not wired into the web app (buddy=None) "
-                        "→ returning 'ask' for %r", tool)
-            return {"decision": "ask"}
-        perm = asyncio.ensure_future(
-            buddy.request_permission(tool, hint, session_id)
-        )
-        try:
-            while True:
-                done, _ = await asyncio.wait({perm}, timeout=0.5)
-                if perm in done:
-                    decision = perm.result()
-                    log.info("buddy: /buddy/permission for %r → %s", tool, decision)
-                    return {"decision": decision}
-                if await request.is_disconnected():
-                    log.info("buddy: caller for %r disconnected before a tap "
-                             "(handled in the Claude session) → ask", tool)
-                    perm.cancel()
-                    try:
-                        await perm
-                    except asyncio.CancelledError:
-                        pass
-                    return {"decision": "ask"}
-        except asyncio.CancelledError:
-            perm.cancel()
-            raise
-
-    @app.get("/buddy/status")
-    async def buddy_status() -> dict[str, Any]:
-        if buddy is None:
-            return {"available": False}
-        return {"available": True, **buddy.status()}
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")
