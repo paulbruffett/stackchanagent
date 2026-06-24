@@ -86,6 +86,12 @@ hume_tts = HumeSynthesizer()
 # Debounce so a Rocky-mode-without-Hume run logs the degradation once, not
 # per sentence.
 _rocky_no_hume_warned = False
+# Rolling Hume reliability tally (since process start). Reported on every
+# fallback so the real flake rate is visible from the log without a separate
+# metric — decide whether the mid-reply voice-flip is frequent enough to
+# mitigate off data, not off a single 500.
+_hume_ok = 0
+_hume_fallback = 0
 
 
 def _synthesize(sentence: str, use_rocky: bool, speed: float) -> bytes:
@@ -94,13 +100,22 @@ def _synthesize(sentence: str, use_rocky: bool, speed: float) -> bytes:
     quota, malformed stream) falls back to Piper for that sentence so audio
     is never dropped. Without Rocky mode — or without a Hume key — this is
     plain Piper."""
-    global _rocky_no_hume_warned
+    global _rocky_no_hume_warned, _hume_ok, _hume_fallback
     if use_rocky:
         if hume_tts.available:
             try:
-                return hume_tts.synthesize(sentence, speed=speed)
+                pcm = hume_tts.synthesize(sentence, speed=speed)
+                _hume_ok += 1
+                return pcm
             except Exception:
-                log.warning("hume tts failed; falling back to piper", exc_info=True)
+                _hume_fallback += 1
+                total = _hume_ok + _hume_fallback
+                log.warning(
+                    "hume tts failed; falling back to piper "
+                    "(fallbacks %d/%d = %.1f%%)",
+                    _hume_fallback, total, 100.0 * _hume_fallback / total,
+                    exc_info=True,
+                )
         elif not _rocky_no_hume_warned:
             log.warning(
                 "ROCKY_MODE on but no Hume voice configured — persona active, "
