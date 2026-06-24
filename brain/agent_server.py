@@ -38,13 +38,14 @@ from zeroconf import ServiceInfo, Zeroconf
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from behavior import IdleBehavior
-from claude_agent import AgentSession
+from claude_agent import AgentSession, repair_memory
 from config import get_config, init_config
 from a2a_client import A2aClient
 from buddy import Buddy
 from mcp_client import McpClient
 from memory import Memory
-from stt import Transcriber
+from stt import Transcriber, should_drop_follow_up
+from tasks import spawn
 from tts import Synthesizer
 from tts_hume import HumeSynthesizer
 from vision import FaceDetector, FaceTracker
@@ -336,19 +337,19 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     # Wakeword turns are never gated here.
     if follow_up_turn:
         cfg = get_config()
-        weak_conf = (
-            transcript.no_speech_prob >= cfg.get("FOLLOWUP_MAX_NO_SPEECH_PROB")
-            or transcript.avg_logprob <= cfg.get("FOLLOWUP_MIN_AVG_LOGPROB")
+        drop, reason = should_drop_follow_up(
+            transcript,
+            voiced_ms,
+            max_no_speech_prob=cfg.get("FOLLOWUP_MAX_NO_SPEECH_PROB"),
+            min_avg_logprob=cfg.get("FOLLOWUP_MIN_AVG_LOGPROB"),
+            clip_peak_pct=cfg.get("FOLLOWUP_CLIP_PEAK_PCT"),
+            min_voiced_ms=cfg.get("FOLLOWUP_MIN_VOICED_MS"),
         )
-        bad_quality = (
-            transcript.peak_pct >= cfg.get("FOLLOWUP_CLIP_PEAK_PCT")
-            and voiced_ms < cfg.get("FOLLOWUP_MIN_VOICED_MS")
-        )
-        if weak_conf or bad_quality:
+        if drop:
             log.info(
                 "dropped follow-up (%s): %r (no_speech=%.2f avg_logprob=%.2f "
                 "peak=%.1f%% voiced=%d ms)",
-                "low confidence" if weak_conf else "noise blip",
+                reason,
                 transcript.text,
                 transcript.no_speech_prob,
                 transcript.avg_logprob,
@@ -601,7 +602,7 @@ async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
     await state.behavior.tick(ws, faces, in_conversation)
 
     if new_face:
-        asyncio.create_task(proactive_greet(ws, state))
+        spawn(proactive_greet(ws, state), "proactive_greet")
 
 
 async def handle(ws: ServerConnection) -> None:
@@ -694,7 +695,7 @@ async def handle(ws: ServerConnection) -> None:
                 )
                 if time.monotonic() - state.last_detect_s >= interval:
                     state.last_detect_s = time.monotonic()
-                    asyncio.create_task(process_latest_jpeg(ws, state))
+                    spawn(process_latest_jpeg(ws, state), "process_jpeg")
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)
@@ -802,6 +803,9 @@ async def main() -> None:
     # model is loaded until first use — so reconstructing here is cheap and
     # picks up any web-UI override saved on a previous run.
     cfg = init_config(memory)
+    # M6.5: heal any durable conversation-state corruption (dangling tool_use
+    # from a pre-M6.1 crash, etc.) before the first turn replays it.
+    repair_memory(memory)
     tts = Synthesizer(voice=cfg.get("PIPER_VOICE"))
     stt = Transcriber(
         model_name=cfg.get("STT_MODEL"),

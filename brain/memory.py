@@ -180,6 +180,29 @@ class Memory:
         self._conn.commit()
         return cur.lastrowid
 
+    def append_turns(self, messages: list[dict[str, Any]]) -> list[int]:
+        """Persist a batch of Claude messages in ONE transaction — either
+        all land or none do. Used to commit a completed exchange atomically
+        (M6.1) so a crash mid-turn can't leave a dangling tool_use in durable
+        history. Returns the new turn ids in append order."""
+        if not messages:
+            return []
+        now = time.time()
+        ids: list[int] = []
+        try:
+            for m in messages:
+                content_json = json.dumps(m["content"], default=_anthropic_default)
+                cur = self._conn.execute(
+                    "INSERT INTO turns(ts, role, content_json) VALUES (?, ?, ?)",
+                    (now, m["role"], content_json),
+                )
+                ids.append(cur.lastrowid)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return ids
+
     def list_unsummarized_turns(self) -> list[Turn]:
         rows = self._conn.execute(
             "SELECT id, role, content_json FROM turns "
@@ -189,6 +212,34 @@ class Memory:
             Turn(id=r["id"], role=r["role"], content=json.loads(r["content_json"]))
             for r in rows
         ]
+
+    def update_turn(self, turn_id: int, content: Any) -> bool:
+        """Replace a turn's content (used by the integrity pass to strip a
+        dangling tool_use / orphan tool_result block in place). Role is
+        unchanged. Returns True if a row was updated."""
+        content_json = json.dumps(content, default=_anthropic_default)
+        cur = self._conn.execute(
+            "UPDATE turns SET content_json = ? WHERE id = ?",
+            (content_json, turn_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_turn(self, turn_id: int) -> bool:
+        """Hard-delete a single turn row. Returns True if it existed. Added
+        for the M6.5 integrity pass — PR #16 couldn't clean the DB because no
+        turn-delete existed."""
+        cur = self._conn.execute("DELETE FROM turns WHERE id = ?", (turn_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_turns_from(self, turn_id: int) -> int:
+        """Hard-delete `turn_id` and every later turn (id >= turn_id). Returns
+        the number deleted. Used by the web-UI 'Reset conversation' control to
+        truncate the live tail."""
+        cur = self._conn.execute("DELETE FROM turns WHERE id >= ?", (turn_id,))
+        self._conn.commit()
+        return cur.rowcount
 
     def unsummarized_count(self) -> int:
         row = self._conn.execute(

@@ -26,12 +26,13 @@ import random
 import re
 from typing import Any, Awaitable, Callable
 
-from anthropic import AsyncAnthropic
+from anthropic import APIError, AsyncAnthropic, BadRequestError
 from websockets.asyncio.server import ServerConnection
 
 import tools
 from config import get_config
 from memory import Memory, Summary, Turn
+from tasks import spawn
 
 # Sentence-end punctuation followed by whitespace (or end of buffer). The
 # lookbehind requires an alphanumeric or closing quote/paren so we don't
@@ -158,6 +159,14 @@ Stay in character: warm, curious, a careful alien friend."""
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
 
+# M6.4: graceful degradation when the Anthropic API errors mid-turn. Spoken
+# once on give-up so the user isn't left hanging; the WS session survives.
+API_ERROR_FALLBACK = (
+    "Sorry, I had a little trouble just now. Could you say that again?"
+)
+# Short pause before the single retry on a transient (non-validation) error.
+API_RETRY_BACKOFF_S = 0.5
+
 # Extended-thinking budget for the turns that opt in (follow-ups and
 # stage-direction events, gated by the FOLLOW_UP_THINKING knob). Gives the
 # model a private channel to reason about whether an utterance is even
@@ -254,6 +263,11 @@ class AgentSession:
         # Serializes user turns and the background summarizer so
         # self.messages isn't rewritten mid-call.
         self._turn_lock = asyncio.Lock()
+        # Messages staged this exchange but not yet persisted. M6.1 defers
+        # the SQLite write until an exchange completes (stop_reason !=
+        # tool_use) and commits them in one transaction, so a crash mid-turn
+        # leaves nothing partial in durable history. Reset at each exchange.
+        self._pending: list[dict[str, Any]] = []
         # Hydrate in-memory thread from any unsummarized history.
         self.messages: list[dict[str, Any]] = [
             {"role": t.role, "content": t.content}
@@ -281,7 +295,7 @@ class AgentSession:
         before the full reply is generated. Returns the full assembled
         text for logging."""
         async with self._turn_lock:
-            self._append({"role": "user", "content": user_text})
+            self._begin_exchange({"role": "user", "content": user_text})
             # Initial wake-word turns stay snappy: no extended thinking.
             return await self._run_loop(speak, thinking=False)
 
@@ -293,7 +307,7 @@ class AgentSession:
         utterance. Wrapped in [brackets] so the system prompt's rule
         kicks in."""
         async with self._turn_lock:
-            self._append({"role": "user", "content": f"[{stage_direction}]"})
+            self._begin_exchange({"role": "user", "content": f"[{stage_direction}]"})
             return await self._run_loop(speak, thinking=self._thinking_enabled())
 
     async def respond_follow_up(self, user_text: str, speak: SpeakFn) -> str:
@@ -304,7 +318,7 @@ class AgentSession:
         the conversation when the utterance wasn't directed at the
         robot or was a brief closing."""
         async with self._turn_lock:
-            self._append(
+            self._begin_exchange(
                 {"role": "user", "content": f"[follow-up] {user_text}"}
             )
             return await self._run_loop(speak, thinking=self._thinking_enabled())
@@ -315,10 +329,29 @@ class AgentSession:
         Hot knob, read per turn so a web-console toggle applies immediately."""
         return bool(get_config().get("FOLLOW_UP_THINKING"))
 
-    def _append(self, message: dict[str, Any]) -> None:
-        """Append to the live thread AND persist to SQLite."""
+    def _stage(self, message: dict[str, Any]) -> None:
+        """Append to the live in-memory thread and queue the message for the
+        end-of-exchange commit. NOT persisted to SQLite yet — see
+        _commit_exchange. The live thread always advances immediately so the
+        tool-use loop can build its next request; only durability is deferred."""
         self.messages.append(message)
-        self.memory.append_turn(message["role"], message["content"])
+        self._pending.append(message)
+
+    def _begin_exchange(self, opening: dict[str, Any]) -> None:
+        """Start a fresh exchange with its opening user/event message. Drops
+        any half-staged messages a prior turn left unpersisted (a turn that
+        raised mid-loop): those were never committed to SQLite, and their
+        in-memory copies are repaired at read time by _sanitize_for_api."""
+        self._pending = []
+        self._stage(opening)
+
+    def _commit_exchange(self) -> None:
+        """Persist every message staged since _begin_exchange in ONE
+        transaction. Called only when the exchange completes, so SQLite never
+        sees a dangling tool_use (M6.1). Idempotent: clears the buffer."""
+        if self._pending:
+            self.memory.append_turns(self._pending)
+            self._pending = []
 
     def _build_system(self) -> list[dict[str, Any]]:
         # Per-turn persona, read here (not cached at construction) so an edit
@@ -380,6 +413,46 @@ class AgentSession:
         except Exception:
             log.exception("set_busy send failed")
 
+    def _truncate_to_current_exchange(self) -> None:
+        """Drop in-memory history before the current exchange's opening user
+        message (the most recent string-content user turn), keeping the live
+        turn so the session can continue. Used to recover from a persistent
+        message-validation 400 whose poison is in older history — without
+        truncation that turn would keep failing on every replay."""
+        for i in range(len(self.messages) - 1, -1, -1):
+            m = self.messages[i]
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                if i > 0:
+                    log.warning(
+                        "truncating %d stale turn(s) to recover from API error", i
+                    )
+                    self.messages = self.messages[i:]
+                return
+
+    async def _recover_api_error(self, e: APIError, *, can_retry: bool) -> bool:
+        """Handle an Anthropic API error raised mid-turn. Returns True if the
+        caller should retry the request once, False to give up (caller then
+        speaks a fallback). A message-validation 400 means the sanitized
+        thread still wasn't accepted, so we log the offending thread and
+        truncate history to the current exchange before retrying; transient
+        errors (network, 5xx, rate limit) just back off once. Either way the
+        WS session stays alive instead of bubbling a fatal error up."""
+        if isinstance(e, BadRequestError):
+            log.error("API rejected the message thread (400): %s", e)
+            log.error(
+                "offending (sanitized) thread: %s",
+                _sanitize_for_api(self.messages),
+            )
+            # The poison is in older history — drop it so a retry can succeed
+            # and the session isn't permanently wedged.
+            self._truncate_to_current_exchange()
+            return can_retry
+        log.warning("transient API error (%s): %s", type(e).__name__, e)
+        if not can_retry:
+            return False
+        await asyncio.sleep(API_RETRY_BACKOFF_S)
+        return True
+
     async def _run_loop(self, speak: SpeakFn, thinking: bool = False) -> str:
         assembled: list[str] = []
         # Whether the on-screen busy indicator is currently shown, and
@@ -389,10 +462,13 @@ class AgentSession:
         # "thinking" bubble stuck on screen.
         busy = False
         filler_spoken = False
+        # M6.4: at most one retry per turn across the whole tool-use loop.
+        api_retried = False
         try:
             while True:
                 buf = ""
                 bracket_depth = 0
+                spoken_at_start = len(assembled)
                 stream_kwargs: dict[str, Any] = {
                     "model": self.model,
                     "max_tokens": MAX_TOKENS,
@@ -410,36 +486,55 @@ class AgentSession:
                         "budget_tokens": THINKING_BUDGET,
                     }
                     stream_kwargs["max_tokens"] = MAX_TOKENS + THINKING_BUDGET
-                async with self.client.messages.stream(**stream_kwargs) as stream:
-                    async for delta in stream.text_stream:
-                        # Never speak [bracketed] text. Brackets are reserved
-                        # for system stage directions in the prompt; the model
-                        # sometimes leaks its own reasoning in brackets
-                        # ("[The user is just chatting...]") on follow-up turns.
-                        # Strip those spans from spoken output — if the whole
-                        # reply was bracketed, nothing is spoken and the turn
-                        # ends silently (no follow-up window opens).
-                        clean, bracket_depth = _strip_brackets(delta, bracket_depth)
-                        buf += clean
-                        # Flush every completed sentence as it lands. Pre-
-                        # tool commentary ("Let me check…") still gets
-                        # spoken on tool-use turns — that's appropriate.
-                        while True:
-                            m = _SENT_END.search(buf)
-                            if not m:
-                                break
-                            end = m.end()
-                            sentence = buf[:end].strip()
-                            buf = buf[end:].lstrip()
-                            if sentence:
-                                # The real reply is arriving — drop the
-                                # "thinking" bubble just before its audio.
-                                if busy:
-                                    await self._set_busy(False)
-                                    busy = False
-                                assembled.append(sentence)
-                                await speak(sentence)
-                    response = await stream.get_final_message()
+                try:
+                    async with self.client.messages.stream(**stream_kwargs) as stream:
+                        async for delta in stream.text_stream:
+                            # Never speak [bracketed] text. Brackets are reserved
+                            # for system stage directions in the prompt; the model
+                            # sometimes leaks its own reasoning in brackets
+                            # ("[The user is just chatting...]") on follow-up turns.
+                            # Strip those spans from spoken output — if the whole
+                            # reply was bracketed, nothing is spoken and the turn
+                            # ends silently (no follow-up window opens).
+                            clean, bracket_depth = _strip_brackets(delta, bracket_depth)
+                            buf += clean
+                            # Flush every completed sentence as it lands. Pre-
+                            # tool commentary ("Let me check…") still gets
+                            # spoken on tool-use turns — that's appropriate.
+                            while True:
+                                m = _SENT_END.search(buf)
+                                if not m:
+                                    break
+                                end = m.end()
+                                sentence = buf[:end].strip()
+                                buf = buf[end:].lstrip()
+                                if sentence:
+                                    # The real reply is arriving — drop the
+                                    # "thinking" bubble just before its audio.
+                                    if busy:
+                                        await self._set_busy(False)
+                                        busy = False
+                                    assembled.append(sentence)
+                                    await speak(sentence)
+                        response = await stream.get_final_message()
+                except APIError as e:
+                    if busy:
+                        await self._set_busy(False)
+                        busy = False
+                    # Don't retry if we already spoke part of this iteration —
+                    # a re-stream would double-speak. Otherwise allow one retry.
+                    spoke_partial = len(assembled) > spoken_at_start
+                    retry = await self._recover_api_error(
+                        e, can_retry=not api_retried and not spoke_partial
+                    )
+                    if retry:
+                        api_retried = True
+                        continue
+                    # Give up gracefully: speak a short fallback, persist
+                    # nothing partial, and let the WS session continue.
+                    self._pending = []
+                    await speak(API_ERROR_FALLBACK)
+                    return API_ERROR_FALLBACK
 
                 # Flush any trailing partial (model that ended without
                 # final punctuation, or short tool-use commentary).
@@ -456,12 +551,15 @@ class AgentSession:
                 # blocks, but the API rejects them on input when the message
                 # is replayed on the next turn.
                 content_clean = [_clean_block(b) for b in response.content]
-                self._append({"role": "assistant", "content": content_clean})
+                self._stage({"role": "assistant", "content": content_clean})
 
                 if response.stop_reason != "tool_use":
                     if busy:
                         await self._set_busy(False)
                         busy = False
+                    # Exchange complete — persist the whole thing atomically
+                    # (M6.1) before anything else can observe partial state.
+                    self._commit_exchange()
                     full = " ".join(assembled)
                     log.info(
                         "agent reply: %r (in=%d out=%d cache_r=%d cache_w=%d)",
@@ -471,7 +569,7 @@ class AgentSession:
                         response.usage.cache_read_input_tokens,
                         response.usage.cache_creation_input_tokens,
                     )
-                    asyncio.create_task(_maybe_summarize(self))
+                    spawn(_maybe_summarize(self), "summarize")
                     return full
 
                 # Tool-use turn: for a genuinely slow tool (weather, vision,
@@ -506,17 +604,40 @@ class AgentSession:
                             self.on_tool(block.name, block.input)
                         except Exception:
                             log.exception("on_tool observer failed")
-                    result = await tools.dispatch(
-                        block.name, block.input, self._tool_ctx
-                    )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        }
-                    )
-                self._append({"role": "user", "content": tool_results})
+                    # A tool that raises (describe_view, mcp__*, a2a__* can all
+                    # fail on network/quota) must NOT abort the turn: that would
+                    # leave this tool_use unanswered — a dangling block that
+                    # poisons replay (the same 400 class M6.1 guards on the
+                    # persistence side). Turn the exception into an is_error
+                    # tool_result so every tool_use is answered and the model
+                    # can recover gracefully ("I couldn't reach the weather
+                    # service") instead of the whole turn dying.
+                    try:
+                        result = await tools.dispatch(
+                            block.name, block.input, self._tool_ctx
+                        )
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result,
+                            }
+                        )
+                    except Exception as e:
+                        log.exception("tool %s dispatch failed", block.name)
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": (
+                                    f"The {block.name} tool failed "
+                                    f"({type(e).__name__}). Briefly tell the "
+                                    f"user you couldn't do that right now."
+                                ),
+                                "is_error": True,
+                            }
+                        )
+                self._stage({"role": "user", "content": tool_results})
         finally:
             if busy:
                 await self._set_busy(False)
@@ -531,30 +652,79 @@ def _content_blocks(content: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _tool_use_ids(msg: dict[str, Any]) -> set[Any]:
+    """ids of the tool_use blocks in a message (assistant turn)."""
+    return {
+        b.get("id")
+        for b in _content_blocks(msg.get("content"))
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    }
+
+
+def _result_ids(msg: dict[str, Any]) -> set[Any]:
+    """tool_use_ids answered by the tool_result blocks in a message."""
+    return {
+        b.get("tool_use_id")
+        for b in _content_blocks(msg.get("content"))
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    }
+
+
+def validate_thread(messages: list[dict[str, Any]]) -> list[str]:
+    """Check the Anthropic message-thread contract. Returns human-readable
+    problems ([] = valid). The single source of truth for "what makes a thread
+    API-valid", shared by `_sanitize_for_api` (repairs on a copy at read time)
+    and `repair_memory` (repairs durably in the DB). Flags: a non-user first
+    message, consecutive same-role messages, a `tool_use` with no answering
+    `tool_result` in the next message, and an orphan `tool_result` whose
+    `tool_use` isn't in the preceding message — each one a 400 on replay."""
+    problems: list[str] = []
+    if messages and messages[0].get("role") != "user":
+        problems.append("first message is not role=user")
+    prev_role: str | None = None
+    for i, msg in enumerate(messages):
+        role = msg.get("role")
+        if role == prev_role:
+            problems.append(f"[{i}] consecutive {role} messages")
+        prev_role = role
+        if role == "assistant":
+            answered = _result_ids(messages[i + 1]) if i + 1 < len(messages) else set()
+            for tid in _tool_use_ids(msg):
+                if tid not in answered:
+                    problems.append(f"[{i}] tool_use {tid} has no following tool_result")
+        prev_uses = _tool_use_ids(messages[i - 1]) if i > 0 else set()
+        for rid in _result_ids(msg):
+            if rid not in prev_uses:
+                problems.append(f"[{i}] orphan tool_result {rid}")
+    return problems
+
+
 def _sanitize_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return an API-valid copy of the message thread.
 
-    Drops any `tool_use` block that isn't answered by a `tool_result` in the
-    immediately-following message. A process killed (or a tool dispatch that
-    raised) between persisting an assistant tool_use turn and appending its
-    tool_result leaves such a dangling block in the persisted history; once
-    it's replayed every turn fails with a 400 ('tool_use ids were found
-    without tool_result blocks immediately after'). Messages emptied by the
-    drop are removed, and consecutive same-role messages are then merged so
-    roles still strictly alternate. Operates on a copy — persisted history is
-    left as-is and self-heals when those turns are later summarized away."""
-    def result_ids(msg: dict[str, Any]) -> set[Any]:
-        ids: set[Any] = set()
-        for b in _content_blocks(msg.get("content")):
-            if isinstance(b, dict) and b.get("type") == "tool_result":
-                ids.add(b.get("tool_use_id"))
-        return ids
+    Drops any `tool_use` block not answered by a `tool_result` in the next
+    message, and any orphan `tool_result` whose `tool_use` isn't in the
+    preceding message — both are a 400 on replay ('tool_use ids were found
+    without tool_result blocks immediately after' / unexpected tool_result). A
+    process killed (or a tool dispatch that raised) mid-exchange could leave
+    such a dangling block in persisted history. Messages emptied by the drop
+    are removed and consecutive same-role messages merged so roles still
+    alternate. Operates on a COPY — persisted history is left as-is; M6.1
+    atomic commits + the M6.5 startup integrity pass keep the DB itself clean,
+    so this should not fire in normal operation (it logs when it does)."""
+    problems = validate_thread(messages)
+    if problems:
+        log.warning(
+            "sanitizing %d thread problem(s) at read time: %s",
+            len(problems), "; ".join(problems[:6]),
+        )
 
+    # Pass 1: drop unanswered tool_use blocks from assistant turns.
     cleaned: list[dict[str, Any]] = []
     for i, msg in enumerate(messages):
         content = msg.get("content")
         if msg.get("role") == "assistant" and isinstance(content, list):
-            answered = result_ids(messages[i + 1]) if i + 1 < len(messages) else set()
+            answered = _result_ids(messages[i + 1]) if i + 1 < len(messages) else set()
             kept = [
                 b for b in content
                 if not (
@@ -568,8 +738,29 @@ def _sanitize_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             msg = {**msg, "content": kept}
         cleaned.append(msg)
 
+    # Pass 2: drop orphan tool_result blocks (no matching tool_use in the
+    # preceding surviving message — e.g. its assistant turn was dropped above).
+    deorphaned: list[dict[str, Any]] = []
+    for i, msg in enumerate(cleaned):
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, list):
+            prev_uses = _tool_use_ids(cleaned[i - 1]) if i > 0 else set()
+            kept = [
+                b for b in content
+                if not (
+                    isinstance(b, dict)
+                    and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") not in prev_uses
+                )
+            ]
+            if not kept:
+                continue
+            msg = {**msg, "content": kept}
+        deorphaned.append(msg)
+
+    # Pass 3: merge consecutive same-role messages so roles strictly alternate.
     merged: list[dict[str, Any]] = []
-    for msg in cleaned:
+    for msg in deorphaned:
         if merged and merged[-1].get("role") == msg.get("role"):
             prev_blocks = _content_blocks(merged[-1].get("content"))
             prev_blocks.extend(_content_blocks(msg.get("content")))
@@ -577,6 +768,95 @@ def _sanitize_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             merged.append(msg)
     return merged
+
+
+def _check_summary_spans(memory: Memory) -> int:
+    """Report (don't auto-delete) inconsistent summary spans: inverted
+    (span_from > span_to) or overlapping a previous span. Counted + logged for
+    observability; summaries are never destructively repaired here (a wrong
+    delete would lose real history)."""
+    issues = 0
+    highest_to = 0
+    for s in memory.list_summaries():
+        if s.span_from > s.span_to:
+            issues += 1
+            log.warning("summary %d has inverted span %d..%d",
+                        s.id, s.span_from, s.span_to)
+        if s.span_from <= highest_to:
+            issues += 1
+            log.warning("summary %d span %d..%d overlaps an earlier span (<=%d)",
+                        s.id, s.span_from, s.span_to, highest_to)
+        highest_to = max(highest_to, s.span_to)
+    return issues
+
+
+def _repair_one_pass(
+    memory: Memory, turns: list[Turn], counts: dict[str, int]
+) -> bool:
+    """One sweep of the unsummarized tail: strip dangling tool_use / orphan
+    tool_result blocks from each turn, rewriting the row (or deleting it when
+    emptied). Decisions use the pre-sweep snapshot; the caller re-loads and
+    repeats so a delete that orphans a neighbour is caught next pass. Returns
+    whether anything changed."""
+    changed = False
+    for i, t in enumerate(turns):
+        content = t.content
+        if not isinstance(content, list):
+            continue
+        answered = _result_ids({"content": turns[i + 1].content}) if i + 1 < len(turns) else set()
+        prev_uses = _tool_use_ids({"content": turns[i - 1].content}) if i > 0 else set()
+        kept: list[Any] = []
+        n_dangle = n_orphan = 0
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in answered:
+                n_dangle += 1
+                continue
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") not in prev_uses:
+                n_orphan += 1
+                continue
+            kept.append(b)
+        if not n_dangle and not n_orphan:
+            continue
+        counts["dangling_tool_use"] += n_dangle
+        counts["orphan_tool_result"] += n_orphan
+        if kept:
+            memory.update_turn(t.id, kept)
+            counts["turns_rewritten"] += 1
+        else:
+            memory.delete_turn(t.id)
+            counts["turns_deleted"] += 1
+        changed = True
+    return changed
+
+
+def repair_memory(memory: Memory, max_passes: int = 5) -> dict[str, int]:
+    """Startup integrity pass (M6.5). Scans the unsummarized turn tail for
+    contract violations and repairs them IN THE DB — strip a dangling tool_use
+    / orphan tool_result block, or delete the turn if that empties it — looping
+    to a fixpoint so cascades resolve. Also reports broken summary spans. Logs
+    the counts so durable corruption becomes a visible, fixed event instead of
+    a forever-silent read-time patch. Idempotent: a clean DB writes nothing and
+    returns all-zero counts."""
+    counts = {
+        "dangling_tool_use": 0,
+        "orphan_tool_result": 0,
+        "turns_rewritten": 0,
+        "turns_deleted": 0,
+        "summary_span_issues": 0,
+    }
+    for _ in range(max_passes):
+        turns = memory.list_unsummarized_turns()
+        thread = [{"role": t.role, "content": t.content} for t in turns]
+        if not validate_thread(thread):
+            break
+        if not _repair_one_pass(memory, turns, counts):
+            break
+    counts["summary_span_issues"] = _check_summary_spans(memory)
+    if any(counts.values()):
+        log.warning("memory integrity pass repaired: %s", counts)
+    else:
+        log.info("memory integrity pass: clean")
+    return counts
 
 
 _STREAM_ONLY_FIELDS = ("parsed_output",)

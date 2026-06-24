@@ -22,6 +22,7 @@ from anthropic import AsyncAnthropic
 from claude_agent import (
     DEFAULT_SYSTEM_PROMPT,
     consolidate_facts,
+    repair_memory,
     summarize_backlog,
 )
 from config import Config
@@ -226,6 +227,25 @@ def create_app(
                 for t in memory.recent_turns(limit)
             ]
         }
+
+    @app.post("/api/memories/repair")
+    async def repair_conversation() -> dict[str, Any]:
+        """Run the M6.5 integrity pass on demand: heal dangling tool_use /
+        orphan tool_result corruption in the unsummarized tail and report the
+        counts. Safe to run anytime; a clean DB changes nothing."""
+        counts = repair_memory(memory)
+        return {"ok": True, "counts": counts}
+
+    @app.post("/api/memories/reset")
+    async def reset_conversation() -> dict[str, Any]:
+        """Hard-reset the live conversation tail: delete every unsummarized
+        turn so the next turn starts from summaries + facts only. Summaries and
+        durable facts are kept. The escape hatch when a thread is wedged and a
+        repair isn't enough."""
+        turns = memory.list_unsummarized_turns()
+        deleted = memory.delete_turns_from(turns[0].id) if turns else 0
+        log.warning("conversation reset: deleted %d unsummarized turn(s)", deleted)
+        return {"ok": True, "deleted": deleted}
 
     # --- MCP servers (Phase 9b) ---------------------------------------
     @app.get("/api/mcp/servers")

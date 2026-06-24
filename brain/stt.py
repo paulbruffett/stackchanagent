@@ -39,6 +39,30 @@ class Transcript:
     rms_pct: float = 0.0
 
 
+def should_drop_follow_up(
+    t: Transcript,
+    voiced_ms: float,
+    *,
+    max_no_speech_prob: float,
+    min_avg_logprob: float,
+    clip_peak_pct: float,
+    min_voiced_ms: float,
+) -> tuple[bool, str]:
+    """Follow-up false-trigger gate (M6.7), as a pure predicate so it can be
+    unit-tested in isolation. A follow-up turn takes no wakeword, so a noise
+    blip hallucinated into text would otherwise start a turn (and open yet
+    another window — a self-perpetuating loop). Returns (drop, reason): drop
+    when Whisper is unconfident (weak no_speech_prob/avg_logprob) OR the
+    capture is a clipping blip too short to be real speech (the AND keeps a
+    genuinely loud-but-real or clean-but-short word). reason is "" when kept.
+    Callers gate follow-up turns only; wakeword turns are never dropped."""
+    if t.no_speech_prob >= max_no_speech_prob or t.avg_logprob <= min_avg_logprob:
+        return True, "low confidence"
+    if t.peak_pct >= clip_peak_pct and voiced_ms < min_voiced_ms:
+        return True, "noise blip"
+    return False, ""
+
+
 class Transcriber:
     """Lazy-loads the model on first transcribe; subsequent calls reuse it."""
 

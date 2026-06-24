@@ -35,8 +35,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
     "ruff>=0.4",
 ]
+
+[tool.pytest.ini_options]
+# Tests live in brain/tests/. asyncio_mode=auto runs `async def test_*`
+# without a per-test marker.
+testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.setuptools]
 # Brain is a flat collection of scripts run directly with .venv/bin/python;
