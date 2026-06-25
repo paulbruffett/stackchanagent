@@ -13,6 +13,8 @@
 #include <mooncake_log.h>
 #include <web_socket.h>
 
+#include "state.h"
+
 namespace agent::transport {
 
 namespace {
@@ -135,6 +137,15 @@ void connection_task(void*)
 
         mclog::tagInfo(TAG, "disconnected; will reconnect");
         s.connected = false;
+        // M6.8 Fix A: a brain kill mid-turn strands the firmware in SPEAKING
+        // (wakeword paused, tap gated to Idle); the WS reconnect alone never
+        // resets it, so the device is dead to wakeword/tap until reboot.
+        // Self-heal to Idle locally — this resumes the wakeword and ungates
+        // the tap handler. We intentionally do NOT relight the screen here:
+        // wake_face() would wrongly wake a legitimately-sleeping device on a
+        // transient brain drop (a stranded turn is always in SPEAKING, screen
+        // already on, so Idle is all that's needed).
+        state::transition(state::Mode::Idle);
         {
             std::lock_guard<std::mutex> lock(s.mu);
             s.ws.reset();

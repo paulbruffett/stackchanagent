@@ -42,6 +42,7 @@ from claude_agent import AgentSession, repair_memory
 from config import get_config, init_config
 from a2a_client import A2aClient
 from mcp_client import McpClient
+from policy import effective_sleep_timeout, skin_for_rocky_mode
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up
 from tasks import spawn
@@ -175,6 +176,14 @@ class ConnState:
     # Set while a vision/detection task is in flight, so we drop overlapping
     # frames rather than queuing detections behind a slow mediapipe call.
     detecting: bool = False
+    # The avatar skin last pushed to the firmware ("rocky"/"default"). Tracks
+    # ROCKY_MODE; synced on connect and whenever it changes (see
+    # _maybe_sync_skin). None until the first sync on connect.
+    last_skin: str | None = None
+    # True while a BLE buddy approve prompt is pending on the device (firmware
+    # emits {"event":"buddy_prompt","pending":...}). Elongates the sleep
+    # timeout so the device doesn't sleep out from under an unanswered prompt.
+    buddy_prompt_pending: bool = False
 
 
 def frame_rms(frame: bytes) -> float:
@@ -472,7 +481,33 @@ def _should_sleep(state: ConnState) -> bool:
     timeout = get_config().get("SLEEP_TIMEOUT_S")
     if not timeout or timeout <= 0:
         return False
+    # Hold off sleeping while a BLE buddy approve prompt is waiting on the
+    # device — the brain's idle timer is otherwise blind to it.
+    timeout = effective_sleep_timeout(
+        timeout,
+        get_config().get("BUDDY_PROMPT_SLEEP_TIMEOUT_S"),
+        state.buddy_prompt_pending,
+    )
     return time.monotonic() - state.last_activity_s >= timeout
+
+
+async def _maybe_sync_skin(ws: ServerConnection, state: ConnState) -> None:
+    """Push the avatar skin to the firmware if ROCKY_MODE has changed since the
+    last sync. ROCKY_MODE is the single source of truth (voice + face); this
+    catches both the voice tool (set_persona_mode) and a web-console toggle
+    with no callback machinery. Cheap to call on every camera frame."""
+    want = skin_for_rocky_mode(get_config().get("ROCKY_MODE"))
+    if want == state.last_skin:
+        return
+    try:
+        await ws.send(json.dumps({"cmd": "set_skin", "value": want}))
+    except Exception:
+        # Leave last_skin unchanged so the next frame retries rather than
+        # latching a skin we never actually pushed.
+        log.exception("set_skin send failed")
+        return
+    state.last_skin = want
+    log.info("skin → %s", want)
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -631,6 +666,9 @@ async def handle(ws: ServerConnection) -> None:
     if bool(memory.get_runtime_state("asleep", False)):
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
+    # Sync the avatar skin to the current ROCKY_MODE on connect (boot brings up
+    # the default skin; this flips it to Rocky if ROCKY_MODE is on).
+    await _maybe_sync_skin(ws, state)
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -685,6 +723,9 @@ async def handle(ws: ServerConnection) -> None:
                 # Always keep the latest frame around for describe_view,
                 # but only RUN detection at the configured cadence.
                 state.latest_jpeg = jpeg
+                # Frames are the steady heartbeat (~every 1.5 s, even while
+                # asleep), so use them to push a ROCKY_MODE skin change.
+                await _maybe_sync_skin(ws, state)
                 # While asleep: no look-around, no face detection — the wake
                 # word / tap is the only way out. Frames keep arriving (cheap)
                 # so describe_view still has a recent one after waking.
@@ -718,6 +759,12 @@ async def handle(ws: ServerConnection) -> None:
                     # firmware has already switched itself to LISTENING and
                     # relit the screen on the same trigger.
                     _on_wake_trigger(state)
+                elif event == "buddy_prompt":
+                    # The firmware's BLE buddy reports whether a permission
+                    # prompt is waiting on the device, so _should_sleep can
+                    # elongate the idle timeout while it's pending.
+                    state.buddy_prompt_pending = bool(payload.get("pending"))
+                    log.info("buddy prompt pending: %s", state.buddy_prompt_pending)
             elif isinstance(msg, bytes):
                 log.warning(
                     "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)

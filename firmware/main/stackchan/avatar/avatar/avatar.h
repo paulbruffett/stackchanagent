@@ -16,6 +16,12 @@ namespace stackchan::avatar {
  */
 class Avatar {
 public:
+    // Avatars are owned via unique_ptr<Avatar> and swapped at runtime
+    // (StackChan::attachAvatar / the set_skin command), so the base needs a
+    // virtual destructor — otherwise deleting a derived skin through the base
+    // pointer is UB and leaks the subclass's LVGL objects.
+    virtual ~Avatar() = default;
+
     /**
      * @brief Update avatar, trigger all elements, decorators and modifiers to update
      *
@@ -59,6 +65,24 @@ public:
     Emotion getEmotion() const
     {
         return _emotion;
+    }
+
+    /**
+     * @brief Transient "working" indicator. Default skin ignores it (the busy
+     *        state shows only as the "..." speech bubble); skins that have a
+     *        dedicated busy rendering (e.g. Rocky's busy body sprite) override.
+     */
+    virtual void setBusy(bool /*on*/)
+    {
+    }
+
+    /**
+     * @brief Celebratory flourish. Default skin maps it to a Happy expression;
+     *        skins may override to add overlays (e.g. Rocky's confetti).
+     */
+    virtual void celebrate()
+    {
+        setEmotion(Emotion::Happy);
     }
 
     Feature& leftEye()

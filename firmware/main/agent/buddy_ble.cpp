@@ -19,6 +19,7 @@
 #include "buddy_ble_nus.h"
 #include "commands.h"
 #include "state.h"
+#include "transport.h"
 
 namespace agent::buddy_ble {
 
@@ -54,6 +55,13 @@ Desired g_rendered = Desired::None;
 bool g_owns_screen = false;   // buddy currently drawing a face/bubble
 bool g_woke_screen = false;   // buddy turned the screen on for a prompt
 bool g_passkey_drawn = false;
+bool g_prompt_announced = false;  // last buddy_prompt pending state sent to brain
+bool g_last_face_off = false;     // backlight state observed on the previous tick
+bool g_ws_was_connected = false;  // brain-WS state observed on the previous tick
+// Set from the WS/dispatch task when the avatar is swapped (set_skin); consumed
+// by tick() to force a redraw. Atomic because it crosses tasks; g_rendered et al
+// stay tick-only.
+std::atomic<bool> g_force_redraw{false};
 
 // ---- LVGL helpers (each takes the lock; never call while already holding) --
 void draw_bubble(const char* text)
@@ -248,6 +256,14 @@ bool prompt_pending()
     return g_has_prompt.load();
 }
 
+void notify_avatar_swapped()
+{
+    // Called from the set_skin handler (WS task) after attachAvatar. The new
+    // avatar starts blank, so invalidate our render state to redraw any
+    // pending prompt/bubble next tick.
+    g_force_redraw.store(true);
+}
+
 void approve_pending()
 {
     std::string id;
@@ -269,6 +285,34 @@ void approve_pending()
 void tick()
 {
     uint32_t now = GetHAL().millis();
+
+    // If the screen was woken by something other than us (a head tap, the
+    // wakeword, or a brain wake/activity command), wake_face() reset the face
+    // to Neutral — clobbering any approve prompt we had drawn. Force a redraw
+    // so a "see it, then approve" prompt comes back. (g_woke_screen guards the
+    // case where buddy itself just woke the screen for the prompt.)
+    bool face_off_now = commands::face_is_off();
+    if (g_last_face_off && !face_off_now && !g_woke_screen) {
+        g_rendered = Desired::None;
+    }
+    g_last_face_off = face_off_now;
+
+    // A skin swap (set_skin) rebuilt the avatar, wiping any prompt/PIN bubble
+    // we had drawn. Force a redraw so it comes back on the next tick.
+    if (g_force_redraw.exchange(false)) {
+        g_rendered = Desired::None;
+        g_owns_screen = false;
+    }
+
+    // On a brain-WS (re)connect, re-announce the buddy_prompt pending state:
+    // our edge-trigger global survives a brain restart but the brain's view
+    // resets to "not pending", so without this the device could sleep under
+    // an unanswered prompt after a reconnect.
+    bool ws_now = transport::is_connected();
+    if (ws_now && !g_ws_was_connected) {
+        g_prompt_announced = false;
+    }
+    g_ws_was_connected = ws_now;
 
     // Pairing passkey display wins until the link is encrypted.
     if (g_showing_passkey.load()) {
@@ -305,6 +349,17 @@ void tick()
         } else if (g_running.load() > 0) {
             desired = Desired::Working;
         }
+    }
+
+    // Tell the brain whether a permission prompt is pending. The brain's sleep
+    // timer is otherwise blind to BLE buddy state and would sleep the device
+    // out from under an unanswered approve prompt; while pending it uses an
+    // elongated timeout instead. Edge-triggered to avoid spamming the WS.
+    bool pending = (desired == Desired::Waiting);
+    if (pending != g_prompt_announced) {
+        transport::send_event_json(pending ? "{\"event\":\"buddy_prompt\",\"pending\":true}"
+                                           : "{\"event\":\"buddy_prompt\",\"pending\":false}");
+        g_prompt_announced = pending;
     }
 
     if (desired == g_rendered) return;

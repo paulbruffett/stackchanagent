@@ -61,8 +61,9 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "description": (
             "Change the robot's facial expression. Use sparingly to react to the "
             "conversation: 'happy' on good news, 'sad' on bad news, 'surprised' "
-            "on unexpected information, 'sleepy' when asked to wind down. Defaults "
-            "to 'neutral'."
+            "on unexpected information, 'sleepy' when asked to wind down, "
+            "'celebrate' for a genuine win or milestone (a brief flourish). "
+            "Defaults to 'neutral'."
         ),
         "input_schema": {
             "type": "object",
@@ -76,6 +77,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                         "sleepy",
                         "angry",
                         "surprised",
+                        "celebrate",
                     ],
                 }
             },

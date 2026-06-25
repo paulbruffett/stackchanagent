@@ -1,6 +1,7 @@
 #include "commands.h"
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -8,8 +9,11 @@
 #include <hal/hal.h>
 #include <mooncake_log.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
+#include <stackchan/avatar/skins/default/default.h>
+#include <stackchan/avatar/skins/rocky/rocky.h>
 #include <stackchan/stackchan.h>
 
+#include "buddy_ble.h"
 #include "state.h"
 
 namespace agent::commands {
@@ -40,9 +44,14 @@ Emotion parse_emotion(std::string_view name)
 void apply_set_expression(JsonDocument& doc)
 {
     const char* value = doc["value"] | "neutral";
-    Emotion e = parse_emotion(value);
     LvglLockGuard lock;
-    GetStackChan().avatar().setEmotion(e);
+    if (std::string_view{value} == "celebrate") {
+        // No "celebrate" Emotion; skins decide how to render it (Rocky adds
+        // confetti, the default maps it to Happy).
+        GetStackChan().avatar().celebrate();
+    } else {
+        GetStackChan().avatar().setEmotion(parse_emotion(value));
+    }
     mclog::tagInfo(TAG, "expression: {}", value);
 }
 
@@ -83,12 +92,49 @@ void apply_set_busy(JsonDocument& doc)
 {
     bool on = doc["on"] | false;
     LvglLockGuard lock;
+    GetStackChan().avatar().setBusy(on);
     if (on) {
         GetStackChan().avatar().setSpeech("...");
     } else {
         GetStackChan().avatar().clearSpeech();
     }
     mclog::tagInfo(TAG, "busy: {}", on);
+}
+
+// Active skin. Boot brings up DefaultAvatar (hal/board/stackchan_display.cc
+// SetupUI), so this starts at Default; the brain syncs it via set_skin on
+// connect and whenever ROCKY_MODE changes.
+enum class Skin { Default, Rocky };
+Skin g_current_skin = Skin::Default;
+
+// Runtime skin swap. Both skins ship in the build; ROCKY_MODE (a brain knob)
+// is the single source of truth and the brain emits set_skin. The framework
+// swap is pointer-safe: the Breath/Blink/HeadPet modifiers re-fetch
+// avatar().leftEye()/mouth()/getEmotion() fresh every tick, so they need no
+// teardown — they simply poke the new avatar next tick.
+void apply_set_skin(JsonDocument& doc)
+{
+    const char* value = doc["value"] | "default";
+    Skin want         = (std::string_view{value} == "rocky") ? Skin::Rocky : Skin::Default;
+    if (want == g_current_skin) {
+        return;
+    }
+    LvglLockGuard lock;
+    auto& stackchan = GetStackChan();
+    if (want == Skin::Rocky) {
+        auto a = std::make_unique<stackchan::avatar::RockyAvatar>();
+        a->init(lv_screen_active());
+        stackchan.attachAvatar(std::move(a));
+    } else {
+        auto a = std::make_unique<stackchan::avatar::DefaultAvatar>();
+        a->init(lv_screen_active());
+        stackchan.attachAvatar(std::move(a));
+    }
+    g_current_skin = want;
+    // The new avatar starts blank — let the BLE buddy redraw any pending
+    // prompt/PIN bubble that the rebuild wiped.
+    buddy_ble::notify_avatar_swapped();
+    mclog::tagInfo(TAG, "skin: {}", value);
 }
 
 }  // namespace
@@ -161,6 +207,8 @@ void dispatch(std::string_view json)
     } else if (c == "set_busy") {
         wake_face();
         apply_set_busy(doc);
+    } else if (c == "set_skin") {
+        apply_set_skin(doc);
     } else if (c == "sleep") {
         sleep_face();
     } else if (c == "wake") {

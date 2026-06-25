@@ -28,4 +28,8 @@ bool prompt_pending();
 // Approve the pending prompt (decision "once"). Called from the tap handler.
 void approve_pending();
 
+// Invalidate the buddy render state after the avatar skin is swapped, so any
+// pending prompt/PIN bubble (wiped by the rebuild) is redrawn on the next tick.
+void notify_avatar_swapped();
+
 }  // namespace agent::buddy_ble

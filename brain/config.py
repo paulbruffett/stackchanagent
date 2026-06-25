@@ -136,6 +136,13 @@ SPECS: dict[str, Spec] = {
         "look-around + face detection until a wake word or tap. 0 = never "
         "sleep.",
     ),
+    "BUDDY_PROMPT_SLEEP_TIMEOUT_S": Spec(
+        1800.0, "float", False, "behavior",
+        "While a BLE buddy approve prompt is waiting on the device, use this "
+        "longer idle timeout instead of SLEEP_TIMEOUT_S so the screen doesn't "
+        "sleep out from under an unanswered prompt. Never shortens "
+        "SLEEP_TIMEOUT_S.",
+    ),
     "GREETING_COOLDOWN_S": Spec(
         1800.0, "float", False, "behavior",
         "Minimum time between proactive greetings.",
