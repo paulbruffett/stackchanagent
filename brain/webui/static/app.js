@@ -10,6 +10,47 @@ const el = (tag, props = {}, ...kids) => {
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 const fmtTs = (t) => new Date(t * 1000).toLocaleTimeString();
 
+// ---- console token ----
+// The API is a shared secret away (webui/app.py): CONSOLE_TOKEN from .env, or
+// one minted per run and logged with a #token= URL. Take it from the URL once,
+// then keep it in localStorage so the bookmark stays plain http://host:8080/.
+function initToken() {
+  const m = (location.hash + "&" + location.search).match(/token=([^&]+)/);
+  if (m) {
+    localStorage.setItem("stackchan_token", decodeURIComponent(m[1]));
+    history.replaceState(null, "", location.pathname);
+  }
+  return localStorage.getItem("stackchan_token") || "";
+}
+const TOKEN = initToken();
+
+let asking = false;
+function askForToken() {
+  if (asking) return;
+  asking = true;
+  const t = prompt("Console token (CONSOLE_TOKEN in .env, or the one the brain logged at startup):", "");
+  if (t && t.trim()) {
+    localStorage.setItem("stackchan_token", t.trim());
+    location.reload();
+  } else {
+    setStatus("console token required", "err");
+    asking = false;
+  }
+}
+
+// Every request this page makes goes to our own API, so shadow the global
+// rather than adding the header at ~25 call sites (one of which would end up
+// forgotten). A 401 means the brain restarted with a freshly minted token —
+// ask once instead of leaving a silently empty page.
+const fetch = async (path, opts = {}) => {
+  const res = await window.fetch(path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), "x-stackchan-token": TOKEN },
+  });
+  if (res.status === 401) askForToken();
+  return res;
+};
+
 // ---- tabs ----
 $$("nav button").forEach((b) =>
   b.addEventListener("click", () => {
@@ -227,13 +268,18 @@ async function loadMemories() {
   root.append(tsec);
 }
 
+// Rewriting turns in SQLite is only half the job — the connected device holds
+// its own copy of the thread. Say whether that copy was re-synced, so "reset"
+// stops looking like it worked when nothing reached the live conversation.
+const liveNote = (j) => (j.live_synced ? " · live thread re-synced" : "");
+
 async function repairConversation() {
   setStatus("repairing…");
   const r = await fetch("/api/memories/repair", { method: "POST" });
   const j = await r.json();
   const c = j.counts || {};
   const fixed = (c.turns_rewritten || 0) + (c.turns_deleted || 0);
-  setStatus(fixed ? `repaired ${fixed} turn(s): ${JSON.stringify(c)}` : "conversation clean — nothing to repair", "ok");
+  setStatus(fixed ? `repaired ${fixed} turn(s): ${JSON.stringify(c)}${liveNote(j)}` : "conversation clean — nothing to repair", "ok");
   loadMemories();
 }
 
@@ -242,7 +288,7 @@ async function resetConversation() {
   setStatus("resetting…");
   const r = await fetch("/api/memories/reset", { method: "POST" });
   const j = await r.json();
-  setStatus(r.ok ? `conversation reset — deleted ${j.deleted} turn(s)` : "reset failed", r.ok ? "ok" : "err");
+  setStatus(r.ok ? `conversation reset — deleted ${j.deleted} turn(s)${liveNote(j)}` : "reset failed", r.ok ? "ok" : "err");
   loadMemories();
 }
 
@@ -250,7 +296,7 @@ async function summarizeNow() {
   setStatus("summarizing…");
   const r = await fetch("/api/memories/summarize", { method: "POST" });
   const j = await r.json();
-  if (j.ok) { setStatus(`summary created (turns ${j.summary.span_from}–${j.summary.span_to})`, "ok"); loadMemories(); }
+  if (j.ok) { setStatus(`summary created (turns ${j.summary.span_from}–${j.summary.span_to})${liveNote(j)}`, "ok"); loadMemories(); }
   else setStatus(`nothing summarized: ${j.reason}`, "err");
 }
 
@@ -499,13 +545,24 @@ function appendTurn(t) {
 // ---- websockets ----
 function connectFeed(path, onItem) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}${path}`);
+  // A browser can't set headers on a WebSocket handshake, so the token rides
+  // in the query string (the server accepts either).
+  const ws = new WebSocket(`${proto}://${location.host}${path}?token=${encodeURIComponent(TOKEN)}`);
+  let opened = false;
+  ws.onopen = () => { opened = true; };
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "scrollback") m.items.forEach(onItem);
     else if (m.type === "item") onItem(m.item);
   };
-  ws.onclose = () => setTimeout(() => connectFeed(path, onItem), 2000);
+  ws.onclose = () => {
+    // A handshake the server refused (missing/stale token) reaches the browser
+    // as a plain 1006, indistinguishable from "brain is restarting" — so no
+    // prompt here, the first API 401 already asks. Just back off harder when
+    // we never got connected, so a refused feed can't retry twice a second
+    // forever.
+    setTimeout(() => connectFeed(path, onItem), opened ? 2000 : 10000);
+  };
 }
 
 loadConfig();

@@ -64,5 +64,42 @@ and starts the brain on whatever is already on disk.
 
 ## Ports
 
-- `8765` — firmware WebSocket
-- `8080` — web console
+- `8765` — firmware WebSocket (all interfaces)
+- `8080` — web console (LAN address only, see below)
+
+## Web console access
+
+The console's MCP tab persists a command line that the brain then *runs* as
+this user, so it is not open: every API route needs a shared secret, and the
+console binds the LAN address rather than `0.0.0.0`.
+
+Put a token in the repo-root `.env` (untracked, so `git reset --hard` on each
+start leaves it alone):
+
+```
+CONSOLE_TOKEN=some-long-random-string      # e.g. `openssl rand -base64 24`
+```
+
+Without one the brain mints a token per run and logs the URL to open:
+
+```
+journalctl --user-unit=stackchan-brain -b | grep 'web console'
+# web console on http://192.168.4.21:8080/#token=…
+```
+
+Open that URL once — the page stores the token and rewrites the address bar,
+so the bookmark stays `http://192.168.4.21:8080/`. Paste a new token any time
+via the prompt the page shows on a 401.
+
+Two knobs, both in `.env`:
+
+- `CONSOLE_TOKEN` — the shared secret. Unset = per-run token (above).
+- `CONSOLE_BIND` — interface override. Default is the LAN address, which
+  means `curl localhost:8080` on the Jetson no longer reaches the console —
+  use the LAN address, or set `CONSOLE_BIND=0.0.0.0` (or `127.0.0.1` for
+  ssh-tunnel-only).
+
+Requests are also rejected when the `Host` header is a name we don't
+recognise (only IP literals, `localhost`, `*.local` and this host's own name
+pass), so a web page you visit elsewhere can't rebind its domain to the
+Jetson and drive the console as if it were same-origin.

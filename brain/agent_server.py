@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
 import socket
 import sys
 import time
@@ -134,6 +136,17 @@ mcp_client = McpClient(memory)
 # Shared A2A client (Phase 9c): connects to Agent2Agent servers (e.g.
 # Hermes) and surfaces their sub-agents as delegation tools in every turn.
 a2a_client = A2aClient(memory)
+# Live agent sessions, one per connected firmware WebSocket (normally exactly
+# one). The web console edits durable history; a session hydrates its thread
+# once at construction, so the console needs a way to reach the in-memory copy
+# — see resync_live_sessions.
+live_sessions: set[AgentSession] = set()
+
+# A session busy with a turn holds its turn lock for the whole exchange
+# (model round trips + tool calls). Bound the console's wait on it rather than
+# hanging the HTTP request behind a wedged turn — which is exactly the state
+# the operator is usually trying to clear.
+RESYNC_TIMEOUT_S = 15.0
 
 
 @dataclass
@@ -220,7 +233,28 @@ def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
             mcp=mcp_client,
             a2a=a2a_client,
         )
+        live_sessions.add(state.agent)
     return state.agent
+
+
+async def resync_live_sessions() -> int:
+    """Re-hydrate every live session's in-memory thread from SQLite, so a
+    console edit to the conversation tail reaches the connected device instead
+    of only landing at the next brain restart. Returns how many sessions were
+    re-synced; a session that stays busy past RESYNC_TIMEOUT_S is skipped and
+    logged rather than blocking the console."""
+    synced = 0
+    for session in list(live_sessions):
+        try:
+            await asyncio.wait_for(session.resync_from_memory(), RESYNC_TIMEOUT_S)
+            synced += 1
+        except TimeoutError:
+            log.warning(
+                "live session busy for %.0fs — its in-memory thread still "
+                "holds the old turns; restart the brain to clear it",
+                RESYNC_TIMEOUT_S,
+            )
+    return synced
 
 
 async def run_speaker(
@@ -775,6 +809,8 @@ async def handle(ws: ServerConnection) -> None:
     except Exception:
         log.exception("connection error")
     finally:
+        if state.agent is not None:
+            live_sessions.discard(state.agent)
         log.info("esp32 disconnected")
 
 
@@ -794,6 +830,46 @@ def lan_ip() -> str:
         return s.getsockname()[0]
     finally:
         s.close()
+
+
+def _console_bind() -> str:
+    """Interface for the web console.
+
+    The LAN address, not 0.0.0.0: the console is an admin surface (its MCP
+    tab persists a command line the brain then executes as this user), so it
+    has no business being offered on every interface the Jetson happens to
+    have — a VPN/tunnel one included. CONSOLE_BIND overrides, e.g. 127.0.0.1
+    for ssh-tunnel-only access or 0.0.0.0 to go back to everything. Note the
+    LAN bind means `curl localhost:8080` on the Jetson no longer works; use
+    the LAN address.
+    """
+    override = (os.environ.get("CONSOLE_BIND") or "").strip()
+    if override:
+        return override
+    try:
+        return lan_ip()
+    except OSError as exc:
+        # No default route yet (DHCP still coming up under a user unit that
+        # can't order on network-online.target). Falling back to every
+        # interface keeps the console reachable once the link is up; the
+        # token is what actually guards it.
+        log.warning("no LAN address yet (%s) — console binds %s", exc, HOST)
+        return HOST
+
+
+def _console_token() -> tuple[str, bool]:
+    """(token, was_generated) for the web console.
+
+    From CONSOLE_TOKEN in the repo-root .env, which survives the deploy
+    script's `git reset --hard` (it's untracked). Absent, mint one for this
+    run rather than serving the console open — a per-run secret that gets
+    logged is still a secret, and it means a Jetson that has never been
+    configured is protected but not locked out of its own console.
+    """
+    configured = (os.environ.get("CONSOLE_TOKEN") or "").strip()
+    if configured:
+        return configured, False
+    return secrets.token_urlsafe(16), True
 
 
 async def advertise_mdns() -> tuple[AsyncZeroconf, ServiceInfo] | tuple[None, None]:
@@ -914,10 +990,14 @@ async def main() -> None:
     LOGS.bind_loop(loop)
     TURNS.bind_loop(loop)
     logging.getLogger("brain").addHandler(WebUILogHandler())
+    console_token, console_generated = _console_token()
+    web_host = _console_bind()
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg, mcp_client, a2a_client),
-            host=HOST, port=WEB_PORT, loop="none", log_level="warning",
+            create_app(memory, cfg, mcp_client, a2a_client,
+                       token=console_token,
+                       resync_sessions=resync_live_sessions),
+            host=web_host, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
     web_task = asyncio.create_task(web.serve())
@@ -931,7 +1011,19 @@ async def main() -> None:
             handle, HOST, PORT, max_size=2**20, ping_interval=None
         ):
             log.info("brain listening on ws://%s:%d", HOST, PORT)
-            log.info("web console on http://%s:%d", HOST, WEB_PORT)
+            if console_generated:
+                # Nobody can reach the console without this, and a fresh
+                # Jetson has no CONSOLE_TOKEN yet — so print the URL that
+                # hands the token to the browser (it stores it and drops it
+                # from the address bar).
+                log.warning(
+                    "web console on http://%s:%d/#token=%s — no CONSOLE_TOKEN "
+                    "in .env, so this one is good only until the next restart",
+                    web_host, WEB_PORT, console_token,
+                )
+            else:
+                log.info("web console on http://%s:%d (token from .env)",
+                         web_host, WEB_PORT)
             await asyncio.Future()
     finally:
         web.should_exit = True

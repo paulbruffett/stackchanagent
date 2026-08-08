@@ -3,17 +3,26 @@
 Mounted in-process by agent_server.main() and served on a separate port.
 Shares the live `memory` and `Config` singletons, so edits take effect on
 the running agent (hot knobs immediately; restart knobs on next start).
-No auth — the LAN is trusted.
+
+Authenticated with a shared secret. This is not a login system — it is the
+recognition that POST /api/mcp/servers persists a command line that the MCP
+client then *executes* as the brain's user, so an open console is a remote
+shell for anything that can reach port 8080. agent_server passes the token
+(CONSOLE_TOKEN in .env, else one minted per run and logged); the browser
+sends it as a header, the log/turn WebSockets as a query param.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import secrets
+import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from anthropic import AsyncAnthropic
@@ -24,7 +33,7 @@ from claude_agent import (
     repair_memory,
     summarize_backlog,
 )
-from config import Config
+from config import SPECS, Config
 from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
 
@@ -32,11 +41,81 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 log = logging.getLogger("brain.webui")
 
+TOKEN_HEADER = "x-stackchan-token"
+
+# `env_ref` names the one .env variable a child MCP server / A2A endpoint is
+# allowed to see, which is the point of the field (HUE_TOKEN for the Hue
+# server). What it must never name is a credential the *brain* itself holds:
+# mcp_client._child_env strips secret-looking vars from the child environment
+# and then re-adds exactly the named one, so `env_ref: ANTHROPIC_API_KEY`
+# hands our own key to whatever command that registry row launches.
+PROTECTED_ENV = {"ANTHROPIC_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
+
+# The only two mcp_client._open_session knows how to open. Anything else was
+# accepted by the registry and then failed at connect time with a ValueError
+# the operator only ever saw as a red dot.
+MCP_TRANSPORTS = ("stdio", "http")
+
+
+def _host_allowed(host_header: str) -> bool:
+    """DNS-rebinding backstop for the Host header.
+
+    The token is the real control; this stops an attacker's domain, rebound
+    to the Jetson's address, from being *same-origin* with the console at all.
+    So it rejects registrable names while passing every way the console is
+    actually reached: an IP literal can't be rebound, nor can localhost or an
+    mDNS `.local` name, and a router-assigned name (`orin.lan`) still matches
+    on this host's own name.
+    """
+    host = host_header.strip().lower()
+    if not host:
+        return True
+    if host.startswith("["):                       # [::1]:8080
+        host = host[1:host.find("]")] if "]" in host else host[1:]
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    if host in ("localhost", "::1"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return (host.endswith(".local")
+            or host.split(".")[0] == socket.gethostname().lower().split(".")[0])
+
+
+def _token_ok(presented: str | None, token: str) -> bool:
+    # Compare as bytes: compare_digest refuses non-ASCII str, and a pasted
+    # token with a stray character should be a 401, not a 500.
+    return bool(presented) and secrets.compare_digest(
+        presented.encode("utf-8", "replace"), token.encode("utf-8", "replace")
+    )
+
+
+def _check_env_ref(env_ref: Any) -> None:
+    if isinstance(env_ref, str) and env_ref.strip().upper() in PROTECTED_ENV:
+        raise HTTPException(
+            400, f"env_ref {env_ref!r} is one of the brain's own credentials"
+        )
+
+
+def _check_transport(transport: Any) -> None:
+    if transport not in MCP_TRANSPORTS:
+        raise HTTPException(400, f"transport must be one of {MCP_TRANSPORTS}")
+
 
 def create_app(
     memory: Memory, config: Config, mcp: Any = None, a2a: Any = None,
+    *,
+    token: str | None = None,
+    resync_sessions: Callable[[], Awaitable[int]] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
+
+    if not token:
+        log.warning("web console running WITHOUT a token — every API route, "
+                    "including MCP server registration, is open")
 
     # Lazy Anthropic client for operator-triggered LLM jobs (summarize now,
     # fact compaction). Created on first use inside the app's event loop and
@@ -47,6 +126,53 @@ def create_app(
         if "c" not in _llm:
             _llm["c"] = AsyncAnthropic()
         return _llm["c"]
+
+    async def resync_live() -> int:
+        """Push a durable-history rewrite into the live conversation(s).
+
+        AgentSession hydrates its in-memory thread once, at construction, and
+        only appends to it — a session lives for the whole firmware WebSocket
+        connection, i.e. days. So editing turns in SQLite alone leaves the
+        connected device replaying the very turns the operator just deleted
+        until the brain restarts (or a summarizer fold re-hydrates hours
+        later, landing the reset at an unpredictable moment). Returns how many
+        live sessions were re-synced; 0 means "nothing connected", or that the
+        app was built without the hook (tests)."""
+        return await resync_sessions() if resync_sessions else 0
+
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next):
+        """Shared-secret gate on the whole API.
+
+        Only the SPA shell and its assets are public — app.js has to load
+        before it can present a token. Everything else needs the header (or
+        `?token=` for clients that can't set one), because the mutating half
+        of this API runs processes as the brain's user and the read half
+        streams every transcript."""
+        if not _host_allowed(request.headers.get("host", "")):
+            return JSONResponse({"detail": "unrecognised Host header"},
+                                status_code=403)
+        path = request.url.path
+        public = path == "/" or path.startswith("/static")
+        if token and not public:
+            presented = (request.headers.get(TOKEN_HEADER)
+                         or request.query_params.get("token"))
+            if not _token_ok(presented, token):
+                return JSONResponse({"detail": "console token required"},
+                                    status_code=401)
+        return await call_next(request)
+
+    async def authorize_ws(ws: WebSocket) -> bool:
+        """Same gate for the live feeds. Browsers can't set headers on a
+        WebSocket handshake, so the token rides in the query string; the log
+        feed carries every transcript, so it is not left open."""
+        if not _host_allowed(ws.headers.get("host", "")):
+            await ws.close(code=1008)
+            return False
+        if token and not _token_ok(ws.query_params.get("token"), token):
+            await ws.close(code=1008)
+            return False
+        return True
 
     @app.middleware("http")
     async def revalidate_static(request: Request, call_next):
@@ -80,8 +206,12 @@ def create_app(
             raise HTTPException(404, f"unknown config key: {key}")
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"bad value: {exc}")
-        spec = next(i for i in config.describe() if i["key"] == key)
-        return {"key": key, "value": value, "restart": spec["restart"]}
+        # Read the flag off SPECS, not describe(): describe() omits hidden
+        # knobs (SYSTEM_PROMPT, the two prompt templates), so a scan of it
+        # raised StopIteration — which CPython turns into a 500 — *after*
+        # config.set had already persisted the value, telling the caller the
+        # write failed when it had landed.
+        return {"key": key, "value": value, "restart": SPECS[key].restart}
 
     # --- persona / system prompt --------------------------------------
     # The persona is a hot config knob (SYSTEM_PROMPT) but too large for the
@@ -208,8 +338,13 @@ def create_app(
         )
         if result is None:
             return {"ok": False, "reason": reason}
+        # summarize_backlog marks the folded turns summarized; callers holding
+        # live turn state have to re-hydrate (its docstring says so, and the
+        # automatic path does it).
+        live = await resync_live()
         return {
             "ok": True,
+            "live_synced": live,
             "summary": {
                 "id": result.id, "summary": result.summary,
                 "span_from": result.span_from, "span_to": result.span_to,
@@ -232,18 +367,22 @@ def create_app(
         orphan tool_result corruption in the unsummarized tail and report the
         counts. Safe to run anytime; a clean DB changes nothing."""
         counts = repair_memory(memory)
-        return {"ok": True, "counts": counts}
+        live = await resync_live()
+        return {"ok": True, "counts": counts, "live_synced": live}
 
     @app.post("/api/memories/reset")
     async def reset_conversation() -> dict[str, Any]:
         """Hard-reset the live conversation tail: delete every unsummarized
         turn so the next turn starts from summaries + facts only. Summaries and
         durable facts are kept. The escape hatch when a thread is wedged and a
-        repair isn't enough."""
+        repair isn't enough — so it has to reach the *connected* device's
+        in-memory thread too, not just SQLite."""
         turns = memory.list_unsummarized_turns()
         deleted = memory.delete_turns_from(turns[0].id) if turns else 0
-        log.warning("conversation reset: deleted %d unsummarized turn(s)", deleted)
-        return {"ok": True, "deleted": deleted}
+        live = await resync_live()
+        log.warning("conversation reset: deleted %d unsummarized turn(s), "
+                    "re-synced %d live session(s)", deleted, live)
+        return {"ok": True, "deleted": deleted, "live_synced": live}
 
     # --- MCP servers (Phase 9b) ---------------------------------------
     @app.get("/api/mcp/servers")
@@ -268,10 +407,13 @@ def create_app(
         name = (body.get("name") or "").strip()
         if not name:
             raise HTTPException(400, "missing 'name'")
+        transport = body.get("transport", "stdio")
+        _check_transport(transport)
+        _check_env_ref(body.get("env_ref"))
         try:
             sid = memory.add_mcp_server(
                 name=name,
-                transport=body.get("transport", "stdio"),
+                transport=transport,
                 command=body.get("command"),
                 args=body.get("args") or [],
                 url=body.get("url"),
@@ -289,6 +431,10 @@ def create_app(
         fields = {k: v for k, v in body.items() if k in allowed}
         if not fields:
             raise HTTPException(400, "no editable fields")
+        if "transport" in fields:
+            _check_transport(fields["transport"])
+        if "env_ref" in fields:
+            _check_env_ref(fields["env_ref"])
         if not memory.update_mcp_server(server_id, **fields):
             raise HTTPException(404, "no such server")
         return {"ok": True}
@@ -332,6 +478,7 @@ def create_app(
             raise HTTPException(400, "missing 'name'")
         if not url:
             raise HTTPException(400, "missing 'url'")
+        _check_env_ref(body.get("env_ref"))
         try:
             sid = memory.add_a2a_server(
                 name=name,
@@ -349,6 +496,8 @@ def create_app(
         fields = {k: v for k, v in body.items() if k in allowed}
         if not fields:
             raise HTTPException(400, "no editable fields")
+        if "env_ref" in fields:
+            _check_env_ref(fields["env_ref"])
         if not memory.update_a2a_server(server_id, **fields):
             raise HTTPException(404, "no such server")
         return {"ok": True}
@@ -369,11 +518,13 @@ def create_app(
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")
     async def ws_logs(ws: WebSocket) -> None:
-        await _stream(ws, LOGS)
+        if await authorize_ws(ws):
+            await _stream(ws, LOGS)
 
     @app.websocket("/ws/turns")
     async def ws_turns(ws: WebSocket) -> None:
-        await _stream(ws, TURNS)
+        if await authorize_ws(ws):
+            await _stream(ws, TURNS)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
