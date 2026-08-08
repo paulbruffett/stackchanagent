@@ -3,12 +3,15 @@
 The brain is a flat collection of modules run with `.venv/bin/python`, so we
 prepend brain/ to sys.path here and import the modules directly (no package).
 The fake client lets us drive `AgentSession._run_loop` deterministically —
-scripting each model turn as text / a tool call / an API error — without a
-network round-trip, which is what makes the M6.1/M6.2/M6.4 regressions testable.
+scripting each model turn as text (whole or chunked) / a tool call / an API
+error before or mid-stream — without a network round-trip, which is what makes
+the M6.1/M6.2/M6.4 regressions testable. `FakeWs` captures the commands the
+brain sends the firmware so the turn-state handshake is assertable too.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -18,14 +21,16 @@ import pytest
 # brain/ is the import root (flat modules: memory.py, claude_agent.py, …).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import init_config  # noqa: E402
+from config import get_config, init_config  # noqa: E402
 from memory import Memory  # noqa: E402
 
 
 @pytest.fixture
 def mem(tmp_path):
     """A fresh Memory on a temp DB, wired to the global Config singleton with
-    the noisy on-device knobs disabled so a turn needs no websocket."""
+    the noisy on-device knobs disabled so the common path stays quiet. The
+    busy_indicator / ack_filler / follow_up_thinking fixtures below turn one
+    back on for the tests that assert that feature."""
     m = Memory(tmp_path / "memory.db")
     cfg = init_config(m)
     cfg.set("BUSY_INDICATOR", 0)
@@ -36,6 +41,27 @@ def mem(tmp_path):
     m.close()
 
 
+@pytest.fixture
+def busy_indicator(mem):
+    """Re-enable the on-screen 'thinking' indicator for the tests that assert
+    the brain's half of the turn-state handshake (they read `sess.ws.sent`)."""
+    get_config().set("BUSY_INDICATOR", 1)
+
+
+@pytest.fixture
+def ack_filler(mem):
+    """Re-enable the spoken pre-tool acknowledgement, so the phrases actually
+    reaching TTS on a slow-tool turn are observable."""
+    get_config().set("ACK_FILLER", 1)
+
+
+@pytest.fixture
+def follow_up_thinking(mem):
+    """Turn extended thinking on for the follow-up / stage-direction turns that
+    opt into it — off in `mem` so the wake-word path stays the default."""
+    get_config().set("FOLLOW_UP_THINKING", 1)
+
+
 # --- scripted fake streaming client ----------------------------------------
 
 class _FakeBlock:
@@ -43,7 +69,20 @@ class _FakeBlock:
         self.__dict__.update(kw)
 
     def model_dump(self, exclude_none: bool = True) -> dict[str, Any]:
-        return dict(self.__dict__)
+        # Honouring exclude_none is not pedantry: it is what actually keeps the
+        # SDK's unset optionals (`citations`) and stream-only decorations
+        # (`parsed_output`) out of the message we replay next turn. A fake that
+        # ignored the flag would let `_clean_block` lose it and stay green.
+        d = dict(self.__dict__)
+        if exclude_none:
+            d = {k: v for k, v in d.items() if v is not None}
+        return d
+
+
+def _text_block(text: str) -> _FakeBlock:
+    """A streamed text block as the SDK hands it over — carrying the optional
+    fields it always attaches, which must not survive into persisted history."""
+    return _FakeBlock(type="text", text=text, citations=None, parsed_output=None)
 
 
 class _FakeUsage:
@@ -59,8 +98,10 @@ class _FakeResp:
 
 
 class _OkStream:
-    def __init__(self, text: str, resp: _FakeResp) -> None:
-        self._text = text
+    def __init__(self, text: str | list[str], resp: _FakeResp) -> None:
+        # A list models the real thing: deltas arrive in arbitrary pieces, so
+        # brackets and sentence ends land across chunk boundaries.
+        self._chunks = [text] if isinstance(text, str) else list(text)
         self._resp = resp
 
     async def __aenter__(self) -> "_OkStream":
@@ -72,8 +113,9 @@ class _OkStream:
     @property
     def text_stream(self):
         async def gen():
-            if self._text:
-                yield self._text
+            for chunk in self._chunks:
+                if chunk:
+                    yield chunk
         return gen()
 
     async def get_final_message(self) -> _FakeResp:
@@ -94,18 +136,50 @@ class _ErrStream:
         return False
 
 
+class _MidStreamErrStream:
+    """Streams some deltas and then raises — a connection flap after the user
+    has already heard part of the reply. `_ErrStream` can't model this (it dies
+    before any token), so it's the only way to exercise the `spoke_partial`
+    guard that stops a retry from double-speaking."""
+
+    def __init__(self, chunks: list[str], exc: BaseException) -> None:
+        self._chunks = chunks
+        self._exc = exc
+
+    async def __aenter__(self) -> "_MidStreamErrStream":
+        return self
+
+    async def __aexit__(self, *a: Any) -> bool:
+        return False
+
+    @property
+    def text_stream(self):
+        chunks, exc = self._chunks, self._exc
+
+        async def gen():
+            for chunk in chunks:
+                yield chunk
+            raise exc
+        return gen()
+
+
 def _build_stream(step: tuple):
     """Turn a script step into one fake stream.
 
     ("text", "spoken reply")                 → end_turn with that text
+    ("text_chunks", ["spo", "ken reply"])    → same, streamed in pieces
     ("tool", name, tool_id[, lead_text])     → tool_use turn (optional pre-text)
     ("cutoff", name, tool_id[, lead_text])   → tool_use cut off by max_tokens
     ("error", exception)                     → request raises (no tokens)
+    ("stream_error", ["chu", "nks"], exc)    → deltas stream, then it raises
     """
     kind = step[0]
     if kind == "text":
         txt = step[1]
-        return _OkStream(txt, _FakeResp([_FakeBlock(type="text", text=txt)], "end_turn"))
+        return _OkStream(txt, _FakeResp([_text_block(txt)], "end_turn"))
+    if kind == "text_chunks":
+        chunks = list(step[1])
+        return _OkStream(chunks, _FakeResp([_text_block("".join(chunks))], "end_turn"))
     if kind == "tool":
         name, tid = step[1], step[2]
         lead = step[3] if len(step) > 3 else ""
@@ -123,7 +197,24 @@ def _build_stream(step: tuple):
         return _OkStream(lead, _FakeResp(blocks, "max_tokens"))
     if kind == "error":
         return _ErrStream(step[1])
+    if kind == "stream_error":
+        return _MidStreamErrStream(list(step[1]), step[2])
     raise ValueError(f"bad script step: {step!r}")
+
+
+class FakeWs:
+    """Records every command the brain sends the firmware. `object()` swallowed
+    them (no `.send`, and `_set_busy` catches the AttributeError), which left
+    the brain's half of the turn-state handshake unobservable."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(json.loads(payload))
+
+    def cmds(self, cmd: str) -> list[dict[str, Any]]:
+        return [m for m in self.sent if m.get("cmd") == cmd]
 
 
 @pytest.fixture
@@ -151,7 +242,7 @@ def make_agent(mem, monkeypatch) -> Callable:
         monkeypatch.setattr(claude_agent, "AsyncAnthropic", FakeClient)
         if dispatch is not None:
             monkeypatch.setattr(tools, "dispatch", dispatch)
-        return claude_agent.AgentSession(ws=object(), memory=mem)
+        return claude_agent.AgentSession(ws=FakeWs(), memory=mem)
 
     return factory
 
