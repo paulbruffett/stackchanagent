@@ -31,7 +31,8 @@ import numpy as np
 import uvicorn
 from dotenv import load_dotenv
 from websockets.asyncio.server import ServerConnection, serve
-from zeroconf import ServiceInfo, Zeroconf
+from zeroconf import ServiceInfo
+from zeroconf.asyncio import AsyncZeroconf
 
 # Load ANTHROPIC_API_KEY (and any other env) from the project root .env
 # before importing the agent module (which constructs the Anthropic client).
@@ -777,17 +778,44 @@ async def handle(ws: ServerConnection) -> None:
         log.info("esp32 disconnected")
 
 
-def advertise_mdns() -> tuple[Zeroconf, ServiceInfo] | tuple[None, None]:
+def lan_ip() -> str:
+    """The address the ESP32 can actually reach us at.
+
+    Not `gethostbyname(gethostname())`: on Debian/Ubuntu that resolves the
+    hostname through /etc/hosts, which maps it to the 127.0.1.1 loopback
+    alias. Advertising that over mDNS points the firmware at its own
+    loopback. Connecting a UDP socket sends no packets — it only asks the
+    routing table which source address would be used to reach the outside
+    world, which is exactly the interface the ESP32 is on.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 53))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+async def advertise_mdns() -> tuple[AsyncZeroconf, ServiceInfo] | tuple[None, None]:
     """Register stackchan-brain.local via zeroconf.
 
-    On macOS, port 5353 is held by the system mdnsresponder and zeroconf's
-    register_service can time out. We treat that as non-fatal — for local
-    testing the firmware can be pointed at the host's existing `.local`
-    hostname (e.g. `Pauls-Mac-mini.local`) directly.
+    Async on purpose. The synchronous `Zeroconf` API deadlocks when it is
+    constructed from inside a running event loop: it attaches to *our* loop,
+    then blocks the calling thread on `run_coroutine_threadsafe(...).result()`
+    against that same loop, and every registration dies with EventLoopBlocked
+    ~10 s later. AsyncZeroconf drives the same machinery through our loop and
+    registers in about a second.
+
+    Still non-fatal. On macOS port 5353 is held by the system mdnsresponder
+    and registration can genuinely time out — for local testing the firmware
+    can be pointed at the host's existing `.local` hostname directly.
     """
+    aiozc = None
     try:
-        zc = Zeroconf()
-        ip = socket.gethostbyname(socket.gethostname())
+        ip = lan_ip()
+        # Bind the LAN interface only, so we don't also announce on lo and
+        # docker0 (nothing the ESP32 can use, and it clutters avahi-browse).
+        aiozc = AsyncZeroconf(interfaces=[ip])
         info = ServiceInfo(
             type_="_ws._tcp.local.",
             name=f"{MDNS_NAME}._ws._tcp.local.",
@@ -795,13 +823,23 @@ def advertise_mdns() -> tuple[Zeroconf, ServiceInfo] | tuple[None, None]:
             port=PORT,
             server=f"{MDNS_NAME}.local.",
         )
-        zc.register_service(info)
+        await aiozc.async_register_service(info)
         log.info("mDNS: advertising %s.local at %s:%d", MDNS_NAME, ip, PORT)
-        return zc, info
+        return aiozc, info
     except Exception as exc:
+        # Close on the way out. A half-registered responder keeps answering
+        # queries for the rest of the process's life, so leaking it here means
+        # serving an address we just decided was unusable — which is how a
+        # failed registration still managed to publish 127.0.1.1.
+        if aiozc is not None:
+            try:
+                await aiozc.async_close()
+            except Exception:
+                log.debug("zeroconf close after failed registration", exc_info=True)
         log.warning(
-            "mDNS registration failed (%s). The brain still listens on :%d; "
+            "mDNS registration failed (%s: %s). The brain still listens on :%d; "
             "point the firmware at the host's existing .local hostname.",
+            type(exc).__name__,
             exc,
             PORT,
         )
@@ -884,7 +922,7 @@ async def main() -> None:
     )
     web_task = asyncio.create_task(web.serve())
 
-    zc, info = advertise_mdns()
+    aiozc, info = await advertise_mdns()
     try:
         # ping_interval=None: the 78/esp-ml307 WebSocket on the firmware
         # doesn't reply to pings, so server-side keepalive trips the
@@ -900,10 +938,17 @@ async def main() -> None:
         await web_task
         await mcp_client.aclose()
         await a2a_client.aclose()
-        if zc is not None and info is not None:
-            zc.unregister_service(info)
-            zc.close()
+        if aiozc is not None and info is not None:
+            await aiozc.async_unregister_service(info)
+            await aiozc.async_close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # systemd stops us with SIGINT (deploy/stackchan-brain.service) so that
+        # main()'s finally can unregister mDNS and close the MCP/A2A clients.
+        # Letting KeyboardInterrupt escape would exit non-zero and leave the
+        # unit sitting in `failed` after every ordinary stop.
+        log.info("interrupted — shut down cleanly")
