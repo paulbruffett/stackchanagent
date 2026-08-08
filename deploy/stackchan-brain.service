@@ -8,9 +8,15 @@
 [Unit]
 Description=Stackchan brain (voice agent for the M5StackChan)
 Documentation=https://github.com/paulbruffett/stackchanagent
-# Give up after 8 restarts in 5 min so a hard crash loop stops burning CPU.
-StartLimitIntervalSec=300
-StartLimitBurst=8
+# No start limit, on purpose. A burst limit puts the unit in `failed` with
+# StartLimitAction=none and nothing in this repo ever clears it — an always-on
+# robot would then stay dead until someone SSHes in, even though the usual
+# causes are transient on a human timescale: a bad auto-pulled commit that is
+# fixed 10 min later, a half-synced venv, a USB/audio device that has not
+# enumerated yet at cold boot. ExecStartPre only runs as part of a start job,
+# so a unit that stops starting also stops pulling the fix. RestartSec is what
+# bounds the cost of a hard crash loop instead.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -35,7 +41,11 @@ TimeoutStopSec=20
 TimeoutStartSec=1200
 
 Restart=always
-RestartSec=10
+# With no start limit above, this delay is the only throttle on a crash loop:
+# long enough that one costs almost nothing (and that update-brain.sh's 60 s
+# fetch cooldown throttles the fetches to one per two restarts), short enough
+# that a one-off crash costs a missed exchange, not the evening.
+RestartSec=30
 
 [Install]
 WantedBy=default.target
