@@ -368,8 +368,10 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     await ws.send(json.dumps({"cmd": "stop_listening"}))
 
     if get_config().get("STT_DEBUG_DUMP"):
-        _dump_capture(pcm)
-    transcript = stt.transcribe(pcm)
+        # Whole-file WAV write; off the loop like every other blocking call
+        # here, so turning the debug dump on doesn't stall the console/mDNS.
+        await asyncio.to_thread(_dump_capture, pcm)
+    transcript = await stt.transcribe(pcm)
     if not transcript.text:
         log.info("empty transcript — going idle")
         return
@@ -972,6 +974,12 @@ async def main() -> None:
         device=cfg.get("STT_DEVICE"),
         compute_type=cfg.get("STT_COMPUTE_TYPE"),
     )
+    # Pull the whisper load off the first utterance. The Jetson restarts the
+    # brain on every deploy, so "first utterance" is a routine event, and the
+    # load is seconds of dead air on top of a turn the user is waiting on.
+    # Background, not awaited: the socket should be accepting connections
+    # while the model comes up.
+    spawn(stt.warm(), "stt_warm")
 
     # MCP servers (Phase 9b): seed the two local servers on first run so
     # weather works out of the box and Hue is one toggle + .env away.

@@ -1,7 +1,7 @@
 """Speech-to-text wrapper around faster-whisper.
 
 Brain accumulates 16 kHz s16le PCM frames during the LISTENING state,
-then calls `Transcriber.transcribe(pcm_bytes)` once the utterance
+then awaits `Transcriber.transcribe(pcm_bytes)` once the utterance
 ends. Returns the text.
 
 Default model is `small.en` on CUDA float16 — the brain runs on the
@@ -11,8 +11,10 @@ Orin Nano. Override via env for CPU dev:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 
@@ -64,7 +66,13 @@ def should_drop_follow_up(
 
 
 class Transcriber:
-    """Lazy-loads the model on first transcribe; subsequent calls reuse it."""
+    """Lazy-loads the model on first transcribe; subsequent calls reuse it.
+
+    `transcribe()` is async and runs the inference in a worker thread: the
+    brain is a single event loop shared by the firmware socket, the uvicorn
+    console and the AsyncZeroconf responder, and a CTranslate2 inference (or
+    worse, the one-time model load) run on it freezes all three.
+    """
 
     def __init__(
         self,
@@ -76,6 +84,13 @@ class Transcriber:
         self.device = device
         self.compute_type = compute_type
         self._model: WhisperModel | None = None
+        # Everything that touches the model runs on a worker thread now, and
+        # faster-whisper's model object is not safe to drive from two threads
+        # at once (two concurrent _load()s would also build two CUDA
+        # contexts). Only one turn is ever in flight, so this normally never
+        # queues — it just makes a second WS connection or a warm racing the
+        # first turn harmless.
+        self._lock = threading.Lock()
 
     def _load(self) -> WhisperModel:
         if self._model is None:
@@ -92,34 +107,54 @@ class Transcriber:
             log.info("whisper loaded in %.1fs", time.monotonic() - t0)
         return self._model
 
-    def transcribe(self, pcm: bytes) -> Transcript:
+    async def warm(self) -> None:
+        """Load the model ahead of the first utterance. Best-effort — a
+        failure here just leaves the load to the first turn, which is where
+        it happened before. Fire this in the background at startup so a
+        restart doesn't add the whole model-load time to the next thing the
+        user says."""
+        try:
+            await asyncio.to_thread(self._load_locked)
+        except Exception:
+            log.exception("whisper warm-up failed — will retry on first turn")
+
+    def _load_locked(self) -> None:
+        with self._lock:
+            self._load()
+
+    async def transcribe(self, pcm: bytes) -> Transcript:
         """Transcribe a buffer of 16 kHz s16le mono PCM samples."""
         if not pcm:
             return Transcript(text="", latency_ms=0)
+        return await asyncio.to_thread(self._transcribe_sync, pcm)
 
-        model = self._load()
-        audio = (
-            np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        )
-        # Signal level, as % of full scale. A healthy speech utterance peaks
-        # ~30-90% with rms ~5-20%; peak below ~5% means the mic gain is too
-        # low (Whisper hallucinates plausible-but-wrong text on weak audio),
-        # near 100% means clipping. Logged every turn to diagnose STT errors.
-        peak_pct = float(np.max(np.abs(audio))) * 100.0 if audio.size else 0.0
-        rms_pct = float(np.sqrt(np.mean(audio**2))) * 100.0 if audio.size else 0.0
-        t0 = time.monotonic()
-        segments, _info = model.transcribe(
-            audio,
-            language="en",
-            beam_size=1,
-            # Short utterances; word timestamps and VAD aren't needed.
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
-        # Materialize the generator once so we can both join the text and read
-        # per-segment confidence. Aggregate worst-case (a single bad segment is
-        # what we want to catch): highest no_speech_prob, lowest avg_logprob.
-        segs = list(segments)
+    def _transcribe_sync(self, pcm: bytes) -> Transcript:
+        with self._lock:
+            model = self._load()
+            audio = (
+                np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            )
+            # Signal level, as % of full scale. A healthy speech utterance peaks
+            # ~30-90% with rms ~5-20%; peak below ~5% means the mic gain is too
+            # low (Whisper hallucinates plausible-but-wrong text on weak audio),
+            # near 100% means clipping. Logged every turn to diagnose STT errors.
+            peak_pct = float(np.max(np.abs(audio))) * 100.0 if audio.size else 0.0
+            rms_pct = float(np.sqrt(np.mean(audio**2))) * 100.0 if audio.size else 0.0
+            t0 = time.monotonic()
+            segments, _info = model.transcribe(
+                audio,
+                language="en",
+                beam_size=1,
+                # Short utterances; word timestamps and VAD aren't needed.
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            # Materialize the generator once so we can both join the text and
+            # read per-segment confidence. Aggregate worst-case (a single bad
+            # segment is what we want to catch): highest no_speech_prob, lowest
+            # avg_logprob. Must happen under the lock — faster-whisper's
+            # segment generator runs the decode lazily, on the model.
+            segs = list(segments)
         text = " ".join(seg.text.strip() for seg in segs).strip()
         no_speech_prob = max((s.no_speech_prob for s in segs), default=0.0)
         avg_logprob = min((s.avg_logprob for s in segs), default=0.0)
