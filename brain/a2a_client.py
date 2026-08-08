@@ -30,9 +30,10 @@ import asyncio
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -46,6 +47,20 @@ CALL_TIMEOUT_S = 60.0
 # tasks/get until it finishes or this budget is exhausted.
 POLL_TIMEOUT_S = 55.0
 POLL_INTERVAL_S = 1.5
+# A poll is a cheap status read. Giving each one the full CALL_TIMEOUT_S is
+# how the 55s budget used to stretch to ~37 minutes of held agent turn.
+POLL_HTTP_TIMEOUT_S = 10.0
+# Last-resort wall-clock ceiling on one delegation (send, its legacy retry,
+# and the poll budget together), so no remote agent can hold a turn — and
+# with it the firmware's thinking state — open indefinitely.
+DISPATCH_TIMEOUT_S = 120.0
+# Delegation results are replayed on every later request in the session and
+# committed to memory.db, so they cannot be remote-sized (see mcp_client).
+MAX_RESULT_CHARS = 8000
+# The Messages API caps a tool name at 64 chars and rejects the whole
+# `tools` array if one is over — and these fragments come from a remote card.
+MAX_TOOL_NAME = 64
+_MAX_SERVER_FRAGMENT = 24
 
 _NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 _TERMINAL = {"completed", "failed", "canceled", "cancelled", "rejected", "input-required"}
@@ -107,6 +122,17 @@ def _result_text(result: Any) -> str:
             if t:
                 return t
     return ""
+
+
+def _clamp_result(name: str, text: str) -> str:
+    """Bound what a remote agent hands back, for the same reason as the MCP
+    side: the string is sized by someone else, replayed on every later
+    request of the session, and committed to memory.db."""
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    dropped = len(text) - MAX_RESULT_CHARS
+    log.warning("%s returned %d chars; truncated %d away", name, len(text), dropped)
+    return text[:MAX_RESULT_CHARS] + f"\n... [truncated, {dropped} chars omitted]"
 
 
 class _Delegate:
@@ -174,21 +200,23 @@ class _A2aConn:
             by_agent.setdefault(s.get("agent"), []).append(s)
 
         agents = card.get("agents") or []
-        sname = _sanitize(self.spec.name)
+        sname = _sanitize(self.spec.name)[:_MAX_SERVER_FRAGMENT]
         out: list[_Delegate] = []
         if agents:
             for a in agents:
                 aid = a.get("id") or a.get("name") or "agent"
-                aurl = urljoin(card_url, a.get("url") or card.get("url") or "")
+                aurl = self._endpoint(card_url, a.get("url") or card.get("url") or "")
                 desc = self._describe(a.get("name", aid), a.get("description", ""),
                                       by_agent.get(aid, []))
                 out.append(_Delegate(
-                    f"a2a__{sname}__{_sanitize(str(aid))}",
+                    # Clamped as a whole: the agent id comes from the remote
+                    # card, and one over-long name 400s every turn's request.
+                    f"a2a__{sname}__{_sanitize(str(aid))}"[:MAX_TOOL_NAME],
                     str(aid), a.get("name", str(aid)), aurl, desc,
                 ))
         else:
             # Plain A2A card: one tool for the whole agent.
-            aurl = urljoin(card_url, card.get("url") or "")
+            aurl = self._endpoint(card_url, card.get("url") or "")
             desc = self._describe(card.get("name", self.spec.name),
                                   card.get("description", ""), skills)
             out.append(_Delegate(
@@ -196,6 +224,29 @@ class _A2aConn:
                 aurl, desc,
             ))
         return out
+
+    def _endpoint(self, card_url: str, raw: str) -> str:
+        """Resolve a card-supplied endpoint, pinned to the registered origin.
+
+        `urljoin` discards the base entirely when the card's `url` is
+        absolute, so the remote — not the operator — would get to choose
+        where we POST this server's bearer token (`_headers()`), and any
+        host the Jetson can reach is a valid target (the unauthenticated
+        console on 127.0.0.1 included). The card's contents are the remote's
+        to choose; the origin is the operator's, so the origin wins. We
+        re-anchor rather than drop the delegate so the benign case still
+        works — a card advertising its own hostname while the registry
+        holds the IP."""
+        url = urljoin(card_url, raw)
+        base, cand = urlsplit(card_url), urlsplit(url)
+        if (cand.scheme, cand.netloc.lower()) == (base.scheme, base.netloc.lower()):
+            return url
+        log.warning(
+            "a2a %s: card endpoint %s is off the registered origin %s://%s; "
+            "using its path there instead",
+            self.spec.name, url, base.scheme, base.netloc,
+        )
+        return urlunsplit((base.scheme, base.netloc, cand.path, cand.query, ""))
 
     @staticmethod
     def _describe(name: str, description: str, skills: list[dict]) -> str:
@@ -283,26 +334,48 @@ class _A2aConn:
         if not is_task:
             return result
         task_id = result.get("id")
-        waited = 0.0
-        while task_id and waited < POLL_TIMEOUT_S:
+        # A real deadline, not a count of the sleeps: only counting sleeps
+        # left each round trip unbudgeted, so a slow tasks/get turned this
+        # documented 55s into ~37 minutes of held agent turn.
+        deadline = time.monotonic() + POLL_TIMEOUT_S
+        while task_id:
             state = (result.get("status") or {}).get("state")
             if state in _TERMINAL or state is None:
                 return result
-            await asyncio.sleep(POLL_INTERVAL_S)
-            waited += POLL_INTERVAL_S
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning(
+                    "a2a %s: task %s still %r after %.0fs; returning it as-is",
+                    self.spec.name, task_id, state, POLL_TIMEOUT_S,
+                )
+                return result
+            await asyncio.sleep(min(POLL_INTERVAL_S, remaining))
             poll = {
                 "jsonrpc": "2.0", "id": uuid.uuid4().hex,
                 "method": "tasks/get", "params": {"id": task_id},
             }
             try:
                 pr = await http.post(
-                    url, json=poll, headers=self._headers(), timeout=CALL_TIMEOUT_S
+                    url, json=poll, headers=self._headers(),
+                    timeout=max(1.0, min(POLL_HTTP_TIMEOUT_S,
+                                         deadline - time.monotonic())),
                 )
                 pr.raise_for_status()
-                result = pr.json().get("result", result)
+                env = pr.json()
             except Exception as exc:  # noqa: BLE001
                 log.warning("a2a %s tasks/get failed: %s", self.spec.name, exc)
                 return result
+            polled = env.get("result")
+            if not isinstance(polled, dict):
+                # An error envelope (or a malformed one) will keep coming
+                # back; re-polling with the previous non-terminal task just
+                # burns the whole budget on a state that can never advance.
+                log.warning(
+                    "a2a %s tasks/get gave no task: %s",
+                    self.spec.name, env.get("error") or env,
+                )
+                return result
+            result = polled
         return result
 
 
@@ -382,10 +455,16 @@ class A2aClient:
         if not request:
             return "No request provided to delegate."
         try:
-            return await conn.call(self._http, d.url, request)
+            out = await asyncio.wait_for(
+                conn.call(self._http, d.url, request), DISPATCH_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            log.warning("a2a call %s exceeded %.0fs", name, DISPATCH_TIMEOUT_S)
+            out = f"The {d.agent_name} agent did not answer in time."
         except Exception as exc:  # noqa: BLE001
             log.warning("a2a call %s failed: %s", name, exc)
-            return f"The {d.agent_name} agent failed: {exc}"
+            out = f"The {d.agent_name} agent failed: {exc}"
+        return _clamp_result(name, out)
 
     # -- web UI --
     def status(self) -> list[dict[str, Any]]:
