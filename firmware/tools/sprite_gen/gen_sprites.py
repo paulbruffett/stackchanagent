@@ -226,7 +226,11 @@ def save_png(raw: bytes, out_path: Path, size: int, resize: bool, key_color: str
     if resize:
         im.thumbnail((size, size), Image.LANCZOS)
         canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        canvas.paste(im, ((size - im.width) // 2, (size - im.height) // 2), im)
+        # No mask argument: passing `im` as its own mask makes PIL mix every
+        # band through it, so the result is rgb*a with alpha a**2/255. LVGL
+        # then multiplies by alpha again when it blends the straight-alpha
+        # RGB565A8, darkening and eroding the anti-aliased rim of every sprite.
+        canvas.alpha_composite(im, ((size - im.width) // 2, (size - im.height) // 2))
         im = canvas
     im.save(out_path)
 
