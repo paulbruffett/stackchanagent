@@ -2,10 +2,11 @@
 name = "stackchan-brain"
 version = "0.1.0"
 description = "Jetson-side agent for the M5StackChan refactor"
-# 3.12 exactly, not 3.11+: the locally-built CUDA ctranslate2 wheel pinned in
-# [tool.uv.sources] is cp312-only, so a >=3.11 floor makes uv fork the
-# resolution onto a 3.11 branch that no ctranslate2 satisfies.
-requires-python = ">=3.12"
+# 3.12 exactly — not a floor. The locally-built CUDA ctranslate2 wheel pinned
+# in [tool.uv.sources] is cp312-only, so any open bound makes uv fork the
+# resolution onto a 3.11 (or 3.14) branch that no ctranslate2 satisfies and the
+# whole lock fails. Rebuild the wheel before widening this.
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "websockets>=12.0",
     "anthropic>=0.40.0",
@@ -29,7 +30,10 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
     # Phase 9b: MCP client (and FastMCP for our local weather/Hue servers).
-    "mcp>=1.2",
+    # Pinned below 2.0: mcp 2.x dropped mcp.server.fastmcp (FastMCP moved to
+    # the separate 'fastmcp' package), which mcp_servers/weather.py and
+    # hue.py import. Unpin once those are ported.
+    "mcp>=1.2,<2",
     # Weather/Hue MCP servers make outbound HTTP to Open-Meteo / the Hue
     # bridge. httpx is already pulled in by mcp, but pin it explicitly.
     "httpx>=0.27",
