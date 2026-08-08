@@ -68,7 +68,25 @@ def test_sanitize_merges_consecutive_same_role():
         {"role": "user", "content": "b"},
     ]
     out = _sanitize_for_api(thread)
-    assert len(out) == 1 and out[0]["role"] == "user"
+    # Content, not just shape: a merge that kept only the first message would
+    # satisfy "one user message" while silently swallowing the second.
+    assert out == [{"role": "user", "content": [
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b"},
+    ]}]
+
+
+def test_sanitize_merge_keeps_the_new_utterance_after_an_aborted_turn():
+    # The realistic shape: a turn aborted after its tool_result was staged, then
+    # the user spoke again — so the merge is a block list plus a plain string.
+    # Losing the string here means the robot answers the previous question.
+    thread = GOOD[:3] + [{"role": "user", "content": "hello again"}]
+    out = _sanitize_for_api(thread)
+    assert validate_thread(out) == []
+    assert out[-1] == {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+        {"type": "text", "text": "hello again"},
+    ]}
 
 
 def test_sanitize_is_idempotent_on_clean_thread():
