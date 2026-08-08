@@ -145,10 +145,10 @@ void connection_task(void*)
             s.ws = std::move(ws);
         }
         s.connected = true;
+        const TickType_t session_start = xTaskGetTickCount();
         mclog::tagInfo(TAG, "connected");
         send_event_json("{\"event\":\"boot\"}");
 
-        const TickType_t session_start = xTaskGetTickCount();
         // Run until disconnect / error fires.
         while (!closed->load()) {
             vTaskDelay(pdMS_TO_TICKS(200));

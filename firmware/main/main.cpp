@@ -151,10 +151,13 @@ extern "C" void app_main(void)
         // on-device leaves LISTENING on its own — the wakenet is paused there
         // and the head tap is gated to Idle — so transitioning on an event the
         // transport silently dropped would leave the robot deaf for the rest
-        // of the outage.
+        // of the outage. AfeWakeWord::AudioDetectionTask already called Stop()
+        // before invoking us, and staying in Idle means transition() would
+        // never resume it (prev == next short-circuits), so re-arm by hand.
         if (!agent::transport::send_event_json(
                 std::string("{\"event\":\"wakeword\",\"word\":\"") + w + "\"}")) {
             mclog::tagWarn(TAG, "wakeword dropped — brain link down");
+            agent::wakeword::resume();
             return;
         }
         agent::state::transition(agent::state::Mode::Listening);
