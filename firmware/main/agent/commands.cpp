@@ -1,7 +1,9 @@
 #include "commands.h"
 
 #include <atomic>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -29,6 +31,34 @@ using stackchan::avatar::Emotion;
 // cross-task reads/writes are well-defined.
 std::atomic<bool> g_face_off{false};
 std::atomic<uint8_t> g_saved_brightness{255};
+
+// The atomic makes each flag flip well-defined, but not the flag-plus-backlight
+// pair. sleep_face() runs on the WS dispatch path while wake_face() runs from
+// the head-touch and wakeword tasks, and both take the (contended) LVGL lock
+// only *after* their exchange — so sleep can win the flag and wake can win the
+// lock, leaving g_face_off false with the backlight at 0. After that every
+// wake_face() early-returns and no tap or wake word can relight the screen.
+// Serialise the whole check-and-act. Deliberately not the LVGL lock itself:
+// dispatch() calls wake_face() for every activity command and its common
+// no-op path must not queue behind a 20 ms avatar update.
+std::mutex g_face_mu;
+
+// Brain commands are parsed on the esp-ml307 "tcp_receive" task, but they must
+// not be *executed* there: apply_look_at ends in ScsServo::getCurrentAngle() /
+// set_angle_impl(), i.e. request/response transactions on the SCS UART bus
+// that the main loop is already driving at 50 Hz from Servo::update(). A
+// ReadPos yields for tens of ms mid-transaction (SCSerial::readSCS delays per
+// byte poll), so a WritePos frame interleaves, both sides fail their
+// checksums, hal_servo's bad-read guard substitutes the stale angle and the
+// spring teleports — a visible head jump plus a dropped pose. The same two
+// tasks were also racing on _angle_anim, which no bus lock would cover. So
+// queue the raw frame here and let the idle loop run it: one task owns
+// StackChan. It also gets apply_set_skin's LVGL rebuild off tcp_receive's
+// 4 KB stack.
+constexpr size_t kMaxQueuedCommands = 16;
+
+std::mutex g_queue_mu;
+std::deque<std::string> g_queue;
 
 Emotion parse_emotion(std::string_view name)
 {
@@ -141,6 +171,7 @@ void apply_set_skin(JsonDocument& doc)
 
 void wake_face()
 {
+    std::lock_guard<std::mutex> face_lock(g_face_mu);
     if (!g_face_off.exchange(false)) return;  // wasn't asleep
     LvglLockGuard lock;
     GetHAL().setBackLightBrightness(g_saved_brightness.load());
@@ -151,6 +182,7 @@ void wake_face()
 
 void sleep_face()
 {
+    std::lock_guard<std::mutex> face_lock(g_face_mu);
     if (g_face_off.exchange(true)) return;  // already asleep
     LvglLockGuard lock;
     uint8_t cur = GetHAL().getBackLightBrightness();
@@ -164,6 +196,33 @@ void sleep_face()
 bool face_is_off()
 {
     return g_face_off.load();
+}
+
+void enqueue(std::string_view json)
+{
+    std::lock_guard<std::mutex> lock(g_queue_mu);
+    if (g_queue.size() >= kMaxQueuedCommands) {
+        // The idle loop drains everything every ~20 ms, so this only fires if
+        // it has stopped running — worth a line in the log either way.
+        mclog::tagWarn(TAG, "command queue full; dropping {}", g_queue.front());
+        g_queue.pop_front();
+    }
+    g_queue.emplace_back(json);
+}
+
+void drain()
+{
+    while (true) {
+        std::string json;
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mu);
+            if (g_queue.empty()) return;
+            json = std::move(g_queue.front());
+            g_queue.pop_front();
+        }
+        // Outside g_queue_mu: dispatch takes the LVGL lock and can block.
+        dispatch(json);
+    }
 }
 
 void dispatch(std::string_view json)

@@ -63,7 +63,7 @@ void RockyAvatar::update()
 {
     Avatar::update();
 
-    if (_overlay_clear_at != 0 && GetHAL().millis() >= _overlay_clear_at) {
+    if (_overlay_duration_ms != 0 && (GetHAL().millis() - _overlay_set_at) >= _overlay_duration_ms) {
         setOverlay(Overlay::None);
     }
 }
@@ -78,6 +78,15 @@ void RockyAvatar::setEmotion(const Emotion& emotion)
 
 void RockyAvatar::setBusy(bool on)
 {
+    // celebrate() and setEmotion() already clear _busy, so this early-out makes
+    // the brain's trailing `set_busy false` a no-op after either of them. That
+    // matters: without it, busy-off repaints from _emotion and hides the
+    // confetti a second into its 3 s life, because the brain only clears busy
+    // when the reply's first sentence lands — one API round trip after the
+    // set_expression("celebrate") that armed it.
+    if (_busy == on) {
+        return;
+    }
     _busy = on;
     if (on) {
         showBody(&rocky_busy);
@@ -88,6 +97,9 @@ void RockyAvatar::setBusy(bool on)
 
 void RockyAvatar::celebrate()
 {
+    if (!_pannel) {
+        return;
+    }
     Avatar::setEmotion(Emotion::Happy);
     _busy = false;
     _pannel->setBgColor(_bg_default);
@@ -95,8 +107,16 @@ void RockyAvatar::celebrate()
     setOverlay(Overlay::Confetti, _confetti_lifetime_ms);
 }
 
+// showBody/setOverlay already guard their own objects; guard _pannel the same
+// way here and in celebrate() so the whole skin follows one convention — the
+// three objects are created together in init(), but nothing enforces that, and
+// the old mix protected the cheap paths while leaving these two bare.
 void RockyAvatar::applyEmotion(const Emotion& emotion)
 {
+    if (!_pannel) {
+        return;
+    }
+
     const lv_image_dsc_t* body = &rocky_neutral;
     Overlay overlay            = Overlay::None;
     lv_color_t bg              = _bg_default;
@@ -146,8 +166,7 @@ void RockyAvatar::setOverlay(Overlay overlay, uint32_t autoClearMs)
 
     if (overlay == Overlay::None) {
         lv_obj_add_flag(_overlay->get(), LV_OBJ_FLAG_HIDDEN);
-        _overlay_kind     = Overlay::None;
-        _overlay_clear_at = 0;
+        _overlay_duration_ms = 0;
         return;
     }
 
@@ -177,6 +196,6 @@ void RockyAvatar::setOverlay(Overlay overlay, uint32_t autoClearMs)
     _overlay->setAlign(align);
     _overlay->setPos(x_ofs, y_ofs);
     lv_obj_remove_flag(_overlay->get(), LV_OBJ_FLAG_HIDDEN);
-    _overlay_kind     = overlay;
-    _overlay_clear_at = (autoClearMs != 0) ? (GetHAL().millis() + autoClearMs) : 0;
+    _overlay_set_at      = GetHAL().millis();
+    _overlay_duration_ms = autoClearMs;
 }

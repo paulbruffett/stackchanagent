@@ -31,6 +31,15 @@ using stackchan::avatar::Emotion;
 // Connection treated as dead if no snapshot in this long (REFERENCE.md ~30s).
 constexpr uint32_t kSnapshotStaleMs = 30000;
 
+// Give up on a passkey display after the SM pairing timeout (30 s) plus slack.
+constexpr uint32_t kPasskeyTimeoutMs = 35000;
+
+// Re-check that we are still advertising this often while no central is up.
+constexpr uint32_t kAdvCheckIntervalMs = 5000;
+
+// Minimum gap between buddy_prompt announcement attempts to the brain.
+constexpr uint32_t kPromptRetryMs = 1000;
+
 // ---- Snapshot state (written from the NimBLE host task, read from tick) ----
 std::atomic<int> g_total{0};
 std::atomic<int> g_running{0};
@@ -45,6 +54,8 @@ std::string g_prompt_tool;  // guarded by g_prompt_mtx
 // Pairing passkey display (set by the passkey hook, drawn by tick).
 std::atomic<bool> g_showing_passkey{false};
 std::atomic<uint32_t> g_passkey{0};
+std::atomic<uint32_t> g_passkey_at_ms{0};
+std::atomic<bool> g_pairing_failed{false};
 
 // Fun lifetime counters reported in status.stats (in-memory, best effort).
 std::atomic<uint32_t> g_appr{0};
@@ -58,6 +69,8 @@ bool g_passkey_drawn = false;
 bool g_prompt_announced = false;  // last buddy_prompt pending state sent to brain
 bool g_last_face_off = false;     // backlight state observed on the previous tick
 bool g_ws_was_connected = false;  // brain-WS state observed on the previous tick
+uint32_t g_last_adv_check_ms = 0;   // last "are we still advertising?" poll
+uint32_t g_last_prompt_try_ms = 0;  // last buddy_prompt announcement attempt
 // Set from the WS/dispatch task when the avatar is swapped (set_skin); consumed
 // by tick() to force a redraw. Atomic because it crosses tasks; g_rendered et al
 // stay tick-only.
@@ -92,13 +105,30 @@ void release_screen(bool resleep)
     g_rendered = Desired::None;
 }
 
+// Tear down the PIN bubble. Separate from release_screen() because buddy never
+// "owns" the face during pairing — but it may still have lit the screen to
+// show the PIN, and nothing else would ever put it back to sleep (the brain
+// believes the device is already asleep, so its timer won't fire again).
+void end_passkey_display()
+{
+    g_showing_passkey.store(false);
+    g_passkey_drawn = false;
+    draw_bubble("");
+    if (g_woke_screen && !g_owns_screen) {
+        commands::sleep_face();
+        g_woke_screen = false;
+    }
+}
+
 // ---- Outbound JSON ----
-void notify_doc(JsonDocument& doc)
+// Returns buddy_nus_notify's rc (0 on success) so callers that commit local
+// state on the strength of a notification can check it.
+int notify_doc(JsonDocument& doc)
 {
     std::string out;
     serializeJson(doc, out);
     out.push_back('\n');
-    buddy_nus_notify(out.data(), static_cast<int>(out.size()));
+    return buddy_nus_notify(out.data(), static_cast<int>(out.size()));
 }
 
 void ack(const char* cmd, bool ok, const char* error = nullptr)
@@ -117,7 +147,7 @@ void send_status()
     doc["ok"] = true;
     JsonObject data = doc["data"].to<JsonObject>();
     data["name"] = "Claude StackChan";
-    data["sec"] = buddy_nus_encrypted();
+    data["sec"] = buddy_nus_authenticated();
     JsonObject bat = data["bat"].to<JsonObject>();
     bat["pct"] = GetHAL().getBatteryLevel();
     bat["usb"] = GetHAL().isBatteryCharging();
@@ -225,7 +255,16 @@ extern "C" void buddy_on_passkey(uint32_t passkey)
 {
     g_passkey.store(passkey);
     g_passkey_drawn = false;
+    g_passkey_at_ms.store(GetHAL().millis());
+    g_pairing_failed.store(false);
     g_showing_passkey.store(true);
+}
+
+extern "C" void buddy_on_pairing_failed(void)
+{
+    // Runs on the NimBLE host task; tick() owns the drawing state, so only
+    // raise the flag and let it tear the PIN bubble down.
+    g_pairing_failed.store(true);
 }
 
 extern "C" void buddy_on_connect(void)
@@ -276,7 +315,14 @@ void approve_pending()
     doc["cmd"] = "permission";
     doc["id"] = id;
     doc["decision"] = "once";
-    notify_doc(doc);
+    int rc = notify_doc(doc);
+    if (rc != 0) {
+        // The desktop never got the decision (link gone, mbuf pool empty).
+        // Leave the prompt up so the bubble stays and the tap is repeatable
+        // rather than logging an approval that did not happen.
+        mclog::tagWarn(TAG, "approve notify failed (rc={}); prompt {} left pending", rc, id);
+        return;
+    }
     g_appr.fetch_add(1);
     g_has_prompt.store(false);  // optimistic; next snapshot confirms
     mclog::tagInfo(TAG, "approved prompt {}", id);
@@ -314,15 +360,24 @@ void tick()
     }
     g_ws_was_connected = ws_now;
 
-    // Pairing passkey display wins until the link is encrypted.
+    // Pairing passkey display wins until the link is authenticated.
     if (g_showing_passkey.load()) {
-        if (buddy_nus_encrypted()) {
-            g_showing_passkey.store(false);
-            draw_bubble("");
-            g_passkey_drawn = false;
+        if (buddy_nus_authenticated()) {
+            end_passkey_display();
+        } else if (g_pairing_failed.load()
+                   || now - g_passkey_at_ms.load() > kPasskeyTimeoutMs) {
+            // Pairing failed or never finished, and NimBLE keeps the ACL up —
+            // so without an exit the stale PIN stays on screen and tick()
+            // returns below on every iteration, which also freezes the
+            // buddy_prompt edge announcement to the brain.
+            mclog::tagWarn(TAG, "pairing did not complete; clearing PIN display");
+            end_passkey_display();
         } else {
             if (!g_passkey_drawn) {
-                commands::wake_face();
+                if (commands::face_is_off()) {
+                    commands::wake_face();
+                    g_woke_screen = true;
+                }
                 char buf[20];
                 std::snprintf(buf, sizeof(buf), "PIN %06u",
                               static_cast<unsigned>(g_passkey.load()));
@@ -331,6 +386,14 @@ void tick()
             }
             return;
         }
+    }
+
+    // Advertising is otherwise only re-armed on GAP edges, and every failure
+    // path there just logs — one lost ble_gap_adv_start() would leave the
+    // buddy link dead until a power cycle, with no indicator anywhere.
+    if (now - g_last_adv_check_ms >= kAdvCheckIntervalMs) {
+        g_last_adv_check_ms = now;
+        buddy_nus_ensure_advertising();
     }
 
     // A live conversation always wins; yield without sleeping.
@@ -356,10 +419,19 @@ void tick()
     // out from under an unanswered approve prompt; while pending it uses an
     // elongated timeout instead. Edge-triggered to avoid spamming the WS.
     bool pending = (desired == Desired::Waiting);
-    if (pending != g_prompt_announced) {
-        transport::send_event_json(pending ? "{\"event\":\"buddy_prompt\",\"pending\":true}"
-                                           : "{\"event\":\"buddy_prompt\",\"pending\":false}");
-        g_prompt_announced = pending;
+    if (pending != g_prompt_announced && now - g_last_prompt_try_ms >= kPromptRetryMs) {
+        // Only commit the edge if the brain actually heard it; otherwise we
+        // would believe we had announced a pending prompt it never learned
+        // about, which is exactly the "sleeps under an unanswered prompt"
+        // divergence the WS-reconnect reset above exists to prevent. Retried,
+        // but not at the 50 Hz tick rate — send_event_json can block on a
+        // half-dead socket and this runs on the main loop.
+        g_last_prompt_try_ms = now;
+        if (transport::send_event_json(pending
+                                           ? "{\"event\":\"buddy_prompt\",\"pending\":true}"
+                                           : "{\"event\":\"buddy_prompt\",\"pending\":false}")) {
+            g_prompt_announced = pending;
+        }
     }
 
     if (desired == g_rendered) return;

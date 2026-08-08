@@ -33,8 +33,16 @@ void buddy_nus_init(buddy_line_cb_t on_line);
 /* True once a central is connected (regardless of encryption). */
 bool buddy_nus_connected(void);
 
-/* True once the current connection's link is encrypted (bonded/paired). */
-bool buddy_nus_encrypted(void);
+/* True once the current link is encrypted *and* MITM-authenticated, i.e. the
+ * peer went through the displayed passkey. Encryption alone is not enough: a
+ * central declaring NoInputNoOutput negotiates Just Works, which encrypts
+ * without ever showing a PIN. This is what gates NUS RX writes. */
+bool buddy_nus_authenticated(void);
+
+/* Re-arm advertising if it has stopped while no central is connected. Cheap
+ * and idempotent; call periodically (see buddy_ble.cpp tick()) because every
+ * buddy_advertise() failure path inside the GAP callbacks only logs. */
+void buddy_nus_ensure_advertising(void);
 
 /* Send one line to the desktop over NUS TX (notification). The caller must
  * include the trailing '\n'. Returns 0 on success. No-op (returns nonzero)
@@ -49,6 +57,10 @@ void buddy_nus_unpair(void);
 /* DisplayOnly pairing: show this 6-digit passkey to the user so they can
  * type it into the desktop app. */
 void buddy_on_passkey(uint32_t passkey);
+
+/* Pairing did not complete (wrong PIN, peer aborted, SM timeout). The link
+ * stays up, so without this the passkey stays on screen forever. */
+void buddy_on_pairing_failed(void);
 
 /* Central connected / disconnected — lets the C++ layer reset protocol
  * state (snapshot atomics, pending prompt) on link changes. */

@@ -58,9 +58,12 @@ private:
     std::unique_ptr<uitk::lvgl_cpp::Image> _body;
     std::unique_ptr<uitk::lvgl_cpp::Image> _overlay;
 
-    Overlay _overlay_kind     = Overlay::None;
-    uint32_t _overlay_clear_at = 0;  // 0 = no auto-clear
-    bool _busy                = false;
+    // Elapsed-since form, not an absolute deadline: Hal::millis() is a uint32
+    // that wraps every ~49.7 days and this device is meant to run unattended
+    // for weeks. Unsigned subtraction stays correct across the wrap.
+    uint32_t _overlay_set_at      = 0;
+    uint32_t _overlay_duration_ms = 0;  // 0 = no auto-clear
+    bool _busy                    = false;
 };
 
 }  // namespace stackchan::avatar
