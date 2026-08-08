@@ -2,7 +2,10 @@
 name = "stackchan-brain"
 version = "0.1.0"
 description = "Jetson-side agent for the M5StackChan refactor"
-requires-python = ">=3.11"
+# 3.12 exactly, not 3.11+: the locally-built CUDA ctranslate2 wheel pinned in
+# [tool.uv.sources] is cp312-only, so a >=3.11 floor makes uv fork the
+# resolution onto a 3.11 branch that no ctranslate2 satisfies.
+requires-python = ">=3.12"
 dependencies = [
     "websockets>=12.0",
     "anthropic>=0.40.0",

@@ -90,7 +90,9 @@ if [ "$need_sync" -eq 1 ]; then
         log "dependency manifests changed — uv sync"
         # --frozen: install exactly what uv.lock says, never re-resolve. Keeps
         # the deploy checkout clean and makes the installed set reproducible.
-        ( cd "$REPO/brain" && timeout 900 "$UV" sync --frozen ) ||
+        # --extra dev: the device keeps pytest/ruff, so `python -m pytest` works
+        # over SSH and an auto-sync doesn't silently uninstall them.
+        ( cd "$REPO/brain" && timeout 900 "$UV" sync --frozen --extra dev ) ||
             log "uv sync FAILED — starting with the venv as-is"
     else
         log "uv not found at $UV — skipping dependency sync"

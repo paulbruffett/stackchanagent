@@ -17,10 +17,14 @@ cd brain
 uv sync   # auto-fetches CPython 3.12 if the system Python is older
 ```
 
-Python 3.11+ is required (`onnxruntime`, pulled in by `piper-tts`,
-dropped 3.10 wheels). On Jetson Ubuntu 22.04 the system Python is 3.10,
-so `uv` downloads a managed `python-build-standalone` aarch64 build —
-the system Python is left untouched.
+Python 3.12 is required — `onnxruntime` (pulled in by `piper-tts`) dropped
+3.10 wheels, and the locally-built CUDA `ctranslate2` wheel is cp312-only.
+On Jetson Ubuntu 22.04 the system Python is 3.10, so `uv` downloads a
+managed `python-build-standalone` aarch64 build — the system Python is
+left untouched.
+
+`uv.lock` is resolved **on the Jetson**, since the `ctranslate2` pin is an
+aarch64 path wheel. Re-lock there, not on the Mac.
 
 Or with plain pip:
 
