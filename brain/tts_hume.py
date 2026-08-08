@@ -38,6 +38,19 @@ HUME_TTS_URL = "https://api.hume.ai/v0/tts/stream/json"
 # Hume streams 16-bit mono PCM at 48 kHz when format.type == "pcm".
 HUME_SR = 48000
 
+# Wall-clock cap on one sentence's stream. httpx's read timeout is per socket
+# read, so a dribbling stream refreshes it forever and the turn hangs with the
+# device stuck in SPEAKING. Generous on purpose: a long sentence legitimately
+# takes several seconds, and cutting one short only trades dead air for a Piper
+# fallback mid-reply (an audible voice flip).
+STREAM_BUDGET_S = 20.0
+
+# How long a generation_id stays worth resending as prosody context. Hume's
+# context is for continuity within a conversation; carrying one across an idle
+# gap buys nothing and risks the server rejecting an id it has aged out — which
+# would poison every later sentence, since the id is only replaced on success.
+CONTEXT_TTL_S = 300.0
+
 # Default acting instructions for the Rocky persona's voice. Steers prosody
 # only — the grammar/word-choice lives in claude_agent.DEFAULT_ROCKY_PROMPT.
 DEFAULT_DESCRIPTION = "Alien engineer. Broken English. Deliberate. Warm but strange."
@@ -67,6 +80,7 @@ class HumeSynthesizer:
         # Carried across sentences within a conversation for prosody
         # continuity (Hume "context"). Best-effort; reset() clears it.
         self._last_generation_id: str | None = None
+        self._last_generation_s: float = 0.0
 
     @property
     def available(self) -> bool:
@@ -76,8 +90,10 @@ class HumeSynthesizer:
 
     def reset(self) -> None:
         """Forget the rolling generation_id so the next utterance starts a
-        fresh prosody context (call at conversation boundaries)."""
+        fresh prosody context (called at conversation boundaries: an idle gap
+        longer than CONTEXT_TTL_S, and any failed request)."""
         self._last_generation_id = None
+        self._last_generation_s = 0.0
 
     def _voice(self) -> dict[str, str]:
         if self.voice_id:
@@ -93,7 +109,18 @@ class HumeSynthesizer:
             raise RuntimeError("hume unavailable: no API key or voice configured")
 
         if self._client is None:
-            self._client = httpx.Client(timeout=30.0)
+            # Split, tighter budget than the old blanket 30 s: this call sits
+            # in the speaking path, so every second spent waiting on a dead
+            # Hume is a second the device holds the SPEAKING face in silence.
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+            )
+
+        t0 = time.monotonic()
+        # An id from before the last idle gap is no longer prosody continuity,
+        # just an id the server may have aged out.
+        if self._last_generation_id and t0 - self._last_generation_s > CONTEXT_TTL_S:
+            self.reset()
 
         utterance: dict[str, object] = {
             "text": text,
@@ -110,31 +137,53 @@ class HumeSynthesizer:
         if self._last_generation_id:
             body["context"] = {"generation_id": self._last_generation_id}
 
-        t0 = time.monotonic()
         pcm = bytearray()
         gen_id: str | None = None
-        with self._client.stream(
-            "POST",
-            HUME_TTS_URL,
-            headers={"X-Hume-Api-Key": self.api_key},
-            json=body,
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                obj = json.loads(line)
-                audio_b64 = obj.get("audio")
-                if audio_b64:
-                    pcm += base64.standard_b64decode(audio_b64)
-                if obj.get("generation_id"):
-                    gen_id = obj["generation_id"]
+        try:
+            with self._client.stream(
+                "POST",
+                HUME_TTS_URL,
+                headers={"X-Hume-Api-Key": self.api_key},
+                json=body,
+            ) as resp:
+                if resp.status_code >= 400:
+                    # A streamed response carries no body yet; read it so the
+                    # fallback log says *why* Hume refused (quota, unknown
+                    # voice, rejected context) and not just a status code.
+                    resp.read()
+                    raise RuntimeError(
+                        f"hume http {resp.status_code}: {resp.text[:200]}"
+                    )
+                for line in resp.iter_lines():
+                    # The read timeout is per socket read, so a stream that
+                    # dribbles one chunk every few seconds refreshes it
+                    # indefinitely. This is the only wall-clock bound.
+                    if time.monotonic() - t0 > STREAM_BUDGET_S:
+                        raise RuntimeError(
+                            f"hume stream exceeded {STREAM_BUDGET_S:.0f}s budget"
+                        )
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    audio_b64 = obj.get("audio")
+                    if audio_b64:
+                        pcm += base64.standard_b64decode(audio_b64)
+                    if obj.get("generation_id"):
+                        gen_id = obj["generation_id"]
 
-        if not pcm:
-            raise RuntimeError("hume returned no audio")
+            if not pcm:
+                raise RuntimeError("hume returned no audio")
+        except Exception:
+            # Drop the prosody context on any failure. It is only ever
+            # *replaced* on success, so a stale or rejected id kept here would
+            # be resent on the next sentence, and the next — one bad request
+            # demoting the Rocky voice to Piper for the rest of the process.
+            self.reset()
+            raise
 
         if gen_id:
             self._last_generation_id = gen_id
+            self._last_generation_s = time.monotonic()
 
         pcm_int16 = np.frombuffer(bytes(pcm), dtype=np.int16)
         pcm_int16 = resample_to_16k(pcm_int16, HUME_SR)
