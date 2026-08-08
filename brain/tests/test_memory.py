@@ -155,3 +155,63 @@ def test_fresh_db_is_stamped_at_head_without_running_migrations(tmp_path, monkey
     assert m._conn.execute("PRAGMA user_version").fetchone()[0] == 1
     assert "nope" not in {r[1] for r in m._conn.execute("PRAGMA table_info(turns)")}
     m.close()
+
+
+# --- episodic retention: the only path that hard-deletes conversation rows ---
+# prune_summaries runs automatically after every background fold, so a bad
+# cutoff silently destroys history the user still expects to be remembered.
+
+def _turns(mem, n):
+    return mem.append_turns([
+        {"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+        for i in range(n)
+    ])
+
+
+def test_prune_summaries_drops_only_the_oldest_spans(mem):
+    ids = _turns(mem, 5)
+    mem.save_summary(ids[0], ids[1], "oldest")
+    mem.save_summary(ids[2], ids[3], "newer")
+    assert mem.unsummarized_count() == 1  # save_summary marked both spans
+
+    assert mem.prune_summaries(1) == (1, 2)  # (summaries, turns) deleted
+    assert [s.summary for s in mem.list_summaries()] == ["newer"]
+    # The kept summary's rows and the live verbatim tail both survive.
+    assert [t.id for t in mem.recent_turns()] == ids[2:]
+    assert [t.id for t in mem.list_unsummarized_turns()] == [ids[4]]
+
+
+def test_prune_summaries_keep_recent_zero_keeps_everything(mem):
+    ids = _turns(mem, 2)
+    mem.save_summary(ids[0], ids[1], "only")
+    assert mem.prune_summaries(0) == (0, 0)
+    assert len(mem.list_summaries()) == 1
+    assert [t.id for t in mem.recent_turns()] == ids
+
+
+def test_prune_summaries_spares_un_summarized_turns_below_the_cutoff(mem):
+    # A web-UI delete_summary puts its span back into verbatim replay, which
+    # leaves live turns BELOW a later prune's cutoff. Only the `summarized = 1`
+    # clause stops the next automatic fold from hard-deleting them.
+    ids = _turns(mem, 8)
+    mem.save_summary(ids[0], ids[1], "s1")
+    middle = mem.save_summary(ids[2], ids[3], "s2")
+    mem.save_summary(ids[4], ids[5], "s3")
+    mem.save_summary(ids[6], ids[7], "s4")
+    assert mem.delete_summary(middle) is True
+    assert [t.id for t in mem.list_unsummarized_turns()] == ids[2:4]
+
+    assert mem.prune_summaries(1) == (2, 4)  # s1 + s3 and their rows
+    assert [t.id for t in mem.recent_turns()] == ids[2:4] + ids[6:]
+
+
+def test_merge_facts_dedupes_case_insensitively(mem):
+    mem.add_fact("Paul likes coffee")
+    added = mem.merge_facts([
+        "paul LIKES coffee",      # already known, different case
+        "   ",                    # blank
+        "Paul lives in Seattle",
+        "paul lives in seattle",  # duplicate within the same batch
+    ])
+    assert added == 1
+    assert mem.list_facts() == ["Paul likes coffee", "Paul lives in Seattle"]
