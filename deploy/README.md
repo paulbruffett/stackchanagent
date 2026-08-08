@@ -47,20 +47,38 @@ systemctl --user start stackchan-brain       # resets to origin/main again
 
 On each start, `update-brain.sh`:
 
-1. Skips entirely if it already fetched in the last 60 s (a crash loop under
-   `Restart=always` must not become a fetch loop).
+1. Skips the git half if it already fetched in the last 60 s (a crash loop under
+   `Restart=always` must not become a fetch loop). The venv check in step 4 runs
+   regardless — a broken venv has to be repairable on a restart, and on a boot
+   where origin is unreachable.
 2. `git fetch origin <branch>`, retrying for ~30 s — the user manager has no
-   `network-online.target` to order against and DHCP may not be up yet.
-3. `git checkout -f <branch> && git reset --hard origin/<branch>`. **The
-   checkout is a deploy target, not a workspace**: local edits to tracked files
-   are discarded. Untracked/ignored files survive — `.env`,
-   `brain/.venv/`, `brain/wheels/*.whl` — and runtime state lives in
-   `~/.stackchan/memory.db`, outside the repo.
-4. `uv sync --frozen` only if `brain/pyproject.toml` or `brain/uv.lock` changed
-   between the old and new HEAD (or the venv is missing).
+   `network-online.target` to order against and DHCP may not be up yet. The
+   cooldown stamp is armed before the ladder, so a failed fetch is throttled
+   the same as a successful one.
+3. `git checkout -f <branch> && git reset --hard origin/<branch>`, after
+   clearing a `.git/index.lock` older than 5 minutes (a power cut mid-reset
+   leaves one behind and every later checkout fails on it). **The checkout is a
+   deploy target, not a workspace**: local edits to tracked files are discarded.
+   Untracked/ignored files survive — `.env`, `brain/.venv/`,
+   `brain/wheels/*.whl` — and runtime state lives in `~/.stackchan/memory.db`,
+   outside the repo.
+4. `uv sync --frozen` unless `brain/.venv/.stackchan-sync-ok` matches the hash
+   of `brain/pyproject.toml` + `brain/uv.lock`. That stamp is written only by a
+   sync that ran to completion: `uv` creates `.venv/bin/python` before it
+   installs anything into it, so "the interpreter exists" does not mean the
+   dependencies are there, and an interrupted sync must re-run on the next
+   start rather than crash-looping on `ImportError` forever.
 
 Every step is non-fatal. No network, unreachable origin, failed sync — it logs
-and starts the brain on whatever is already on disk.
+and starts the brain on whatever is already on disk. Nothing is permanently
+given up on either: each failure is retried on the next start, and the unit has
+**no start limit** (`StartLimitIntervalSec=0`, `RestartSec=30`) so it can never
+land in `failed` with nobody around to run `systemctl --user reset-failed`.
+
+When the git half fails, `~/.stackchan/update-failed` holds
+`<first-failure> <last-failure> <reason>` — this host's journal is volatile, so
+that file is the only way to tell a bad night from three weeks of a frozen
+checkout. It is removed on the next successful update.
 
 ## Ports
 
