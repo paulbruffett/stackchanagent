@@ -60,12 +60,32 @@ class Synthesizer:
         if self._voice is None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             onnx = self.cache_dir / f"{self.voice_name}.onnx"
-            if not onnx.exists():
+            # PiperVoice.load also reads <voice>.onnx.json, and download_voice
+            # writes the two as separate non-atomic files. Gating the download
+            # on the .onnx alone makes a power cut mid-fetch permanent: the
+            # guard says "downloaded", the load raises on the missing config,
+            # and nothing ever re-downloads — leaving the robot mute, since
+            # Piper is also the fallback for every Hume failure.
+            cfg = onnx.with_name(onnx.name + ".json")
+            if not (onnx.exists() and cfg.exists()):
                 log.info("downloading piper voice %s …", self.voice_name)
                 download_voice(self.voice_name, self.cache_dir)
             log.info("loading piper voice %s", self.voice_name)
             t0 = time.monotonic()
-            self._voice = PiperVoice.load(onnx)
+            try:
+                self._voice = PiperVoice.load(onnx)
+            except Exception:
+                # A truncated .onnx still passes the existence check, so try
+                # a clean re-download once rather than raising per sentence
+                # for the rest of the machine's life.
+                log.warning(
+                    "piper voice %s failed to load — re-downloading",
+                    self.voice_name, exc_info=True,
+                )
+                onnx.unlink(missing_ok=True)
+                cfg.unlink(missing_ok=True)
+                download_voice(self.voice_name, self.cache_dir)
+                self._voice = PiperVoice.load(onnx)
             log.info("piper loaded in %.1fs", time.monotonic() - t0)
         return self._voice
 

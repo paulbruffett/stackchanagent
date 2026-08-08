@@ -51,6 +51,11 @@ class ToolContext:
     # are namespaced `a2a__<server>__<agent>` and routed here before the
     # native tool ladder below. None if A2A is disabled/unavailable.
     a2a: Any = None
+    # Set by the end_conversation tool, reset by AgentSession at the start of
+    # each exchange. Without it the tool is inert: the caller decides whether
+    # to hold the mic open purely on "the reply was non-empty", and a goodbye
+    # is non-empty, so the follow-up window opened anyway.
+    conversation_ended: bool = False
 
 
 # Schemas exposed to Claude. Keep tight — descriptions are what drive
@@ -212,12 +217,34 @@ async def _describe_view(ctx: ToolContext, prompt: str) -> str:
     return text or "I couldn't make out the scene."
 
 
+# Ceiling on a single tool_result. An MCP server, an A2A agent, or anything
+# upstream of them can hand back an arbitrarily large blob, and it is not just
+# one turn's problem: the result is committed to durable history, replayed on
+# every following turn, and rendered again into the summarizer transcript — so
+# an oversized one wedges the very fold that would have cleared it. 8k chars is
+# far more than a reply this robot speaks aloud can use.
+MAX_TOOL_RESULT_CHARS = 8000
+
+
 async def dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
 ) -> str:
     """Send a tool's JSON command to the firmware (or run the brain-local
     handler). Returns the tool_result content string for the next agent
-    turn."""
+    turn, clamped to MAX_TOOL_RESULT_CHARS."""
+    result = await _dispatch(name, input_, ctx)
+    if len(result) > MAX_TOOL_RESULT_CHARS:
+        log.warning(
+            "tool %s returned %d chars — truncated to %d",
+            name, len(result), MAX_TOOL_RESULT_CHARS,
+        )
+        return result[:MAX_TOOL_RESULT_CHARS] + "\n… (truncated)"
+    return result
+
+
+async def _dispatch(
+    name: str, input_: dict[str, Any], ctx: ToolContext
+) -> str:
     # MCP (Phase 9b) and A2A (Phase 9c) tools take priority — they're
     # namespaced (`mcp__…` / `a2a__…`) so they can't collide with the
     # native tools below.
@@ -258,7 +285,10 @@ async def dispatch(
         log.info("persona mode → %s", mode)
         return f"Persona mode set to {mode}."
     if name == "end_conversation":
-        # No firmware-side cmd needed; the agent's reply is the goodbye.
+        # No firmware-side cmd needed; the agent's reply is the goodbye. The
+        # flag is what actually ends the conversation — the caller reads it
+        # after the turn and skips the follow-up window.
+        ctx.conversation_ended = True
         return "Conversation ended."
     log.warning("unknown tool: %s", name)
     return f"Unknown tool {name}"

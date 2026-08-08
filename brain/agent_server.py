@@ -368,8 +368,10 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     await ws.send(json.dumps({"cmd": "stop_listening"}))
 
     if get_config().get("STT_DEBUG_DUMP"):
-        _dump_capture(pcm)
-    transcript = stt.transcribe(pcm)
+        # Whole-file WAV write; off the loop like every other blocking call
+        # here, so turning the debug dump on doesn't stall the console/mDNS.
+        await asyncio.to_thread(_dump_capture, pcm)
+    transcript = await stt.transcribe(pcm)
     if not transcript.text:
         log.info("empty transcript — going idle")
         return
@@ -411,16 +413,19 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
+    # Per-turn observer, not a slot on the session: a greeting turn can be in
+    # flight against the same AgentSession (it blocks on the turn lock inside
+    # respond*), and a shared slot let this turn collect the greeting's tool
+    # calls and then publish its own as empty.
+    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    try:
-        if follow_up_turn:
-            run = lambda spk: agent.respond_follow_up(transcript.text, spk)
-        else:
-            run = lambda spk: agent.respond(transcript.text, spk)
-        speak_text = await _drive_agent_turn(ws, state, run)
-    finally:
-        agent.on_tool = None
+    if follow_up_turn:
+        run = lambda spk: agent.respond_follow_up(
+            transcript.text, spk, on_tool=on_tool
+        )
+    else:
+        run = lambda spk: agent.respond(transcript.text, spk, on_tool=on_tool)
+    speak_text = await _drive_agent_turn(ws, state, run)
     total_ms = int((time.monotonic() - t0) * 1000)
     log.info("agent turn: %d ms total, %r", total_ms, speak_text[:120])
     publish_turn({
@@ -437,8 +442,12 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     state.last_activity_s = time.monotonic()
 
     # If the agent chose to stay silent (typical on a follow-up that
-    # wasn't directed at us), close out — no further window.
-    if speak_text.strip():
+    # wasn't directed at us), close out — no further window. Same for an
+    # explicit end_conversation: the user said goodbye, so holding the mic
+    # open for another FOLLOW_UP_WINDOW_S is exactly what they didn't ask for.
+    if agent.conversation_ended:
+        log.info("agent ended the conversation — re-arming wakeword")
+    elif speak_text.strip():
         await _open_follow_up_window(ws, state)
     else:
         log.info("agent stayed silent — ending conversation, re-arming wakeword")
@@ -470,8 +479,12 @@ async def _open_follow_up_window(ws: ServerConnection, state: ConnState) -> None
     await ws.send(json.dumps({"cmd": "start_listening"}))
     log.info("follow-up window opened (%.1fs)", get_config().get("FOLLOW_UP_WINDOW_S"))
 
-    state.follow_up_timeout = asyncio.create_task(
-        _follow_up_timeout_task(ws, state)
+    # Through spawn() even though we track and cancel this one ourselves: it
+    # ends in a `ws.send` on a socket that may have died since, and a bare
+    # create_task turns that ConnectionClosed into a context-free "Task
+    # exception was never retrieved" at GC time.
+    state.follow_up_timeout = spawn(
+        _follow_up_timeout_task(ws, state), "follow_up_timeout"
     )
 
 
@@ -608,25 +621,32 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
         return
 
     state.last_greeting_s = now
+    # A greeting is an interaction, so it has to defer sleep like any other
+    # turn — otherwise a face arriving just before SLEEP_TIMEOUT_S expires
+    # gets greeted and then watches the screen go dark on the next camera
+    # frame. last_user_interaction_s is deliberately NOT touched: that one
+    # gates greetings and must stay driven by the user, not by us.
+    state.last_activity_s = now
     log.info("proactive greeting: new face")
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
+    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    try:
-        speak_text = await _drive_agent_turn(
-            ws,
-            state,
-            lambda spk: agent.respond_to_event(
-                "A new person just appeared in front of you. Greet them in one "
-                "short, friendly sentence.",
-                spk,
-            ),
-        )
-    finally:
-        agent.on_tool = None
+    speak_text = await _drive_agent_turn(
+        ws,
+        state,
+        lambda spk: agent.respond_to_event(
+            "A new person just appeared in front of you. Greet them in one "
+            "short, friendly sentence.",
+            spk,
+            on_tool=on_tool,
+        ),
+    )
     total_ms = int((time.monotonic() - t0) * 1000)
+    # Re-stamp after the turn: the greeting itself can run for seconds, and
+    # the sleep check that matters is the one on the next camera frame.
+    state.last_activity_s = time.monotonic()
     log.info("greet turn: %d ms, %r", total_ms, speak_text[:120])
     publish_turn({
         "ts": time.time(),
@@ -710,6 +730,14 @@ async def handle(ws: ServerConnection) -> None:
                 if not state.listening:
                     continue
                 frame = msg[1:]
+                if len(frame) % 2:
+                    # np.frombuffer(int16) raises on a partial sample, which
+                    # would escape the message loop and drop the connection.
+                    # Our firmware always sends whole frames, so this is a
+                    # malformed peer on the open port, not us.
+                    log.warning("dropping odd-length audio frame (%d bytes)",
+                                len(frame))
+                    continue
                 state.speech_buf.extend(frame)
                 cfg = get_config()
                 rms = frame_rms(frame)
@@ -801,8 +829,13 @@ async def handle(ws: ServerConnection) -> None:
                     state.buddy_prompt_pending = bool(payload.get("pending"))
                     log.info("buddy prompt pending: %s", state.buddy_prompt_pending)
             elif isinstance(msg, bytes):
+                # A zero-length binary frame is legal WebSocket and lands here
+                # (both opcode branches require a non-empty msg). Log arguments
+                # are evaluated eagerly, so an unguarded msg[0] would IndexError
+                # out of the message loop and tear the connection down.
                 log.warning(
-                    "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)
+                    "unknown binary frame: opcode %s, %d bytes",
+                    f"0x{msg[0]:02x}" if msg else "none", len(msg),
                 )
             else:
                 log.warning("unexpected frame type: %r", type(msg).__name__)
@@ -811,6 +844,13 @@ async def handle(ws: ServerConnection) -> None:
     finally:
         if state.agent is not None:
             live_sessions.discard(state.agent)
+        # The follow-up timer outlives the socket otherwise: it wakes up to
+        # FOLLOW_UP_WINDOW_S later, mutates a ConnState nothing owns any more
+        # (pinning its AgentSession and speech buffer alive with it) and then
+        # sends stop_listening down a dead connection. An in-flight turn is
+        # deliberately left to finish — cancelling it at an arbitrary await is
+        # how the M6.1 half-written tool_use corruption happens.
+        _cancel_follow_up_timeout(state)
         log.info("esp32 disconnected")
 
 
@@ -972,6 +1012,12 @@ async def main() -> None:
         device=cfg.get("STT_DEVICE"),
         compute_type=cfg.get("STT_COMPUTE_TYPE"),
     )
+    # Pull the whisper load off the first utterance. The Jetson restarts the
+    # brain on every deploy, so "first utterance" is a routine event, and the
+    # load is seconds of dead air on top of a turn the user is waiting on.
+    # Background, not awaited: the socket should be accepting connections
+    # while the model comes up.
+    spawn(stt.warm(), "stt_warm")
 
     # MCP servers (Phase 9b): seed the two local servers on first run so
     # weather works out of the box and Hue is one toggle + .env away.

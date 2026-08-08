@@ -113,6 +113,18 @@ CREATE TABLE IF NOT EXISTS a2a_servers (
 );
 """
 
+# Ordered schema upgrades for a DB that already exists; entry i takes
+# user_version i to i+1. Empty so far because every schema change to date has
+# been a whole new TABLE, which the CREATE TABLE IF NOT EXISTS pass above adds
+# on its own. A new COLUMN is the case that does NOT work that way: IF NOT
+# EXISTS skips the whole statement on a table that already exists, so the
+# deployed ~/.stackchan/memory.db would simply never get the column while every
+# fresh test DB does — and the first SELECT naming it raises `no such column`
+# inside Memory()/repair_memory at startup, before either port binds, leaving a
+# systemd restart loop and no console to fix it from. Put such changes here as
+# ALTER TABLE statements and add the column to SCHEMA as well.
+MIGRATIONS: list[str] = []
+
 
 @dataclass(frozen=True)
 class Turn:
@@ -167,8 +179,34 @@ class Memory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
+        self._migrate()
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an existing DB up to the current schema version, then stamp
+        PRAGMA user_version. A brand-new file needs no migration — SCHEMA is
+        always the current shape — so it is only stamped, which is what stops a
+        later migration from re-running an ALTER on a table that already has
+        the column. Runs before SCHEMA so a migration sees the old shape."""
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        fresh = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()["n"] == 0
+        if not fresh:
+            for i in range(version, len(MIGRATIONS)):
+                log.info("migrating memory.db schema: %d → %d", i, i + 1)
+                try:
+                    self._conn.executescript(MIGRATIONS[i])
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+        if version != len(MIGRATIONS):
+            # PRAGMA takes no bound parameters; len() of a module constant is
+            # not injectable.
+            self._conn.execute(f"PRAGMA user_version = {len(MIGRATIONS)}")
+            self._conn.commit()
 
     def append_turn(self, role: str, content: Any) -> int:
         """Append a Claude message. Returns the new turn id."""
@@ -241,6 +279,17 @@ class Memory:
         self._conn.commit()
         return cur.rowcount
 
+    def delete_unsummarized_turns(self) -> int:
+        """Hard-delete the whole unsummarized (verbatim-replayed) tail,
+        returning the number deleted. The durable counterpart of the agent's
+        in-memory truncation after an unrecoverable over-length 400: those rows
+        can never be sent to the API again, so leaving them on disk only makes
+        the next session re-hydrate them and get rejected again. Summarized
+        rows — already folded into a summary — are untouched."""
+        cur = self._conn.execute("DELETE FROM turns WHERE summarized = 0")
+        self._conn.commit()
+        return cur.rowcount
+
     def unsummarized_count(self) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM turns WHERE summarized = 0"
@@ -262,16 +311,23 @@ class Memory:
         ]
 
     def save_summary(self, span_from: int, span_to: int, summary: str) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO summaries(ts, summary, span_from, span_to) "
-            "VALUES (?, ?, ?, ?)",
-            (time.time(), summary, span_from, span_to),
-        )
-        self._conn.execute(
-            "UPDATE turns SET summarized = 1 WHERE id BETWEEN ? AND ?",
-            (span_from, span_to),
-        )
-        self._conn.commit()
+        # Insert + mark are one unit: a summary whose turns stayed unsummarized
+        # would be replayed twice, and marked turns with no summary row would
+        # be silently dropped from history.
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO summaries(ts, summary, span_from, span_to) "
+                "VALUES (?, ?, ?, ?)",
+                (time.time(), summary, span_from, span_to),
+            )
+            self._conn.execute(
+                "UPDATE turns SET summarized = 1 WHERE id BETWEEN ? AND ?",
+                (span_from, span_to),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return cur.lastrowid
 
     def update_summary(self, summary_id: int, summary: str) -> bool:
@@ -294,13 +350,17 @@ class Memory:
         ).fetchone()
         if row is None:
             return False
-        self._conn.execute("DELETE FROM summaries WHERE id = ?", (summary_id,))
-        if unmark_turns:
-            self._conn.execute(
-                "UPDATE turns SET summarized = 0 WHERE id BETWEEN ? AND ?",
-                (row["span_from"], row["span_to"]),
-            )
-        self._conn.commit()
+        try:
+            self._conn.execute("DELETE FROM summaries WHERE id = ?", (summary_id,))
+            if unmark_turns:
+                self._conn.execute(
+                    "UPDATE turns SET summarized = 0 WHERE id BETWEEN ? AND ?",
+                    (row["span_from"], row["span_to"]),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return True
 
     def prune_summaries(self, keep_recent: int) -> tuple[int, int]:
@@ -308,12 +368,8 @@ class Memory:
         `keep_recent` summaries; permanently purge older ones AND the raw
         turn rows they covered. Returns (summaries_deleted, turns_deleted).
 
-        `keep_recent <= 0` is a no-op (keep everything). Spans are
-        contiguous oldest-first and never overlap (each fold takes the
-        oldest chunk — see save_summary / delete_summary), so the doomed
-        summaries' turns are exactly `turns.id <= max(span_to)` among the
-        already-summarized rows; the live verbatim tail (summarized = 0)
-        is untouched."""
+        `keep_recent <= 0` is a no-op (keep everything). The live verbatim
+        tail (summarized = 0) is never touched."""
         if keep_recent <= 0:
             return (0, 0)
         doomed = self._conn.execute(
@@ -324,6 +380,19 @@ class Memory:
             return (0, 0)
         ids = [r["id"] for r in doomed]
         cutoff = max(r["span_to"] for r in doomed)
+        # Summary id order does NOT reliably track span order: deleting a
+        # middle summary in the console un-marks its turns, and the next fold
+        # re-summarizes them into a row with the highest id but the lowest
+        # span. Taking the cutoff from the doomed set alone then reaches past a
+        # RETAINED summary and hard-deletes the raw turns it still covers. Stop
+        # short of the oldest span we are keeping — an invariant that holds
+        # whatever order the ids ended up in.
+        kept = self._conn.execute(
+            "SELECT span_from FROM summaries ORDER BY id DESC LIMIT ?",
+            (keep_recent,),
+        ).fetchall()
+        if kept:
+            cutoff = min(cutoff, min(r["span_from"] for r in kept) - 1)
         try:
             tcur = self._conn.execute(
                 "DELETE FROM turns WHERE summarized = 1 AND id <= ?", (cutoff,)
@@ -346,10 +415,21 @@ class Memory:
         self._conn.commit()
         return cur.lastrowid
 
-    def list_facts(self) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT fact FROM known_facts ORDER BY id"
-        ).fetchall()
+    def list_facts(self, limit: int | None = None) -> list[str]:
+        """Facts oldest-first — the order they are injected into the prompt.
+        `limit` (> 0) keeps only the newest `limit` of them, still oldest-first:
+        the fact set only ever grows and ships in the system block on every
+        turn, so the PROMPT is bounded on the read path rather than evicting
+        rows, which would silently destroy permanent memory."""
+        if limit is not None and limit > 0:
+            rows = self._conn.execute(
+                "SELECT fact FROM known_facts ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            rows.reverse()
+        else:
+            rows = self._conn.execute(
+                "SELECT fact FROM known_facts ORDER BY id"
+            ).fetchall()
         return [r["fact"] for r in rows]
 
     def list_fact_rows(self) -> list[Fact]:
@@ -399,17 +479,25 @@ class Memory:
         existing = {f.casefold() for f in self.list_facts()}
         added = 0
         now = time.time()
-        for fact in new_facts:
-            fact = fact.strip()
-            if not fact or fact.casefold() in existing:
-                continue
-            self._conn.execute(
-                "INSERT INTO known_facts(ts, fact) VALUES (?, ?)", (now, fact)
-            )
-            existing.add(fact.casefold())
-            added += 1
-        if added:
-            self._conn.commit()
+        # Same rollback guard as append_turns/replace_facts: a failure partway
+        # through this loop would otherwise leave the connection holding an
+        # open write transaction (and a RESERVED lock on memory.db) until some
+        # unrelated later commit swept it in.
+        try:
+            for fact in new_facts:
+                fact = fact.strip()
+                if not fact or fact.casefold() in existing:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO known_facts(ts, fact) VALUES (?, ?)", (now, fact)
+                )
+                existing.add(fact.casefold())
+                added += 1
+            if added:
+                self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return added
 
     def recent_turns(self, limit: int = 50) -> list[Turn]:

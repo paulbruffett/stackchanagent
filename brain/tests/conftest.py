@@ -99,6 +99,7 @@ def _build_stream(step: tuple):
 
     ("text", "spoken reply")                 → end_turn with that text
     ("tool", name, tool_id[, lead_text])     → tool_use turn (optional pre-text)
+    ("cutoff", name, tool_id[, lead_text])   → tool_use cut off by max_tokens
     ("error", exception)                     → request raises (no tokens)
     """
     kind = step[0]
@@ -110,6 +111,16 @@ def _build_stream(step: tuple):
         lead = step[3] if len(step) > 3 else ""
         block = _FakeBlock(type="tool_use", id=tid, name=name, input={})
         return _OkStream(lead, _FakeResp([block], "tool_use"))
+    if kind == "cutoff":
+        # What the SDK actually returns when the response is truncated inside
+        # a tool_use: the block is present with partial-JSON input, no
+        # exception is raised, and stop_reason is "max_tokens" — NOT
+        # "tool_use", so the loop treats the turn as finished.
+        name, tid = step[1], step[2]
+        lead = step[3] if len(step) > 3 else ""
+        blocks = [_FakeBlock(type="text", text=lead)] if lead else []
+        blocks.append(_FakeBlock(type="tool_use", id=tid, name=name, input={}))
+        return _OkStream(lead, _FakeResp(blocks, "max_tokens"))
     if kind == "error":
         return _ErrStream(step[1])
     raise ValueError(f"bad script step: {step!r}")

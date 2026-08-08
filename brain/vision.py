@@ -101,10 +101,15 @@ class FaceDetector:
 
 
 class FaceTracker:
-    """Per-connection state: latest face list + new-face debounce."""
+    """Per-connection state for the new-face debounce."""
 
     def __init__(self) -> None:
-        self.latest: list[Face] = []
+        # Only whether the previous detection saw anyone, not the faces
+        # themselves: the one caller uses the list `update()` was handed. A
+        # public `latest` list invites reads from paths where detection was
+        # skipped (the in-flight guard, the idle cadence), which hand back an
+        # arbitrarily stale frame with no timestamp saying so.
+        self._had_face: bool = False
         # 0 = never seen; first detection's gap is treated as "infinite"
         # so we fire a greeting on the very first face of a session.
         self.last_seen_s: float = 0.0
@@ -113,8 +118,8 @@ class FaceTracker:
         """Update state with a fresh detection. Returns True iff this
         update fires a new_face event (debounced)."""
         now = time.monotonic()
-        prev_had_face = bool(self.latest)
-        self.latest = faces
+        prev_had_face = self._had_face
+        self._had_face = bool(faces)
 
         if not faces:
             return False
