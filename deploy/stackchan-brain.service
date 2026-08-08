@@ -1,0 +1,41 @@
+# systemd *user* unit — installed to ~/.config/systemd/user/ by deploy/install.sh,
+# which substitutes @REPO@ / @BRANCH@. Runs under the lingering user manager, so
+# it starts at boot with no login session and needs no root.
+#
+# @REPO@ and @BRANCH@ are filled in at install time. Edit this template, not the
+# installed copy — the installed one is overwritten on the next install.sh run.
+
+[Unit]
+Description=Stackchan brain (voice agent for the M5StackChan)
+Documentation=https://github.com/paulbruffett/stackchanagent
+# Give up after 8 restarts in 5 min so a hard crash loop stops burning CPU.
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@/brain
+Environment=HOME=%h
+Environment=PYTHONUNBUFFERED=1
+Environment=STACKCHAN_REPO=@REPO@
+Environment=STACKCHAN_BRANCH=@BRANCH@
+
+# Auto-update. `-` so a failed update never blocks startup; the script is
+# belt-and-braces about that too. ANTHROPIC_API_KEY and friends come from
+# @REPO@/.env, which agent_server.py loads itself.
+ExecStartPre=-%h/.local/bin/stackchan-brain-update
+ExecStart=@REPO@/brain/.venv/bin/python agent_server.py
+
+# agent_server.py has no SIGTERM handler — asyncio.run() only unwinds its
+# `finally` (mDNS unregister, MCP/A2A close) on KeyboardInterrupt. Send SIGINT
+# so stops are graceful; systemd still escalates to SIGKILL after the timeout.
+KillSignal=SIGINT
+TimeoutStopSec=20
+# ExecStartPre counts against this: fetch retries + a cold `uv sync` can be slow.
+TimeoutStartSec=1200
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
