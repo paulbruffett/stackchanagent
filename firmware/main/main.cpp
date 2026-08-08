@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <string_view>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <mooncake_log.h>
 #include <hal/hal.h>
 #include <stackchan/stackchan.h>
@@ -37,6 +39,44 @@ static constexpr const char* TAG = "stackchan";
 // `idf.py menuconfig` → "Stackchan Brain" → "Brain host".
 static constexpr const char* BRAIN_HOST = CONFIG_BRAIN_HOST;
 static constexpr int BRAIN_PORT = CONFIG_BRAIN_PORT;
+
+// On-screen mirror of Hal::startNetwork's progress log. This firmware never
+// runs xiaozhi's Application loop, so WifiBoard's config-AP alert (posted via
+// Application::Schedule) is dropped on the floor and the hotspot SSID + config
+// URL would otherwise only ever reach the UART — useless to an owner whose
+// robot is sitting on a desk with no serial cable.
+static std::unique_ptr<uitk::lvgl_cpp::Label> net_status_label;
+
+static void set_net_status(const std::string& msg)
+{
+    if (!net_status_label) return;
+    LvglLockGuard lock;
+    net_status_label->setText(msg);
+    net_status_label->setHidden(msg.empty());
+}
+
+// Wi-Fi association runs here, not on app_main: Hal::startNetwork() spins
+// `while (!connected) delay(500)` with no timeout, and WifiBoard latches into
+// config-AP mode after 60 s without ever retrying the stored SSID. Blocking
+// app_main there left the avatar frozen (nothing pumps GetStackChan().update())
+// with the wakeword, mic and head tap unarmed — the classic "router boots
+// slower than the robot after a power cut" case. Everything local is armed
+// before this task starts; only the brain link and the BLE buddy wait on Wi-Fi.
+static void network_task(void*)
+{
+    GetHAL().startNetwork([](std::string_view msg) {
+        mclog::tagInfo(TAG, "net: {}", msg);
+        set_net_status(std::string(msg));
+    });
+    set_net_status({});
+
+    agent::transport::start(BRAIN_HOST, BRAIN_PORT);
+    agent::camera_pump::start();
+    // BLE last, deliberately: this keeps NimBLE's bring-up after the Wi-Fi
+    // controller's, the order this build has always run in.
+    agent::buddy_ble::start();
+    vTaskDelete(nullptr);
+}
 
 extern "C" void app_main(void)
 {
@@ -91,40 +131,36 @@ extern "C" void app_main(void)
     motion.move(0, 200);       pump_for(1500);   // resting pose: pitch=20° (slightly up)
     motion.move(0, 200);       pump_for(1000);   // settle in resting pose
 
-    mclog::tagInfo(TAG, "bring-up ok — bringing up network");
-
-    // Block until Wi-Fi connects (uses board's stored creds; on first boot
-    // this enters WifiManager config-AP mode and the user joins the hotspot
-    // to set credentials).
-    GetHAL().startNetwork([](std::string_view msg) {
-        mclog::tagInfo(TAG, "net: {}", msg);
-    });
+    mclog::tagInfo(TAG, "bring-up ok — arming local inputs");
 
     // Wakeword → LISTENING → STT → SPEAKING → TTS playback. JSON commands
-    // from the brain land in commands::dispatch (set_expression, look_at,
-    // start/stop_speaking, stop_listening).
+    // from the brain (set_expression, look_at, start/stop_speaking,
+    // stop_listening) are queued here and executed by the idle loop below —
+    // never inline on the WS receive task, which would race the main loop on
+    // the SCS servo bus. See the note in agent/commands.cpp.
     agent::transport::set_on_audio(
         [](const int16_t* samples, size_t n) { agent::speaker_play::push(samples, n); });
     agent::transport::set_on_json(
-        [](std::string_view json) { agent::commands::dispatch(json); });
-    agent::transport::start(BRAIN_HOST, BRAIN_PORT);
+        [](std::string_view json) { agent::commands::enqueue(json); });
     agent::speaker_play::start();
     agent::wakeword::on_detected([](const std::string& w) {
         // Relight the screen first if we were asleep (instant, local —
         // doesn't wait on the brain round-trip).
         agent::commands::wake_face();
-        agent::transport::send_event_json(
-            std::string("{\"event\":\"wakeword\",\"word\":\"") + w + "\"}");
+        // Only arm LISTENING once the brain has actually been told. Nothing
+        // on-device leaves LISTENING on its own — the wakenet is paused there
+        // and the head tap is gated to Idle — so transitioning on an event the
+        // transport silently dropped would leave the robot deaf for the rest
+        // of the outage.
+        if (!agent::transport::send_event_json(
+                std::string("{\"event\":\"wakeword\",\"word\":\"") + w + "\"}")) {
+            mclog::tagWarn(TAG, "wakeword dropped — brain link down");
+            return;
+        }
         agent::state::transition(agent::state::Mode::Listening);
     });
     agent::wakeword::start();
     agent::mic_pump::start();
-    agent::camera_pump::start();
-
-    // Claude Desktop "Hardware Buddy" BLE link: advertises as "Claude
-    // StackChan", shows tool-approval prompts as a Doubt face + bubble, and
-    // approves on a head tap. Coexists with the Wi-Fi WS audio link.
-    agent::buddy_ble::start();
 
     // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
     // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so
@@ -146,12 +182,15 @@ extern "C" void app_main(void)
         }
         if (agent::state::current() != agent::state::Mode::Idle) return;
         agent::commands::wake_face();
-        agent::transport::send_event_json("{\"event\":\"tap\"}");
+        // Same reasoning as the wakeword path: don't enter LISTENING unless
+        // the brain heard the tap.
+        if (!agent::transport::send_event_json("{\"event\":\"tap\"}")) {
+            mclog::tagWarn(TAG, "head tap dropped — brain link down");
+            return;
+        }
         agent::state::transition(agent::state::Mode::Listening);
         mclog::tagInfo(TAG, "head tap → listening");
     });
-
-    mclog::tagInfo(TAG, "running — listening for wakeword");
 
     // Brain-offline badge: small red "OFFLINE" label in the top-right
     // corner, hidden when the WebSocket is connected. Added after the
@@ -166,8 +205,24 @@ extern "C" void app_main(void)
         offline_badge->setText("OFFLINE");
         offline_badge->align(LV_ALIGN_TOP_RIGHT, -4, 4);
         offline_badge->setHidden(true);
+
+        net_status_label = std::make_unique<uitk::lvgl_cpp::Label>(lv_screen_active());
+        net_status_label->setTextFont(&lv_font_montserrat_14);
+        net_status_label->setTextColor(lv_color_hex(0xFFFFFF));
+        net_status_label->setLongMode(LV_LABEL_LONG_MODE_WRAP);
+        net_status_label->setWidth(300);
+        net_status_label->setText("");
+        net_status_label->align(LV_ALIGN_BOTTOM_MID, 0, -4);
+        net_status_label->setHidden(true);
     }
     bool last_offline_state = false;
+
+    // Wi-Fi + everything that depends on it. Started last so the labels above
+    // exist and the idle loop below takes over immediately, whatever the
+    // network does.
+    xTaskCreatePinnedToCore(network_task, "agent_net", 8192, nullptr, 4, nullptr, 0);
+
+    mclog::tagInfo(TAG, "running — listening for wakeword");
 
     // Idle loop: pump stackchan (avatar blink/breath + motion spring) at 50 Hz.
     // Also poll the actual servo position every ~500 ms; log any change > 1°
@@ -182,6 +237,9 @@ extern "C" void app_main(void)
             LvglLockGuard lock;
             GetStackChan().update();
         }
+        // Brain commands run here, on the one task that owns StackChan and the
+        // servo bus. Outside the LVGL lock — dispatch takes it itself.
+        agent::commands::drain();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();
@@ -202,11 +260,22 @@ extern "C" void app_main(void)
             if (offline != last_offline_state) {
                 LvglLockGuard lock;
                 offline_badge->setHidden(!offline);
+                // set_skin rebuilds the avatar as a new, opaque, full-screen
+                // child of the same screen, so LVGL draws it over the badge.
+                // With ROCKY_MODE on that happens on the first brain connect —
+                // before the badge has ever been shown. Re-raise it here.
+                offline_badge->moveForeground();
                 last_offline_state = offline;
                 mclog::tagInfo(TAG, "brain link: {}",
                                offline ? "OFFLINE" : "online");
             }
         }
+        // Also marks a freshly-OTA'd image valid: sdkconfig keeps
+        // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y over a two-slot partition
+        // table, and this is the only caller of the confirmation path left
+        // after the M5 app-launcher loop was removed. Self-rate-limited to
+        // 10 s; the heap stats come along for free.
+        GetHAL().updateHeapStatusLog();
         GetHAL().feedTheDog();
         GetHAL().delay(20);
     }

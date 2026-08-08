@@ -27,6 +27,16 @@ namespace agent::commands {
 
 void dispatch(std::string_view json);
 
+// Registered as the transport's on_json handler: copies the frame onto a
+// queue instead of dispatching it inline. Frames arrive on the esp-ml307
+// "tcp_receive" task, and look_at drives the SCS servo bus that the main loop
+// is already driving at 50 Hz — see the note above the queue in commands.cpp.
+void enqueue(std::string_view json);
+
+// Run every queued command on the calling task. Call from the main idle loop,
+// OUTSIDE the LVGL lock (dispatch takes it itself).
+void drain();
+
 // Relight the screen if it was turned off for sleep; no-op otherwise.
 // Called locally from the wake word / head-tap handlers so waking is
 // instant and works even if the brain link is down. Idempotent.
