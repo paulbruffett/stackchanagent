@@ -472,8 +472,12 @@ async def _open_follow_up_window(ws: ServerConnection, state: ConnState) -> None
     await ws.send(json.dumps({"cmd": "start_listening"}))
     log.info("follow-up window opened (%.1fs)", get_config().get("FOLLOW_UP_WINDOW_S"))
 
-    state.follow_up_timeout = asyncio.create_task(
-        _follow_up_timeout_task(ws, state)
+    # Through spawn() even though we track and cancel this one ourselves: it
+    # ends in a `ws.send` on a socket that may have died since, and a bare
+    # create_task turns that ConnectionClosed into a context-free "Task
+    # exception was never retrieved" at GC time.
+    state.follow_up_timeout = spawn(
+        _follow_up_timeout_task(ws, state), "follow_up_timeout"
     )
 
 
@@ -610,6 +614,12 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
         return
 
     state.last_greeting_s = now
+    # A greeting is an interaction, so it has to defer sleep like any other
+    # turn — otherwise a face arriving just before SLEEP_TIMEOUT_S expires
+    # gets greeted and then watches the screen go dark on the next camera
+    # frame. last_user_interaction_s is deliberately NOT touched: that one
+    # gates greetings and must stay driven by the user, not by us.
+    state.last_activity_s = now
     log.info("proactive greeting: new face")
 
     agent = ensure_agent(ws, state)
@@ -629,6 +639,9 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
     finally:
         agent.on_tool = None
     total_ms = int((time.monotonic() - t0) * 1000)
+    # Re-stamp after the turn: the greeting itself can run for seconds, and
+    # the sleep check that matters is the one on the next camera frame.
+    state.last_activity_s = time.monotonic()
     log.info("greet turn: %d ms, %r", total_ms, speak_text[:120])
     publish_turn({
         "ts": time.time(),
@@ -712,6 +725,14 @@ async def handle(ws: ServerConnection) -> None:
                 if not state.listening:
                     continue
                 frame = msg[1:]
+                if len(frame) % 2:
+                    # np.frombuffer(int16) raises on a partial sample, which
+                    # would escape the message loop and drop the connection.
+                    # Our firmware always sends whole frames, so this is a
+                    # malformed peer on the open port, not us.
+                    log.warning("dropping odd-length audio frame (%d bytes)",
+                                len(frame))
+                    continue
                 state.speech_buf.extend(frame)
                 cfg = get_config()
                 rms = frame_rms(frame)
@@ -803,8 +824,13 @@ async def handle(ws: ServerConnection) -> None:
                     state.buddy_prompt_pending = bool(payload.get("pending"))
                     log.info("buddy prompt pending: %s", state.buddy_prompt_pending)
             elif isinstance(msg, bytes):
+                # A zero-length binary frame is legal WebSocket and lands here
+                # (both opcode branches require a non-empty msg). Log arguments
+                # are evaluated eagerly, so an unguarded msg[0] would IndexError
+                # out of the message loop and tear the connection down.
                 log.warning(
-                    "unknown binary opcode 0x%02x, %d bytes", msg[0], len(msg)
+                    "unknown binary frame: opcode %s, %d bytes",
+                    f"0x{msg[0]:02x}" if msg else "none", len(msg),
                 )
             else:
                 log.warning("unexpected frame type: %r", type(msg).__name__)
@@ -813,6 +839,13 @@ async def handle(ws: ServerConnection) -> None:
     finally:
         if state.agent is not None:
             live_sessions.discard(state.agent)
+        # The follow-up timer outlives the socket otherwise: it wakes up to
+        # FOLLOW_UP_WINDOW_S later, mutates a ConnState nothing owns any more
+        # (pinning its AgentSession and speech buffer alive with it) and then
+        # sends stop_listening down a dead connection. An in-flight turn is
+        # deliberately left to finish — cancelling it at an arbitrary await is
+        # how the M6.1 half-written tool_use corruption happens.
+        _cancel_follow_up_timeout(state)
         log.info("esp32 disconnected")
 
 
