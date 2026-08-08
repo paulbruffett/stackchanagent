@@ -50,7 +50,7 @@ static buddy_line_cb_t s_on_line = NULL;
 static uint8_t s_own_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_handle = 0;     /* value handle of the TX characteristic */
-static bool s_encrypted = false;
+static bool s_authenticated = false;
 
 /* RX reassembly buffer — accumulate write fragments until we hit '\n'. */
 static char s_rx_acc[BUDDY_RX_ACC_MAX + 1];
@@ -86,6 +86,15 @@ static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                          struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        /* The characteristic flags already demand an authenticated link; check
+         * it here too, because everything this feeds — settimeofday, the bond
+         * wipe, arbitrary on-screen "approve:" text — is reachable from a
+         * single unchecked write. */
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) != 0 ||
+            !desc.sec_state.encrypted || !desc.sec_state.authenticated) {
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
         /* One ATT write value is bounded by the ATT MTU (512), so a 512-byte
          * scratch copy holds it whole. JSON lines longer than one write are
          * reassembled across writes by rx_feed's newline accumulation. */
@@ -105,16 +114,20 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
         .uuid = &NUS_SVC_UUID.u,
         .characteristics = (struct ble_gatt_chr_def[]){
             {
-                /* RX: desktop writes JSON lines here. Require encryption so
-                 * the link must be paired/bonded before any data flows. */
+                /* RX: desktop writes JSON lines here. WRITE_ENC alone is
+                 * satisfied by *any* encrypted link, and a central that
+                 * declares NoInputNoOutput negotiates Just Works — no passkey
+                 * is ever displayed and sm_mitm only sets a bit in the AuthReq.
+                 * WRITE_AUTHEN is what actually requires the MITM-protected
+                 * pairing this device shows a PIN for. */
                 .uuid = &NUS_RX_UUID.u,
                 .access_cb = nus_access_cb,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP |
-                         BLE_GATT_CHR_F_WRITE_ENC,
+                         BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN,
             },
             {
                 /* TX: device notifies JSON lines back. Notify-only; the link
-                 * is already encrypted because RX write requires it. */
+                 * is already authenticated because RX write requires it. */
                 .uuid = &NUS_TX_UUID.u,
                 .access_cb = nus_access_cb,
                 .flags = BLE_GATT_CHR_F_NOTIFY,
@@ -143,9 +156,22 @@ bool buddy_nus_connected(void)
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
 }
 
-bool buddy_nus_encrypted(void)
+bool buddy_nus_authenticated(void)
 {
-    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_encrypted;
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_authenticated;
+}
+
+void buddy_nus_ensure_advertising(void)
+{
+    /* buddy_advertise() is only ever re-armed from GAP edges (sync, disconnect,
+     * failed connect) and each of its failure paths just logs and returns, so
+     * one unlucky ble_gap_adv_start() leaves this always-on device silently
+     * undiscoverable until a NimBLE host reset or a power cycle. Nothing else
+     * polls ble_gap_adv_active(). */
+    if (!ble_hs_is_enabled() || !ble_hs_synced()) return;
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
+    if (ble_gap_adv_active()) return;
+    buddy_advertise();
 }
 
 void buddy_nus_unpair(void)
@@ -168,7 +194,7 @@ static int buddy_gap_event(struct ble_gap_event *event, void *arg)
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 s_conn_handle = event->connect.conn_handle;
-                s_encrypted = false;
+                s_authenticated = false;
                 s_rx_len = 0;
                 ESP_LOGI(TAG, "central connected; handle=%d", s_conn_handle);
                 /* Ask the central to encrypt straight away (triggers SC
@@ -184,7 +210,7 @@ static int buddy_gap_event(struct ble_gap_event *event, void *arg)
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "central disconnected; reason=%d", event->disconnect.reason);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            s_encrypted = false;
+            s_authenticated = false;
             s_rx_len = 0;
             buddy_on_disconnect();
             buddy_advertise();
@@ -200,10 +226,16 @@ static int buddy_gap_event(struct ble_gap_event *event, void *arg)
 
         case BLE_GAP_EVENT_ENC_CHANGE:
             if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
-                s_encrypted = desc.sec_state.encrypted;
-                ESP_LOGI(TAG, "enc change; status=%d encrypted=%d bonded=%d",
+                s_authenticated = desc.sec_state.encrypted && desc.sec_state.authenticated;
+                ESP_LOGI(TAG, "enc change; status=%d encrypted=%d authenticated=%d bonded=%d",
                          event->enc_change.status, desc.sec_state.encrypted,
-                         desc.sec_state.bonded);
+                         desc.sec_state.authenticated, desc.sec_state.bonded);
+            }
+            /* NimBLE leaves the ACL up when pairing fails or the 30 s SM timer
+             * expires, so this status is the only notice the UI ever gets that
+             * the PIN on screen has become meaningless. */
+            if (event->enc_change.status != 0) {
+                buddy_on_pairing_failed();
             }
             return 0;
 
