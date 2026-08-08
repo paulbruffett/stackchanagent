@@ -28,5 +28,5 @@ systemctl --user enable stackchan-brain.service
 
 echo
 echo "installed. next:"
-echo "  systemctl --user restart stackchan-brain    # start + pull $BRANCH"
-echo "  journalctl --user -u stackchan-brain -f     # follow"
+echo "  systemctl --user restart stackchan-brain      # start + pull $BRANCH"
+echo "  journalctl --user-unit=stackchan-brain -f     # follow"

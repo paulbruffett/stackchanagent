@@ -25,10 +25,14 @@ and logs a NOTE when the unit template has drifted.
 
 ```bash
 systemctl --user status stackchan-brain
-systemctl --user restart stackchan-brain     # also pulls + updates
-journalctl --user -u stackchan-brain -f
-journalctl --user -u stackchan-brain -b      # this boot only
+systemctl --user restart stackchan-brain          # also pulls + updates
+journalctl --user-unit=stackchan-brain -f
+journalctl --user-unit=stackchan-brain -b         # this boot only
 ```
+
+Note `--user-unit=`, not `--user -u`. This host has no `/var/log/journal`, so
+journald is volatile and the plain `--user` journal namespace is empty;
+`--user-unit=` reads the system journal filtered to the unit and works.
 
 To hack on the Jetson checkout without the next restart wiping it, stop the
 timer on updates by masking the branch instead:
