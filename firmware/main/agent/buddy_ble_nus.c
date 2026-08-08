@@ -48,6 +48,7 @@ static const ble_uuid128_t NUS_TX_UUID = BLE_UUID128_INIT(
 
 static buddy_line_cb_t s_on_line = NULL;
 static uint8_t s_own_addr_type;
+static bool s_own_addr_ready = false;  /* buddy_on_sync resolved s_own_addr_type */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_handle = 0;     /* value handle of the TX characteristic */
 static bool s_authenticated = false;
@@ -168,7 +169,7 @@ void buddy_nus_ensure_advertising(void)
      * one unlucky ble_gap_adv_start() leaves this always-on device silently
      * undiscoverable until a NimBLE host reset or a power cycle. Nothing else
      * polls ble_gap_adv_active(). */
-    if (!ble_hs_is_enabled() || !ble_hs_synced()) return;
+    if (!s_own_addr_ready || !ble_hs_is_enabled() || !ble_hs_synced()) return;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
     if (ble_gap_adv_active()) return;
     buddy_advertise();
@@ -336,6 +337,7 @@ static void buddy_on_sync(void)
         ESP_LOGE(TAG, "infer_auto rc=%d", rc);
         return;
     }
+    s_own_addr_ready = true;
     buddy_advertise();
 }
 
