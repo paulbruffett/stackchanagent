@@ -32,6 +32,17 @@ using stackchan::avatar::Emotion;
 std::atomic<bool> g_face_off{false};
 std::atomic<uint8_t> g_saved_brightness{255};
 
+// The atomic makes each flag flip well-defined, but not the flag-plus-backlight
+// pair. sleep_face() runs on the WS dispatch path while wake_face() runs from
+// the head-touch and wakeword tasks, and both take the (contended) LVGL lock
+// only *after* their exchange — so sleep can win the flag and wake can win the
+// lock, leaving g_face_off false with the backlight at 0. After that every
+// wake_face() early-returns and no tap or wake word can relight the screen.
+// Serialise the whole check-and-act. Deliberately not the LVGL lock itself:
+// dispatch() calls wake_face() for every activity command and its common
+// no-op path must not queue behind a 20 ms avatar update.
+std::mutex g_face_mu;
+
 // Brain commands are parsed on the esp-ml307 "tcp_receive" task, but they must
 // not be *executed* there: apply_look_at ends in ScsServo::getCurrentAngle() /
 // set_angle_impl(), i.e. request/response transactions on the SCS UART bus
@@ -160,6 +171,7 @@ void apply_set_skin(JsonDocument& doc)
 
 void wake_face()
 {
+    std::lock_guard<std::mutex> face_lock(g_face_mu);
     if (!g_face_off.exchange(false)) return;  // wasn't asleep
     LvglLockGuard lock;
     GetHAL().setBackLightBrightness(g_saved_brightness.load());
@@ -170,6 +182,7 @@ void wake_face()
 
 void sleep_face()
 {
+    std::lock_guard<std::mutex> face_lock(g_face_mu);
     if (g_face_off.exchange(true)) return;  // already asleep
     LvglLockGuard lock;
     uint8_t cur = GetHAL().getBackLightBrightness();
