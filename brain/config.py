@@ -42,6 +42,12 @@ class Spec:
     # grid — used for values that need a bespoke panel (e.g. the multi-line
     # system prompt). Still a normal hot knob for get()/set()/reload().
     hidden: bool = False
+    # Inclusive bounds for numeric knobs, enforced in _coerce. Nothing else
+    # range-checks: the console renders every knob as a free-text input and
+    # PUT /api/config hands the raw body value straight to Config.set, so a
+    # value that merely casts cleanly used to be persisted forever.
+    minimum: float | None = None
+    maximum: float | None = None
 
 
 # The knob catalog. Keys mirror the original module constant names so the
@@ -229,11 +235,13 @@ SPECS: dict[str, Spec] = {
         "Unsummarized-turn backlog that triggers a background fold into a "
         "summary. Lower = summarize more eagerly (smaller prompts, more "
         "LLM calls).",
+        minimum=0,
     ),
     "KEEP_RECENT_TURNS": Spec(
         10, "int", False, "memory",
         "How many of the most recent turns to always keep verbatim (never "
         "fold into a summary).",
+        minimum=0,
     ),
     "SUMMARIZE_SYSTEM": Spec(
         "", "str", False, "memory",
@@ -247,6 +255,15 @@ SPECS: dict[str, Spec] = {
         "fold, older summaries — and the raw turns they covered — are "
         "permanently purged. Durable facts are extracted first, so nothing "
         "lasting is lost. 0 = keep all (no purge).",
+        minimum=0,
+    ),
+    "MAX_PROMPT_FACTS": Spec(
+        200, "int", False, "memory",
+        "Cap on how many durable facts are injected into the system prompt "
+        "(the newest ones win). Facts beyond the cap stay in the database and "
+        "stay editable in the console — they just stop being sent on every "
+        "turn. 0 = no cap.",
+        minimum=0,
     ),
     "AUTO_FACT_EXTRACTION": Spec(
         1, "int", False, "memory",
@@ -293,11 +310,29 @@ SPECS: dict[str, Spec] = {
 
 
 def _coerce(spec: Spec, value: Any) -> Any:
-    if spec.type == "float":
-        return float(value)
-    if spec.type == "int":
-        return int(value)
-    return str(value)
+    """Cast an incoming value to the knob's type and range, raising
+    TypeError/ValueError on anything else. Both callers already handle that:
+    the web console turns it into a 400, and Config.reload logs it and falls
+    back to the default (so a bad value written by an older build heals)."""
+    if spec.type == "str":
+        # NOT str(value): PUT /api/config with the "value" field missing or
+        # null passes None, and str(None) is the perfectly coercible string
+        # "None" — which then 404s every turn as MODEL, mutes the robot as
+        # PIPER_VOICE, and (being truthy) silently replaces the whole persona
+        # as SYSTEM_PROMPT, surviving every restart.
+        if not isinstance(value, str):
+            raise TypeError(f"expected a string, got {type(value).__name__}")
+        return value
+    # bool is an int subclass and containers have a length, so both would
+    # otherwise slip through int()/float() as 1/0 or a TypeError-free cast.
+    if isinstance(value, (bool, list, dict)):
+        raise TypeError(f"expected a number, got {type(value).__name__}")
+    out = float(value) if spec.type == "float" else int(value)
+    if spec.minimum is not None and out < spec.minimum:
+        raise ValueError(f"{out} is below the minimum {spec.minimum}")
+    if spec.maximum is not None and out > spec.maximum:
+        raise ValueError(f"{out} is above the maximum {spec.maximum}")
+    return out
 
 
 class Config:
