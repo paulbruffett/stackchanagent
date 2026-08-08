@@ -25,10 +25,21 @@ constexpr const char* TAG = "agent.ws";
 constexpr uint32_t kBackoffMinMs = 1000;
 constexpr uint32_t kBackoffMaxMs = 16000;
 
+// A session must last this long before it counts as healthy enough to reset
+// the backoff ladder. A brain that accepts the handshake and dies immediately
+// (systemd crash-loop) would otherwise pin us at kBackoffMinMs forever: a new
+// socket, a new tcp_receive task and a boot/stop_speaking/set_skin exchange
+// every second for as long as it stays broken.
+constexpr uint32_t kStableSessionMs = 10000;
+
 struct State {
     std::string host;
     int port = 0;
-    std::unique_ptr<WebSocket> ws;
+    // shared_ptr, not unique_ptr: senders copy this under `mu`, drop the lock
+    // and only then Send(), so the socket may be swapped out from under an
+    // in-flight write. The reference the sender holds keeps the object alive
+    // until that write returns.
+    std::shared_ptr<WebSocket> ws;
     std::atomic<bool> connected{false};
     // Protects ws_ swap + callbacks installed on ws_.
     std::mutex mu;
@@ -93,35 +104,42 @@ void connection_task(void*)
     while (true) {
         mclog::tagInfo(TAG, "connecting: {}", uri);
 
-        auto ws = network->CreateWebSocket(1);
+        std::shared_ptr<WebSocket> ws = network->CreateWebSocket(1);
         if (!ws) {
             mclog::tagError(TAG, "CreateWebSocket failed; retry in {} ms", backoff_ms);
+            // Same self-heal as the disconnect edge below: with no link there
+            // is nobody to send stop_listening/stop_speaking, so a wakeword or
+            // tap taken while the brain was down would strand us in LISTENING.
+            state::transition(state::Mode::Idle);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = std::min(backoff_ms * 2, kBackoffMaxMs);
             continue;
         }
 
-        std::atomic<bool> closed{false};
+        // Heap-allocated and captured by value: a sender blocked inside Send()
+        // can keep this WebSocket (and therefore these callbacks) alive past
+        // the end of this loop iteration, so they must not point at our stack.
+        auto closed = std::make_shared<std::atomic<bool>>(false);
         ws->OnData([](const char* d, size_t l, bool b) { handle_data(d, l, b); });
-        ws->OnDisconnected([&closed]() {
+        ws->OnDisconnected([closed]() {
             state().connected = false;
-            closed = true;
+            closed->store(true);
         });
-        ws->OnError([&closed](int err) {
+        ws->OnError([closed](int err) {
             mclog::tagWarn(TAG, "ws error: {}", err);
             state().connected = false;
-            closed = true;
+            closed->store(true);
         });
 
         if (!ws->Connect(uri.c_str())) {
             mclog::tagWarn(TAG, "connect failed (err={}); retry in {} ms",
                            ws->GetLastError(), backoff_ms);
+            state::transition(state::Mode::Idle);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = std::min(backoff_ms * 2, kBackoffMaxMs);
             continue;
         }
 
-        backoff_ms = kBackoffMinMs;
         {
             std::lock_guard<std::mutex> lock(s.mu);
             s.ws = std::move(ws);
@@ -130,8 +148,9 @@ void connection_task(void*)
         mclog::tagInfo(TAG, "connected");
         send_event_json("{\"event\":\"boot\"}");
 
+        const TickType_t session_start = xTaskGetTickCount();
         // Run until disconnect / error fires.
-        while (!closed) {
+        while (!closed->load()) {
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
@@ -150,7 +169,15 @@ void connection_task(void*)
             std::lock_guard<std::mutex> lock(s.mu);
             s.ws.reset();
         }
-        vTaskDelay(pdMS_TO_TICKS(kBackoffMinMs));
+        // Only a session that actually stood up counts as success; otherwise
+        // keep climbing the ladder so an accept-then-die brain gets backed off
+        // instead of being hammered once a second.
+        if (xTaskGetTickCount() - session_start >= pdMS_TO_TICKS(kStableSessionMs)) {
+            backoff_ms = kBackoffMinMs;
+        } else {
+            backoff_ms = std::min(backoff_ms * 2, kBackoffMaxMs);
+        }
+        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
     }
 }
 
@@ -182,9 +209,21 @@ bool send_binary(uint8_t op, const uint8_t* payload, size_t len)
     buf.push_back(op);
     buf.insert(buf.end(), payload, payload + len);
 
-    std::lock_guard<std::mutex> lock(s.mu);
-    if (!s.ws) return false;
-    return s.ws->Send(buf.data(), buf.size(), /*binary=*/true);
+    // Never hold s.mu across the write. EspTcp::Send loops on a blocking
+    // socket with no SO_SNDTIMEO, so a peer that stops reading (brain event
+    // loop wedged, AP flap) parks us in send() for lwIP's whole retransmit
+    // budget — minutes. Holding the module mutex there froze the mic/camera
+    // pumps, the wakeword and tap events, inbound command dispatch, and
+    // connection_task itself, which needs s.mu to drop the socket and
+    // reconnect. WebSocket::Send has its own send_mutex_, so concurrent
+    // senders are still serialised.
+    std::shared_ptr<WebSocket> ws;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        ws = s.ws;
+    }
+    if (!ws) return false;
+    return ws->Send(buf.data(), buf.size(), /*binary=*/true);
 }
 
 }  // namespace
@@ -205,9 +244,14 @@ bool send_event_json(std::string_view json)
 {
     auto& s = state();
     if (!s.connected.load()) return false;
-    std::lock_guard<std::mutex> lock(s.mu);
-    if (!s.ws) return false;
-    return s.ws->Send(std::string(json));
+    // Copy the socket out, then write outside the lock — see send_binary.
+    std::shared_ptr<WebSocket> ws;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        ws = s.ws;
+    }
+    if (!ws) return false;
+    return ws->Send(std::string(json));
 }
 
 void set_on_audio(AudioFrameHandler handler)
