@@ -413,16 +413,19 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
+    # Per-turn observer, not a slot on the session: a greeting turn can be in
+    # flight against the same AgentSession (it blocks on the turn lock inside
+    # respond*), and a shared slot let this turn collect the greeting's tool
+    # calls and then publish its own as empty.
+    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    try:
-        if follow_up_turn:
-            run = lambda spk: agent.respond_follow_up(transcript.text, spk)
-        else:
-            run = lambda spk: agent.respond(transcript.text, spk)
-        speak_text = await _drive_agent_turn(ws, state, run)
-    finally:
-        agent.on_tool = None
+    if follow_up_turn:
+        run = lambda spk: agent.respond_follow_up(
+            transcript.text, spk, on_tool=on_tool
+        )
+    else:
+        run = lambda spk: agent.respond(transcript.text, spk, on_tool=on_tool)
+    speak_text = await _drive_agent_turn(ws, state, run)
     total_ms = int((time.monotonic() - t0) * 1000)
     log.info("agent turn: %d ms total, %r", total_ms, speak_text[:120])
     publish_turn({
@@ -439,8 +442,12 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     state.last_activity_s = time.monotonic()
 
     # If the agent chose to stay silent (typical on a follow-up that
-    # wasn't directed at us), close out — no further window.
-    if speak_text.strip():
+    # wasn't directed at us), close out — no further window. Same for an
+    # explicit end_conversation: the user said goodbye, so holding the mic
+    # open for another FOLLOW_UP_WINDOW_S is exactly what they didn't ask for.
+    if agent.conversation_ended:
+        log.info("agent ended the conversation — re-arming wakeword")
+    elif speak_text.strip():
         await _open_follow_up_window(ws, state)
     else:
         log.info("agent stayed silent — ending conversation, re-arming wakeword")
@@ -624,20 +631,18 @@ async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    agent.on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
+    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    try:
-        speak_text = await _drive_agent_turn(
-            ws,
-            state,
-            lambda spk: agent.respond_to_event(
-                "A new person just appeared in front of you. Greet them in one "
-                "short, friendly sentence.",
-                spk,
-            ),
-        )
-    finally:
-        agent.on_tool = None
+    speak_text = await _drive_agent_turn(
+        ws,
+        state,
+        lambda spk: agent.respond_to_event(
+            "A new person just appeared in front of you. Greet them in one "
+            "short, friendly sentence.",
+            spk,
+            on_tool=on_tool,
+        ),
+    )
     total_ms = int((time.monotonic() - t0) * 1000)
     # Re-stamp after the turn: the greeting itself can run for seconds, and
     # the sleep check that matters is the one on the next camera frame.
