@@ -323,6 +323,21 @@ class AgentSession:
             )
             return await self._run_loop(speak, thinking=self._thinking_enabled())
 
+    async def resync_from_memory(self) -> None:
+        """Reload the in-memory thread from durable history.
+
+        self.messages is hydrated once at construction and only appended to,
+        and a session lives for the whole firmware connection — so when the
+        console rewrites the unsummarized tail (reset / repair / forced
+        summarize) the connected device otherwise keeps replaying the turns
+        the operator just deleted, until the brain restarts. Takes the turn
+        lock so this can't land mid-exchange."""
+        async with self._turn_lock:
+            self.messages = [
+                {"role": t.role, "content": t.content}
+                for t in self.memory.list_unsummarized_turns()
+            ]
+
     @staticmethod
     def _thinking_enabled() -> bool:
         """Whether follow-up / event turns get a private thinking channel.
