@@ -21,7 +21,8 @@ entered.
 Secrets: `env_ref` names a single environment variable (loaded from
 `.env`); for stdio servers only that one var is added back to an env that
 has had secret-looking keys stripped, so a child server can't read the
-brain's other secrets (e.g. ANTHROPIC_API_KEY).
+brain's other secrets (e.g. ANTHROPIC_API_KEY). For http servers the same
+var supplies a bearer token. Either way the DB stores only the name.
 """
 
 from __future__ import annotations
@@ -117,6 +118,18 @@ def _child_env(env_ref: str | None) -> dict[str, str]:
     # knob as the source of truth).
     base["DEFAULT_LOCATION"] = str(get_config().get("DEFAULT_LOCATION"))
     return base
+
+
+def _http_headers(env_ref: str | None) -> dict[str, str]:
+    """Bearer auth for http servers. As with stdio, env_ref only names the
+    var -- the token itself stays in `.env` and never reaches the DB."""
+    if not env_ref:
+        return {}
+    token = os.environ.get(env_ref)
+    if not token:
+        log.warning("env_ref %r not set in environment", env_ref)
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 class _ServerConn:
@@ -231,7 +244,7 @@ class _ServerConn:
         if spec.transport == "http":
             if not spec.url:
                 raise ValueError("http server needs a url")
-            return _HttpSession(spec.url)
+            return _HttpSession(spec.url, _http_headers(spec.env_ref))
         raise ValueError(f"unknown transport: {spec.transport}")
 
     async def _serve(self, session: ClientSession) -> None:
@@ -327,12 +340,13 @@ class _StdioSession:
 
 
 class _HttpSession:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         self._url = url
+        self._headers = headers or None
 
     async def __aenter__(self) -> ClientSession:
         from mcp.client.streamable_http import streamablehttp_client
-        self._transport = streamablehttp_client(self._url)
+        self._transport = streamablehttp_client(self._url, headers=self._headers)
         read, write, *_ = await self._transport.__aenter__()
         self._session = ClientSession(read, write)
         try:
