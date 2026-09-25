@@ -931,6 +931,15 @@ config BRAIN_PORT
     help
         TCP port the brain's WebSocket server listens on.
 
+config STACKCHAN_BUDDY_BLE
+    bool "BLE buddy (Claude Desktop permission prompts)"
+    default n
+    help
+        Run the NimBLE "buddy" peripheral that shows Claude Desktop
+        permission prompts on the face and approves them on a head tap.
+        Off by default: BLE shares the radio with Wi-Fi, and with it on,
+        Wi-Fi has to stay in modem sleep, which throttles the mic uplink.
+
 endmenu
 
 menu "BLE prph Configuration"

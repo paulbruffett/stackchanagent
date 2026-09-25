@@ -20,7 +20,6 @@
 namespace agent::transport {
 
 constexpr uint8_t OP_AUDIO = 0x01;
-constexpr uint8_t OP_JPEG  = 0x02;
 
 // Spin up the connection-manager task. Must be called after Wi-Fi is up.
 // Caller retains ownership of host (must outlive this call's copy).
@@ -29,12 +28,9 @@ void start(const char* host, int port);
 bool is_connected();
 
 // Send a 16 kHz / codec-native-rate s16le mono PCM frame prefixed with
-// OP_AUDIO. Returns false if the link is down (frame is dropped, no queue).
+// OP_AUDIO. Returns false if the link is down. Blocking: callers that must
+// not stall (the mic reader) go through mic_pump's queue.
 bool send_audio(const int16_t* samples, size_t sample_count);
-
-// Send a JPEG frame prefixed with OP_JPEG. Returns false if the link is
-// down (frame is dropped, no queue).
-bool send_jpeg(const uint8_t* jpeg, size_t len);
 
 // Send a JSON text frame. Pass a complete JSON string.
 bool send_event_json(std::string_view json);
