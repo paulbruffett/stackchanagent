@@ -6,15 +6,6 @@ unlike agent_server which pulls in Jetson-only deps (faster-whisper, piper, …)
 from __future__ import annotations
 
 
-def skin_for_rocky_mode(rocky_mode) -> str:
-    """The firmware avatar skin that should be active for a ROCKY_MODE value.
-
-    ROCKY_MODE is the single source of truth for "be Rocky" (voice + face);
-    the brain emits ``set_skin`` so the firmware follows it.
-    """
-    return "rocky" if rocky_mode else "default"
-
-
 def effective_sleep_timeout(
     base_s: float, prompt_timeout_s: float, buddy_prompt_pending: bool
 ) -> float:

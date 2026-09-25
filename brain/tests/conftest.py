@@ -29,14 +29,12 @@ from memory import Memory  # noqa: E402
 def mem(tmp_path):
     """A fresh Memory on a temp DB, wired to the global Config singleton with
     the noisy on-device knobs disabled so the common path stays quiet. The
-    busy_indicator / ack_filler / follow_up_thinking fixtures below turn one
+    busy_indicator / ack_filler fixtures below turn one
     back on for the tests that assert that feature."""
     m = Memory(tmp_path / "memory.db")
     cfg = init_config(m)
     cfg.set("BUSY_INDICATOR", 0)
     cfg.set("ACK_FILLER", 0)
-    cfg.set("ROCKY_MODE", 0)
-    cfg.set("FOLLOW_UP_THINKING", 0)
     yield m
     m.close()
 
@@ -53,13 +51,6 @@ def ack_filler(mem):
     """Re-enable the spoken pre-tool acknowledgement, so the phrases actually
     reaching TTS on a slow-tool turn are observable."""
     get_config().set("ACK_FILLER", 1)
-
-
-@pytest.fixture
-def follow_up_thinking(mem):
-    """Turn extended thinking on for the follow-up / stage-direction turns that
-    opt into it — off in `mem` so the wake-word path stays the default."""
-    get_config().set("FOLLOW_UP_THINKING", 1)
 
 
 # --- scripted fake streaming client ----------------------------------------

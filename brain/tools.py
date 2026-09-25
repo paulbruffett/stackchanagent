@@ -1,56 +1,34 @@
 """Tool definitions for the Claude tool-use loop.
 
 Each tool maps to either a JSON command the firmware understands or a
-brain-local action (like a vision-model call). Handlers take a context
+brain-local action (like saving a fact). Handlers take a context
 object plus the tool input and return a brief acknowledgement string
 for the next assistant turn.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
-from anthropic import AsyncAnthropic
 from websockets.asyncio.server import ServerConnection
 
-from config import get_config
 from memory import Memory
 
 log = logging.getLogger("brain.tools")
-
-# Sonnet for vision Q&A — Haiku 4.5 can do vision too but Sonnet gives
-# noticeably better scene descriptions and the tool is invoked rarely.
-VISION_MODEL = "claude-sonnet-4-6"
 
 
 @dataclass
 class ToolContext:
     """Per-connection handles a tool handler may need."""
     ws: ServerConnection
-    client: AsyncAnthropic
     memory: Memory
-    # Callable returning the most recent JPEG frame the firmware has
-    # sent us on this connection, or None if we haven't received one
-    # yet. Used by describe_view.
-    get_latest_jpeg: Callable[[], bytes | None]
-    # Hook fired whenever the agent commands an absolute head move
-    # (look_at). Lets the gaze controller sync to the new pose so it
-    # doesn't immediately yank the head back.
-    on_external_head_move: Callable[[float, float], None] = (
-        lambda yaw_deg, pitch_deg: None
-    )
     # MCP client (Phase 9b), shared across connections. Tools it exposes
     # are namespaced `mcp__<server>__<tool>` and routed here before the
     # native tool ladder below. None if MCP is disabled/unavailable.
     mcp: Any = None
-    # A2A client (Phase 9c), shared across connections. Tools it exposes
-    # are namespaced `a2a__<server>__<agent>` and routed here before the
-    # native tool ladder below. None if A2A is disabled/unavailable.
-    a2a: Any = None
     # Set by the end_conversation tool, reset by AgentSession at the start of
     # each exchange. Without it the tool is inert: the caller decides whether
     # to hold the mic open purely on "the reply was non-empty", and a goodbye
@@ -110,29 +88,6 @@ TOOL_DEFS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "describe_view",
-        "description": (
-            "Look at what the camera currently sees and answer a question "
-            "about it. Use when the user asks 'what do you see?', 'what's in "
-            "front of you?', 'who's there?', or any visual question. The "
-            "optional prompt steers what to report on; if omitted, returns a "
-            "short scene description."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": (
-                        "Question to answer about the scene, e.g. 'who is "
-                        "this?' or 'is the cat in the picture?'. Default: a "
-                        "short description."
-                    ),
-                }
-            },
-        },
-    },
-    {
         "name": "remember_fact",
         "description": (
             "Save a single fact about the user or your shared context that "
@@ -154,25 +109,6 @@ TOOL_DEFS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "set_persona_mode",
-        "description": (
-            "Switch the robot's persona mode. 'rocky' adopts the Rocky "
-            "character (broken-English alien engineer) and, when configured, "
-            "the Rocky voice; 'normal' restores the default Stack-Chan "
-            "persona and voice. Call with 'rocky' when the user asks for the "
-            "Rocky voice / to talk 'as Rocky' / 'rocky mode'; call with "
-            "'normal' on 'Rocky stop', 'stop Rocky', or 'normal mode'. The "
-            "change applies on the next reply."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "mode": {"type": "string", "enum": ["normal", "rocky"]}
-            },
-            "required": ["mode"],
-        },
-    },
-    {
         "name": "end_conversation",
         "description": (
             "End the conversation gracefully. Use when the user says goodbye or "
@@ -183,42 +119,8 @@ TOOL_DEFS: list[dict[str, Any]] = [
 ]
 
 
-async def _describe_view(ctx: ToolContext, prompt: str) -> str:
-    jpeg = ctx.get_latest_jpeg()
-    if jpeg is None:
-        return "No camera frame is available yet."
-    img_b64 = base64.standard_b64encode(jpeg).decode("ascii")
-    msg = await ctx.client.messages.create(
-        model=VISION_MODEL,
-        max_tokens=300,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
-    )
-    text = " ".join(b.text for b in msg.content if b.type == "text").strip()
-    log.info(
-        "describe_view: %d-byte jpeg → %r (in=%d out=%d)",
-        len(jpeg), text[:120],
-        msg.usage.input_tokens, msg.usage.output_tokens,
-    )
-    return text or "I couldn't make out the scene."
-
-
-# Ceiling on a single tool_result. An MCP server, an A2A agent, or anything
-# upstream of them can hand back an arbitrarily large blob, and it is not just
+# Ceiling on a single tool_result. An MCP server, or anything upstream of
+# it, can hand back an arbitrarily large blob, and it is not just
 # one turn's problem: the result is committed to durable history, replayed on
 # every following turn, and rendered again into the summarizer transcript — so
 # an oversized one wedges the very fold that would have cleared it. 8k chars is
@@ -245,13 +147,10 @@ async def dispatch(
 async def _dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
 ) -> str:
-    # MCP (Phase 9b) and A2A (Phase 9c) tools take priority — they're
-    # namespaced (`mcp__…` / `a2a__…`) so they can't collide with the
-    # native tools below.
+    # MCP tools (Phase 9b) take priority — they're namespaced (`mcp__…`)
+    # so they can't collide with the native tools below.
     if ctx.mcp is not None and ctx.mcp.is_mcp_tool(name):
         return await ctx.mcp.dispatch(name, input_)
-    if ctx.a2a is not None and ctx.a2a.is_a2a_tool(name):
-        return await ctx.a2a.dispatch(name, input_)
     if name == "set_expression":
         await ctx.ws.send(
             json.dumps({"cmd": "set_expression", "value": input_["expression"]})
@@ -265,11 +164,7 @@ async def _dispatch(
                 {"cmd": "look_at", "yaw_deg": yaw_deg, "pitch_deg": pitch_deg}
             )
         )
-        ctx.on_external_head_move(yaw_deg, pitch_deg)
         return f"Looking at yaw={yaw_deg}, pitch={pitch_deg}."
-    if name == "describe_view":
-        prompt = input_.get("prompt") or "Describe what you see in one sentence."
-        return await _describe_view(ctx, prompt)
     if name == "remember_fact":
         fact = input_["fact"].strip()
         if not fact:
@@ -277,13 +172,6 @@ async def _dispatch(
         ctx.memory.add_fact(fact)
         log.info("remembered: %r", fact)
         return f"Remembered: {fact}"
-    if name == "set_persona_mode":
-        mode = input_.get("mode")
-        if mode not in ("normal", "rocky"):
-            return f"Unknown persona mode {mode!r}."
-        get_config().set("ROCKY_MODE", 1 if mode == "rocky" else 0)
-        log.info("persona mode → %s", mode)
-        return f"Persona mode set to {mode}."
     if name == "end_conversation":
         # No firmware-side cmd needed; the agent's reply is the goodbye. The
         # flag is what actually ends the conversation — the caller reads it

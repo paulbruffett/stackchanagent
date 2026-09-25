@@ -3,8 +3,8 @@
 A bare ``asyncio.create_task`` is two footguns at once: the loop keeps only a
 *weak* reference to the task (so a fire-and-forget task can be garbage-collected
 mid-flight), and any exception it raises is swallowed into a silent
-"Task exception was never retrieved" — which is exactly how a background turn
-(proactive greeting, summarizer fold) can vanish or wedge the session loop.
+"Task exception was never retrieved" — which is exactly how background work
+(summarizer fold, follow-up timeout) can vanish or wedge the session loop.
 
 ``spawn(coro, name)`` wraps ``create_task`` with a strong reference plus a
 done-callback that logs any exception, so no background work fails silently.

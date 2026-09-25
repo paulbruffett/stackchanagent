@@ -7,11 +7,10 @@ connection state machine.
 Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
-      0x02  JPEG camera frame (phase 4+)
   - Text frame: JSON control message, both directions.
       from ESP32: {"event": "boot"|"wakeword"|"vad_end", ...}
       to   ESP32: {"cmd": "stop_listening"|"start_speaking"|"stop_speaking"|
-                          "set_expression"|"look_at"|"set_motion_rate"}
+                          "set_expression"|"look_at"}
 """
 
 from __future__ import annotations
@@ -41,18 +40,14 @@ from zeroconf.asyncio import AsyncZeroconf
 # before importing the agent module (which constructs the Anthropic client).
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from behavior import IdleBehavior
-from claude_agent import AgentSession, repair_memory
+from claude_agent import AgentSession, maybe_summarize, repair_memory
 from config import get_config, init_config
-from a2a_client import A2aClient
 from mcp_client import McpClient
-from policy import effective_sleep_timeout, skin_for_rocky_mode
+from policy import effective_sleep_timeout
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up, strip_wake_word
 from tasks import spawn
 from tts import Synthesizer
-from tts_hume import HumeSynthesizer
-from vision import FaceDetector, FaceTracker
 from webui.app import create_app
 from webui.logbuf import LOGS, TURNS, WebUILogHandler, publish_turn
 
@@ -62,7 +57,6 @@ WEB_PORT = 8080
 MDNS_NAME = "stackchan-brain"
 
 OP_AUDIO = 0x01
-OP_JPEG = 0x02
 
 # Audio assumptions (must match firmware).
 SAMPLE_RATE = 16000
@@ -70,63 +64,15 @@ FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 320
 FRAME_BYTES = FRAME_SAMPLES * 2                  # 640
 
-# VAD / greeting / follow-up / detect-cadence knobs are now hot-editable
-# via config.py (web UI). Read with get_config().get("SPEECH_RMS") etc.
-# at the use sites below. Defaults live in config.py::SPECS.
-#
-# DETECT_INTERVAL_LOOK_AROUND_S stays a constant — during a sweep we want
-# detection on every frame, and 0.0 ("every frame") is not a useful knob.
-DETECT_INTERVAL_LOOK_AROUND_S = 0.0    # 0 = every frame (~1.5 s)
+# VAD / follow-up / sleep knobs are hot-editable via config.py (web UI).
+# Read with get_config().get("SPEECH_RMS") etc. at the use sites below.
+# Defaults live in config.py::SPECS.
 
 log = logging.getLogger("brain")
 
 # Lazy globals — one model load per process.
 stt = Transcriber()
 tts = Synthesizer()
-# Rocky-mode cloud voice (Milestone 4). Lazy — no HTTP client until first
-# use, and reports unavailable when no Hume key/voice is in .env, so this is
-# harmless to construct even with no Hume account.
-hume_tts = HumeSynthesizer()
-# Debounce so a Rocky-mode-without-Hume run logs the degradation once, not
-# per sentence.
-_rocky_no_hume_warned = False
-# Rolling Hume reliability tally (since process start). Reported on every
-# fallback so the real flake rate is visible from the log without a separate
-# metric — decide whether the mid-reply voice-flip is frequent enough to
-# mitigate off data, not off a single 500.
-_hume_ok = 0
-_hume_fallback = 0
-
-
-def _synthesize(sentence: str, use_rocky: bool, speed: float) -> bytes:
-    """Synthesize one sentence to 16 kHz PCM in a worker thread. In Rocky
-    mode with a Hume voice configured, use Hume; any Hume failure (network,
-    quota, malformed stream) falls back to Piper for that sentence so audio
-    is never dropped. Without Rocky mode — or without a Hume key — this is
-    plain Piper."""
-    global _rocky_no_hume_warned, _hume_ok, _hume_fallback
-    if use_rocky:
-        if hume_tts.available:
-            try:
-                pcm = hume_tts.synthesize(sentence, speed=speed)
-                _hume_ok += 1
-                return pcm
-            except Exception:
-                _hume_fallback += 1
-                total = _hume_ok + _hume_fallback
-                log.warning(
-                    "hume tts failed; falling back to piper "
-                    "(fallbacks %d/%d = %.1f%%)",
-                    _hume_fallback, total, 100.0 * _hume_fallback / total,
-                    exc_info=True,
-                )
-        elif not _rocky_no_hume_warned:
-            log.warning(
-                "ROCKY_MODE on but no Hume voice configured — persona active, "
-                "voice stays Piper (set HUME_API_KEY + a voice in .env)"
-            )
-            _rocky_no_hume_warned = True
-    return tts.synthesize(sentence)
 # Single shared Memory across all WS connections, so the robot
 # remembers conversations even after a disconnect/reconnect or process
 # restart. Sqlite handles file locking; only one process should write.
@@ -134,9 +80,6 @@ memory = Memory()
 # Shared MCP client (Phase 9b): one set of server connections for the
 # whole process. Started in main(); tools merged into every agent turn.
 mcp_client = McpClient(memory)
-# Shared A2A client (Phase 9c): connects to Agent2Agent servers (e.g.
-# Hermes) and surfaces their sub-agents as delegation tools in every turn.
-a2a_client = A2aClient(memory)
 # Live agent sessions, one per connected firmware WebSocket (normally exactly
 # one). The web console edits durable history; a session hydrates its thread
 # once at construction, so the console needs a way to reach the in-memory copy
@@ -166,35 +109,22 @@ class ConnState:
     trailing_silence_ms: int = 0
     started_at: float = 0.0
     agent: AgentSession | None = None
-    latest_jpeg: bytes | None = None
-    face_detector: FaceDetector | None = None
-    face_tracker: FaceTracker = field(default_factory=FaceTracker)
-    behavior: IdleBehavior = field(default_factory=IdleBehavior)
-    last_user_interaction_s: float = 0.0
-    last_greeting_s: float = 0.0
-    last_detect_s: float = 0.0
-    # True while asleep: screen is off, look-around and face detection are
-    # suspended. Cleared by a wake word or head tap. Driven by SLEEP_TIMEOUT_S.
+    # True while asleep: the screen is off until a wake word or head tap.
+    # Driven by SLEEP_TIMEOUT_S.
     asleep: bool = False
     # monotonic time of the last interaction that should keep the device
     # awake (conversation, wake word, tap). Seeded at connect so a fresh
-    # connection doesn't immediately sleep. Distinct from
-    # last_user_interaction_s (which gates greetings) so sleep timing and
-    # greeting suppression stay independent.
+    # connection doesn't immediately sleep.
     last_activity_s: float = 0.0
+    # last_activity_s of the idle stretch the summarizer already ran in, so a
+    # long quiet spell folds the backlog once rather than every tick.
+    summarized_for_activity_s: float = -1.0
     # monotonic time the most recent TTS playback is expected to finish on
     # the device. The brain sends audio faster than real time, so when the
     # speaker worker returns the device still has buffered audio playing;
     # we wait until past this before reopening the mic (else the robot
     # hears its own voice tail and replies to itself).
     est_playback_end_s: float = 0.0
-    # Set while a vision/detection task is in flight, so we drop overlapping
-    # frames rather than queuing detections behind a slow mediapipe call.
-    detecting: bool = False
-    # The avatar skin last pushed to the firmware ("rocky"/"default"). Tracks
-    # ROCKY_MODE; synced on connect and whenever it changes (see
-    # _maybe_sync_skin). None until the first sync on connect.
-    last_skin: str | None = None
     # True while a BLE buddy approve prompt is pending on the device (firmware
     # emits {"event":"buddy_prompt","pending":...}). Elongates the sleep
     # timeout so the device doesn't sleep out from under an unanswered prompt.
@@ -226,14 +156,7 @@ async def send_pcm_stream(ws: ServerConnection, pcm: bytes) -> None:
 
 def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
     if state.agent is None:
-        state.agent = AgentSession(
-            ws,
-            memory=memory,
-            get_latest_jpeg=lambda: state.latest_jpeg,
-            on_external_head_move=state.behavior.notify_head_moved,
-            mcp=mcp_client,
-            a2a=a2a_client,
-        )
+        state.agent = AgentSession(ws, memory=memory, mcp=mcp_client)
         live_sessions.add(state.agent)
     return state.agent
 
@@ -271,12 +194,6 @@ async def run_speaker(
     state.speaking = True
     play_start: float | None = None
     total_audio_s = 0.0
-    # Pick the TTS backend once per turn (Rocky mode → Hume when configured).
-    # Read here in the event loop, not in the worker thread, per the config
-    # single-loop contract.
-    cfg = get_config()
-    use_rocky = bool(cfg.get("ROCKY_MODE"))
-    speed = float(cfg.get("ROCKY_SPEED"))
     try:
         while True:
             sentence = await queue.get()
@@ -286,7 +203,7 @@ async def run_speaker(
                 await ws.send(json.dumps({"cmd": "start_speaking"}))
                 started = True
             t0 = time.monotonic()
-            tts_pcm = await asyncio.to_thread(_synthesize, sentence, use_rocky, speed)
+            tts_pcm = await asyncio.to_thread(tts.synthesize, sentence)
             audio_s = len(tts_pcm) / (SAMPLE_RATE * 2)
             log.info(
                 "tts: %d ms, %.2fs audio, %r",
@@ -422,10 +339,10 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    # Per-turn observer, not a slot on the session: a greeting turn can be in
-    # flight against the same AgentSession (it blocks on the turn lock inside
-    # respond*), and a shared slot let this turn collect the greeting's tool
-    # calls and then publish its own as empty.
+    # Per-turn observer, not a slot on the session: _turn_lock is taken inside
+    # respond*, so another turn can be in flight against the same AgentSession,
+    # and a shared slot let one turn collect the other's tool calls and then
+    # publish its own as empty.
     on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
     if follow_up_turn:
@@ -447,7 +364,6 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         "total_ms": total_ms,
     })
 
-    state.last_user_interaction_s = time.monotonic()
     state.last_activity_s = time.monotonic()
 
     # If the agent chose to stay silent (typical on a follow-up that
@@ -531,10 +447,6 @@ def _should_sleep(state: ConnState) -> bool:
     SLEEP_TIMEOUT_S of 0 disables sleeping entirely."""
     if state.asleep or state.listening or state.speaking:
         return False
-    # Don't drop the screen mid-sweep, or the head would keep moving while
-    # "asleep". A sweep is short (~16 s) and infrequent; just wait it out.
-    if state.behavior.look_around_in_progress:
-        return False
     timeout = get_config().get("SLEEP_TIMEOUT_S")
     if not timeout or timeout <= 0:
         return False
@@ -548,47 +460,40 @@ def _should_sleep(state: ConnState) -> bool:
     return time.monotonic() - state.last_activity_s >= timeout
 
 
-async def _maybe_sync_skin(ws: ServerConnection, state: ConnState) -> None:
-    """Push the avatar skin to the firmware if ROCKY_MODE has changed since the
-    last sync. ROCKY_MODE is the single source of truth (voice + face); this
-    catches both the voice tool (set_persona_mode) and a web-console toggle
-    with no callback machinery. Cheap to call on every camera frame."""
-    want = skin_for_rocky_mode(get_config().get("ROCKY_MODE"))
-    if want == state.last_skin:
-        return
-    try:
-        await ws.send(json.dumps({"cmd": "set_skin", "value": want}))
-    except Exception:
-        # Leave last_skin unchanged so the next frame retries rather than
-        # latching a skin we never actually pushed.
-        log.exception("set_skin send failed")
-        return
-    state.last_skin = want
-    log.info("skin → %s", want)
+IDLE_CHECK_INTERVAL_S = 5.0
 
 
-SLEEP_CHECK_INTERVAL_S = 5.0
+def _should_summarize(state: ConnState) -> bool:
+    """True once per idle stretch, SUMMARIZE_IDLE_S after the last turn, when
+    no mic is open — i.e. the conversation is over."""
+    if state.agent is None or state.listening or state.speaking:
+        return False
+    if state.summarized_for_activity_s == state.last_activity_s:
+        return False
+    idle_for = time.monotonic() - state.last_activity_s
+    return idle_for >= float(get_config().get("SUMMARIZE_IDLE_S"))
 
 
-async def _sleep_ticker(ws: ServerConnection, state: ConnState) -> None:
-    """Idle → sleep check on its own clock. It used to ride the camera frame
-    stream (~every 1.5 s), which the firmware no longer sends: frames shared
-    the socket with the mic and starved it. Cancelled by handle() on
-    disconnect."""
+async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
+    """Housekeeping that runs between conversations, on its own clock:
+    idle → sleep, and folding the turn backlog into a summary. Cancelled by
+    handle() on disconnect."""
     while True:
-        await asyncio.sleep(SLEEP_CHECK_INTERVAL_S)
+        await asyncio.sleep(IDLE_CHECK_INTERVAL_S)
+        if _should_summarize(state):
+            state.summarized_for_activity_s = state.last_activity_s
+            spawn(maybe_summarize(state.agent), "summarize")
         if _should_sleep(state):
             await go_to_sleep(ws, state)
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
     """Enter sleep: tell the firmware to turn the screen off (it sets a
-    sleepy face first), and stop look-around + face detection. The wake
-    word and head tap stay armed on the firmware as the only way out."""
+    sleepy face first). The wake word and head tap stay armed on the
+    firmware as the only way out."""
     state.asleep = True
     # Persist so a brain restart while asleep resumes in the asleep state
-    # instead of re-running autonomous behavior (look-around / face-detect
-    # greet) against a still-dark firmware screen.
+    # rather than treating a still-dark firmware screen as awake.
     memory.set_runtime_state("asleep", True)
     log.info("sleeping (idle %.0fs)", time.monotonic() - state.last_activity_s)
     try:
@@ -600,13 +505,11 @@ async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
 def wake_up(state: ConnState) -> None:
     """Clear the sleep state on a wake word / tap. The firmware relights
     its own screen locally on the same trigger (instant, offline-safe), so
-    no wake command is sent from here — we just resume brain-side behavior
-    and reset the look-around clock so a sweep doesn't fire immediately."""
+    no wake command is sent from here — we just clear the flag."""
     if state.asleep:
         log.info("waking")
     state.asleep = False
     memory.set_runtime_state("asleep", False)
-    state.behavior.last_look_around_s = time.monotonic()
 
 
 def _on_wake_trigger(state: ConnState) -> None:
@@ -621,101 +524,7 @@ def _on_wake_trigger(state: ConnState) -> None:
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
     state.started_at = time.monotonic()
-    now = time.monotonic()
-    state.last_user_interaction_s = now
-    state.last_activity_s = now
-
-
-async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
-    """Run an agent turn triggered by a non-speech event (new face seen).
-    Bypasses STT and uses a stage-direction message instead."""
-    now = time.monotonic()
-    if state.listening or state.speaking:
-        log.info("greet skipped: busy (listening=%s speaking=%s)",
-                 state.listening, state.speaking)
-        return
-    if now - state.last_greeting_s < get_config().get("GREETING_COOLDOWN_S"):
-        log.info("greet skipped: cooldown (%.0fs since last)",
-                 now - state.last_greeting_s)
-        return
-    if now - state.last_user_interaction_s < get_config().get("RECENT_INTERACTION_S"):
-        log.info("greet skipped: recent interaction (%.0fs ago)",
-                 now - state.last_user_interaction_s)
-        return
-
-    state.last_greeting_s = now
-    # A greeting is an interaction, so it has to defer sleep like any other
-    # turn — otherwise a face arriving just before SLEEP_TIMEOUT_S expires
-    # gets greeted and then watches the screen go dark on the next camera
-    # frame. last_user_interaction_s is deliberately NOT touched: that one
-    # gates greetings and must stay driven by the user, not by us.
-    state.last_activity_s = now
-    log.info("proactive greeting: new face")
-
-    agent = ensure_agent(ws, state)
-    tool_calls: list[dict[str, Any]] = []
-    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
-    t0 = time.monotonic()
-    speak_text = await _drive_agent_turn(
-        ws,
-        state,
-        lambda spk: agent.respond_to_event(
-            "A new person just appeared in front of you. Greet them in one "
-            "short, friendly sentence.",
-            spk,
-            on_tool=on_tool,
-        ),
-    )
-    total_ms = int((time.monotonic() - t0) * 1000)
-    # Re-stamp after the turn: the greeting itself can run for seconds, and
-    # the sleep check that matters is the one on the next camera frame.
     state.last_activity_s = time.monotonic()
-    log.info("greet turn: %d ms, %r", total_ms, speak_text[:120])
-    publish_turn({
-        "ts": time.time(),
-        "transcript": "[new face — proactive greeting]",
-        "follow_up": False,
-        "tools": tool_calls,
-        "reply": speak_text,
-        "stt_ms": None,
-        "total_ms": total_ms,
-    })
-
-
-async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
-    """Run face detection + gaze update + proactive-greeting check on the
-    most recent JPEG. Skipped if a previous detection is still running,
-    so a slow frame doesn't queue up backlogged work — we always look at
-    the newest available frame instead."""
-    if state.detecting:
-        return
-    jpeg = state.latest_jpeg
-    if jpeg is None:
-        return
-
-    if state.face_detector is None:
-        try:
-            state.face_detector = FaceDetector()
-        except Exception:
-            log.exception("FaceDetector init failed — disabling vision")
-            return
-
-    state.detecting = True
-    try:
-        faces = await asyncio.to_thread(state.face_detector.detect, jpeg)
-    except Exception:
-        log.exception("face detect failed")
-        state.detecting = False
-        return
-    state.detecting = False
-
-    new_face = state.face_tracker.update(faces)
-
-    in_conversation = state.listening or state.speaking
-    await state.behavior.tick(ws, faces, in_conversation)
-
-    if new_face:
-        spawn(proactive_greet(ws, state), "proactive_greet")
 
 
 async def handle(ws: ServerConnection) -> None:
@@ -736,18 +545,13 @@ async def handle(ws: ServerConnection) -> None:
     # sleep before any interaction.
     state.last_activity_s = time.monotonic()
     # Restore the persisted sleep flag: if the device was asleep when the
-    # brain last ran (or restarted), stay dormant — keep look-around and
-    # face detection suppressed so we don't act against a dark screen — and
-    # let only a wake word / head tap (which the firmware lights locally)
-    # bring it back. The firmware is still backlit-off from its earlier
+    # brain last ran (or restarted), stay dormant and let only a wake word /
+    # head tap (which the firmware lights locally) bring it back. The firmware is still backlit-off from its earlier
     # `sleep`, so the two stay consistent without sending any command.
     if bool(memory.get_runtime_state("asleep", False)):
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
-    # Sync the avatar skin to the current ROCKY_MODE on connect (boot brings up
-    # the default skin; this flips it to Rocky if ROCKY_MODE is on).
-    await _maybe_sync_skin(ws, state)
-    sleep_ticker = spawn(_sleep_ticker(ws, state), "sleep_ticker")
+    idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -804,28 +608,6 @@ async def handle(ws: ServerConnection) -> None:
                         elapsed_ms,
                     )
                     await respond(ws, state)
-            elif isinstance(msg, bytes) and msg and msg[0] == OP_JPEG:
-                jpeg = bytes(msg[1:])
-                log.debug("jpeg frame, %d bytes", len(jpeg))
-                # Always keep the latest frame around for describe_view,
-                # but only RUN detection at the configured cadence.
-                state.latest_jpeg = jpeg
-                # Frames are the steady heartbeat (~every 1.5 s, even while
-                # asleep), so use them to push a ROCKY_MODE skin change.
-                await _maybe_sync_skin(ws, state)
-                # While asleep: no look-around, no face detection — the wake
-                # word / tap is the only way out. Frames keep arriving (cheap)
-                # so describe_view still has a recent one after waking.
-                if state.asleep:
-                    continue
-                interval = (
-                    DETECT_INTERVAL_LOOK_AROUND_S
-                    if state.behavior.look_around_in_progress
-                    else get_config().get("DETECT_INTERVAL_IDLE_S")
-                )
-                if time.monotonic() - state.last_detect_s >= interval:
-                    state.last_detect_s = time.monotonic()
-                    spawn(process_latest_jpeg(ws, state), "process_jpeg")
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)
@@ -847,11 +629,12 @@ async def handle(ws: ServerConnection) -> None:
                     state.buddy_prompt_pending = bool(payload.get("pending"))
                     log.info("buddy prompt pending: %s", state.buddy_prompt_pending)
             elif isinstance(msg, bytes):
-                # A zero-length binary frame is legal WebSocket and lands here
-                # (both opcode branches require a non-empty msg). Log arguments
-                # are evaluated eagerly, so an unguarded msg[0] would IndexError
-                # out of the message loop and tear the connection down.
-                log.warning(
+                # Any other opcode is ignored. A zero-length binary frame is
+                # legal WebSocket and lands here too (the audio branch
+                # requires a non-empty msg). Log arguments are evaluated
+                # eagerly, so an unguarded msg[0] would IndexError out of the
+                # message loop and tear the connection down.
+                log.debug(
                     "unknown binary frame: opcode %s, %d bytes",
                     f"0x{msg[0]:02x}" if msg else "none", len(msg),
                 )
@@ -869,7 +652,7 @@ async def handle(ws: ServerConnection) -> None:
         # deliberately left to finish — cancelling it at an arbitrary await is
         # how the M6.1 half-written tool_use corruption happens.
         _cancel_follow_up_timeout(state)
-        sleep_ticker.cancel()
+        idle_ticker.cancel()
         log.info("esp32 disconnected")
 
 
@@ -982,10 +765,9 @@ async def advertise_mdns() -> tuple[AsyncZeroconf, ServiceInfo] | tuple[None, No
 
 
 def _seed_default_mcp_servers() -> None:
-    """Register the bundled weather + Hue servers once (empty registry).
-    Uses the running interpreter and absolute script paths so it works
-    regardless of cwd. Weather is enabled; Hue is disabled until the user
-    sets HUE_BRIDGE_IP/HUE_TOKEN in .env and toggles it on."""
+    """Register the bundled weather server once (empty registry). Uses the
+    running interpreter and an absolute script path so it works regardless
+    of cwd."""
     if memory.list_mcp_servers():
         return
     srv_dir = Path(__file__).parent / "mcp_servers"
@@ -993,22 +775,7 @@ def _seed_default_mcp_servers() -> None:
         "weather", "stdio", sys.executable,
         args=[str(srv_dir / "weather.py")], enabled=True,
     )
-    memory.add_mcp_server(
-        "hue", "stdio", sys.executable,
-        args=[str(srv_dir / "hue.py")], env_ref="HUE_TOKEN", enabled=False,
-    )
-    log.info("seeded default MCP servers: weather (on), hue (off)")
-
-
-def _seed_default_a2a_servers() -> None:
-    """Register the Hermes A2A endpoint once (empty registry), disabled
-    until the user confirms the URL and toggles it on (like Hue)."""
-    if memory.list_a2a_servers():
-        return
-    memory.add_a2a_server(
-        "hermes", "http://192.168.4.30:8080", enabled=False,
-    )
-    log.info("seeded default A2A server: hermes (off)")
+    log.info("seeded default MCP server: weather")
 
 
 async def main() -> None:
@@ -1038,16 +805,11 @@ async def main() -> None:
     # while the model comes up.
     spawn(stt.warm(), "stt_warm")
 
-    # MCP servers (Phase 9b): seed the two local servers on first run so
-    # weather works out of the box and Hue is one toggle + .env away.
-    # Then connect — best-effort, a down server just contributes no tools.
+    # MCP servers (Phase 9b): seed the local weather server on first run so
+    # it works out of the box. Then connect — best-effort, a down server just
+    # contributes no tools.
     _seed_default_mcp_servers()
     await mcp_client.start()
-
-    # A2A servers (Phase 9c): seed Hermes (disabled) on first run, then
-    # connect any enabled endpoints — best-effort, like MCP.
-    _seed_default_a2a_servers()
-    await a2a_client.start()
 
     # Web console: tee brain.* logs to the live feed and serve the
     # FastAPI app in-process on WEB_PORT, sharing memory + config + mcp.
@@ -1059,7 +821,7 @@ async def main() -> None:
     web_host = _console_bind()
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg, mcp_client, a2a_client,
+            create_app(memory, cfg, mcp_client,
                        token=console_token,
                        resync_sessions=resync_live_sessions),
             host=web_host, port=WEB_PORT, loop="none", log_level="warning",
@@ -1094,7 +856,6 @@ async def main() -> None:
         web.should_exit = True
         await web_task
         await mcp_client.aclose()
-        await a2a_client.aclose()
         if aiozc is not None and info is not None:
             await aiozc.async_unregister_service(info)
             await aiozc.async_close()
@@ -1105,7 +866,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         # systemd stops us with SIGINT (deploy/stackchan-brain.service) so that
-        # main()'s finally can unregister mDNS and close the MCP/A2A clients.
+        # main()'s finally can unregister mDNS and close the MCP client.
         # Letting KeyboardInterrupt escape would exit non-zero and leave the
         # unit sitting in `failed` after every ordinary stop.
         log.info("interrupted — shut down cleanly")

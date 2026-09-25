@@ -20,22 +20,18 @@ dependencies = [
     # overrides sources for packages listed in [project.dependencies].
     "ctranslate2>=4.7",
     "piper-tts>=1.2.0",
-    # Face detection uses OpenCV's bundled Haar cascade — no extra model
-    # download, no mediapipe. headless variant: no GUI libs, avoids
-    # libavdevice collision with faster-whisper's `av` (PyAV) dependency.
-    "opencv-python-headless>=4.9",
     # Phase 9a web console (in-process with agent_server). Plain uvicorn —
     # not uvicorn[standard] — to avoid compiling uvloop/httptools on the
     # Jetson aarch64; the default asyncio loop is fine here.
     "fastapi>=0.110",
     "uvicorn>=0.29",
-    # Phase 9b: MCP client (and FastMCP for our local weather/Hue servers).
+    # Phase 9b: MCP client (and FastMCP for our local weather server).
     # Pinned below 2.0: mcp 2.x dropped mcp.server.fastmcp (FastMCP moved to
-    # the separate 'fastmcp' package), which mcp_servers/weather.py and
-    # hue.py import. Unpin once those are ported.
+    # the separate 'fastmcp' package), which mcp_servers/weather.py imports.
+    # Unpin once it's ported.
     "mcp>=1.2,<2",
-    # Weather/Hue MCP servers make outbound HTTP to Open-Meteo / the Hue
-    # bridge. httpx is already pulled in by mcp, but pin it explicitly.
+    # The weather MCP server makes outbound HTTP to Open-Meteo. httpx is
+    # already pulled in by mcp, but pin it explicitly.
     "httpx>=0.27",
 ]
 

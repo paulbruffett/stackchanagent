@@ -69,7 +69,7 @@ def test_repair_of_a_mid_thread_dangling_tool_use_leaves_roles_to_sanitize(mem):
     mem.append_turns([
         {"role": "user", "content": "what do you see?"},
         {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "k", "name": "describe_view", "input": {}}]},
+            {"type": "tool_use", "id": "k", "name": "mcp__weather__get_weather", "input": {}}]},
         {"role": "user", "content": "hello again"},
     ])
     counts = repair_memory(mem)

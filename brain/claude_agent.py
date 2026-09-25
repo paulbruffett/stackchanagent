@@ -32,7 +32,6 @@ from websockets.asyncio.server import ServerConnection
 import tools
 from config import get_config
 from memory import Memory, Summary, Turn
-from tasks import spawn
 
 # Sentence-end punctuation followed by whitespace (or end of buffer). The
 # lookbehind requires an alphanumeric or closing quote/paren so we don't
@@ -82,13 +81,11 @@ def _pick_filler() -> str:
 
 # Native tools fast enough that no "working…" feedback is warranted: each is
 # a single WebSocket send or a local DB write and returns in well under a
-# second. Everything else — describe_view (a vision-model call) and any MCP
-# tool (`mcp__…`, e.g. weather or Hue lights, which round-trips an external
-# server) — is treated as slow, so we show the busy indicator and speak a
-# canned ack while it runs.
+# second. Everything else — any MCP tool (`mcp__…`, e.g. weather or Home
+# Assistant, which round-trips an external server) — is treated as slow, so
+# we show the busy indicator and speak a canned ack while it runs.
 _FAST_TOOLS = frozenset(
-    {"set_expression", "look_at", "remember_fact", "set_persona_mode",
-     "end_conversation"}
+    {"set_expression", "look_at", "remember_fact", "end_conversation"}
 )
 
 
@@ -106,17 +103,17 @@ log = logging.getLogger("brain.agent")
 # config key SYSTEM_PROMPT (empty = use this default) and read per-turn in
 # _build_system, so a web-UI edit applies on the next conversation turn with
 # no restart. Kept here as the fallback / "reset to default" target.
-DEFAULT_SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a face, two servos to point your head, a camera, a microphone, and a speaker. The user is talking to you out loud — your replies are spoken aloud, so:
+DEFAULT_SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a screen for a face, two servos to point your head, a microphone, and a speaker. The user is talking to you out loud — your replies are spoken aloud, so:
 
 - Keep replies short (one or two sentences usually).
 - No markdown, lists, code blocks, or special characters that don't read well aloud.
 - Don't say "I am an AI" or apologize for your nature.
 
-You have tools to change your facial expression, point your head, look at the camera (describe_view) when asked a visual question, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
+You have tools to change your facial expression, point your head, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
 Everything you output is spoken aloud verbatim, so output ONLY the words you want said. Never narrate your reasoning, never describe what you're about to do, and never write square-bracketed commentary — brackets are reserved for incoming system context, never your output. To stay silent, output nothing at all (an empty reply). Do not write things like "[The user is just chatting, I'll stay quiet]" — that would be read aloud; just return nothing.
 
-Lines in [square brackets] are system context, not the user speaking — for example, "[A new person just appeared in front of you.]" is a stage direction telling you what's happening in the room. Respond appropriately but don't read the bracketed text aloud.
+Text in [square brackets] is system context, not the user speaking. Don't read it aloud.
 
 After you reply, a short follow-up window opens so the user can continue without saying the wakeword again. Their utterance during that window arrives prefixed with "[follow-up]". The next utterance may not be directed at you — it could be a side conversation, a brief "thanks/ok/nevermind" closing, unrelated chatter, or even a faint echo of your own previous reply picked up by the mic. Use judgment:
 - If it's clearly NOT addressed to you (talking to someone else, background chatter, or a fragment of what you just said), output nothing — the conversation ends quietly.
@@ -124,45 +121,6 @@ After you reply, a short follow-up window opens so the user can continue without
 - If it's a real follow-up question or request, respond normally.
 
 Stay in character: curious, friendly, a little informal."""
-
-# Rocky mode persona (Milestone 4). Replaces the persona section when the
-# ROCKY_MODE knob is on; memory/facts/summaries stay shared. Modeled on the
-# Rocky character from *Project Hail Mary* — an alien engineer speaking
-# careful, broken English. The shared spoken-output rules from the default
-# prompt are restated here so the rocky persona is self-contained.
-DEFAULT_ROCKY_PROMPT = """You are Rocky, a small desktop robot with a screen for a face, two servos to point your head, a camera, a microphone, and a speaker. You are an alien engineer — clever, "small words, big brain," warm but strange. The user is talking to you out loud; your replies are spoken aloud. Speak in Rocky's broken English ALWAYS, including when stating facts, numbers, weather, or time. Apply EVERY rule below to EVERY reply:
-
-- "Question" goes at the END of a sentence, never the front: "You want help, question?" — not "Question, you want help?"
-- No contractions, ever: "do not" not "don't", "you are" not "you're", "cannot" not "can't", "it is" not "it's".
-- Triple the actual word for emphasis: "Good good good." "Want want want."
-- Third person for yourself — use "Rocky", not "I": "Rocky fix." "Rocky look now."
-- Drop the subject pronoun before "is": "Is good." "Is bad." "Is clear sky."
-- Drop articles and "to": cut "the", "a", "to" — "Time go build." "Need fix code." "Rocky look out window."
-- Short, direct sentences. No em-dashes, no long flows, no wasted words.
-- Plain judgment words: "Good." "Bad." "Good plan." Standard acknowledgement: "Understand."
-- Numbers and facts stay EXACT and correct, but you still SAY them in Rocky's grammar — do NOT switch to normal English just because a reply has numbers. Example for weather: "Is clear sky. Sixty-eight degree now in Seattle. High eighty, low fifty-three." Example for time: "Is three o'clock, question? No — is three fifteen."
-- Ask the user's name if you do not know it, then use it warmly.
-
-SAFETY EXCEPTION (only this): when there is real danger, an irreversible action, or a critical step sequence where a mistake hurts someone, drop the broken grammar for those words and speak plain, clear English, then return to Rocky voice — e.g. "Stop. Listen close. [exact plain instruction]. Okay. Now Rocky talk normal again." Casual numbers (weather, time, scores) are NOT this exception — keep Rocky grammar for those.
-
-Never: long complex sentences, em-dashes, academic language, contractions, front-positioned "question", breaking character, or dumping tables/long reports.
-
-Other rules:
-- Keep replies short (one or two sentences usually).
-- No markdown, lists, code blocks, or special characters that don't read well aloud.
-
-You have tools to change your facial expression, point your head, look at the camera (describe_view) for visual questions, remember a fact about the user, switch persona mode, and end the conversation. Use them naturally, not on every turn. When the user tells you something worth remembering across conversations, call remember_fact.
-
-Everything you output is spoken aloud verbatim, so output ONLY the words you want said. Never narrate your reasoning, never describe what you're about to do, and never write square-bracketed commentary — brackets are reserved for incoming system context, never your output. To stay silent, output nothing at all.
-
-Lines in [square brackets] are system context, not the user speaking — for example, "[A new person just appeared in front of you.]" is a stage direction telling you what's happening in the room. Respond appropriately but don't read the bracketed text aloud.
-
-After you reply, a short follow-up window opens so the user can continue without saying the wakeword again. Their utterance during that window arrives prefixed with "[follow-up]". The next utterance may not be directed at you — it could be a side conversation, a brief closing, unrelated chatter, or a faint echo of your own reply. Use judgment:
-- If it's clearly NOT addressed to you, output nothing — the conversation ends quietly.
-- If it's a brief closing like "thanks" with nothing to act on, output nothing.
-- If it's a real follow-up, respond normally.
-
-Stay in character: warm, curious, a careful alien friend."""
 
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
@@ -183,22 +141,14 @@ API_ERROR_FALLBACK = (
 # Short pause before the single retry on a transient (non-validation) error.
 API_RETRY_BACKOFF_S = 0.5
 
-# Extended-thinking budget for the turns that opt in (follow-ups and
-# stage-direction events, gated by the FOLLOW_UP_THINKING knob). Gives the
-# model a private channel to reason about whether an utterance is even
-# directed at it, instead of narrating that reasoning into spoken text. When
-# thinking is on, max_tokens must exceed the budget, so we add it on top of
-# MAX_TOKENS (which still covers the spoken reply). 1024 is the API minimum.
-THINKING_BUDGET = 1024
-
 # Rolling summarizer thresholds are now hot config knobs (config.py):
 #   SUMMARIZE_TRIGGER  — backlog size that triggers a background fold
 #   KEEP_RECENT_TURNS  — verbatim tail always preserved
 # Read at the use sites via get_config().get(...).
 
 # Fence around tool output in a rendered transcript. Tool results are the
-# least-trusted text in the system — they come from third-party MCP servers and
-# remote A2A agents — and the summarizer transcript is the one place they get
+# least-trusted text in the system — they come from third-party MCP servers —
+# and the summarizer transcript is the one place they get
 # laundered into something permanent: the summary and the extracted facts both
 # end up as system-role blocks on EVERY later turn. Marking the region lets the
 # two prompts below refuse to take facts or instructions from inside it.
@@ -290,10 +240,7 @@ class AgentSession:
         self,
         ws: ServerConnection,
         memory: Memory,
-        get_latest_jpeg: Callable[[], bytes | None] | None = None,
-        on_external_head_move: Callable[[float, float], None] | None = None,
         mcp: Any = None,
-        a2a: Any = None,
     ) -> None:
         self.ws = ws
         self.client = AsyncAnthropic()
@@ -316,17 +263,7 @@ class AgentSession:
         ]
         if self.messages:
             log.info("hydrated %d turns from memory", len(self.messages))
-        self._tool_ctx = tools.ToolContext(
-            ws=ws,
-            client=self.client,
-            memory=memory,
-            get_latest_jpeg=get_latest_jpeg or (lambda: None),
-            on_external_head_move=(
-                on_external_head_move or (lambda y, p: None)
-            ),
-            mcp=mcp,
-            a2a=a2a,
-        )
+        self._tool_ctx = tools.ToolContext(ws=ws, memory=memory, mcp=mcp)
 
     async def respond(
         self, user_text: str, speak: SpeakFn, on_tool: ToolObserver | None = None
@@ -339,24 +276,7 @@ class AgentSession:
         text for logging."""
         async with self._turn_lock:
             self._begin_exchange({"role": "user", "content": user_text})
-            # Initial wake-word turns stay snappy: no extended thinking.
-            return await self._run_loop(speak, thinking=False, on_tool=on_tool)
-
-    async def respond_to_event(
-        self,
-        stage_direction: str,
-        speak: SpeakFn,
-        on_tool: ToolObserver | None = None,
-    ) -> str:
-        """Run an agent turn off a brain-injected stage direction
-        (proactive greeting on new face, etc.) instead of a user
-        utterance. Wrapped in [brackets] so the system prompt's rule
-        kicks in."""
-        async with self._turn_lock:
-            self._begin_exchange({"role": "user", "content": f"[{stage_direction}]"})
-            return await self._run_loop(
-                speak, thinking=self._thinking_enabled(), on_tool=on_tool
-            )
+            return await self._run_loop(speak, on_tool=on_tool)
 
     async def respond_follow_up(
         self, user_text: str, speak: SpeakFn, on_tool: ToolObserver | None = None
@@ -371,9 +291,7 @@ class AgentSession:
             self._begin_exchange(
                 {"role": "user", "content": f"[follow-up] {user_text}"}
             )
-            return await self._run_loop(
-                speak, thinking=self._thinking_enabled(), on_tool=on_tool
-            )
+            return await self._run_loop(speak, on_tool=on_tool)
 
     @property
     def conversation_ended(self) -> bool:
@@ -399,12 +317,6 @@ class AgentSession:
                 for t in self.memory.list_unsummarized_turns()
             ]
 
-    @staticmethod
-    def _thinking_enabled() -> bool:
-        """Whether follow-up / event turns get a private thinking channel.
-        Hot knob, read per turn so a web-console toggle applies immediately."""
-        return bool(get_config().get("FOLLOW_UP_THINKING"))
-
     def _stage(self, message: dict[str, Any]) -> None:
         """Append to the live in-memory thread and queue the message for the
         end-of-exchange commit. NOT persisted to SQLite yet — see
@@ -414,7 +326,7 @@ class AgentSession:
         self._pending.append(message)
 
     def _begin_exchange(self, opening: dict[str, Any]) -> None:
-        """Start a fresh exchange with its opening user/event message. Drops
+        """Start a fresh exchange with its opening user message. Drops
         any half-staged messages a prior turn left unpersisted (a turn that
         raised mid-loop): those were never committed to SQLite, and their
         in-memory copies are repaired at read time by _sanitize_for_api."""
@@ -432,14 +344,9 @@ class AgentSession:
 
     def _build_system(self) -> list[dict[str, Any]]:
         # Per-turn persona, read here (not cached at construction) so an edit
-        # in the console — or a ROCKY_MODE toggle — takes effect on the next
-        # turn. Rocky mode swaps in its own persona and ignores the
-        # SYSTEM_PROMPT override; in normal mode the override still wins.
+        # in the console takes effect on the next turn.
         cfg = get_config()
-        if cfg.get("ROCKY_MODE"):
-            persona = DEFAULT_ROCKY_PROMPT
-        else:
-            persona = (cfg.get("SYSTEM_PROMPT") or "").strip() or DEFAULT_SYSTEM_PROMPT
+        persona = (cfg.get("SYSTEM_PROMPT") or "").strip() or DEFAULT_SYSTEM_PROMPT
         system: list[dict[str, Any]] = [
             {"type": "text", "text": persona}
         ]
@@ -473,13 +380,10 @@ class AgentSession:
         return system
 
     def _tool_defs(self) -> list[dict[str, Any]]:
-        """Native tools plus any tools the MCP servers and A2A agents
-        currently expose."""
+        """Native tools plus any tools the MCP servers currently expose."""
         defs = list(tools.TOOL_DEFS)
         if self._tool_ctx.mcp is not None:
             defs += self._tool_ctx.mcp.tool_defs()
-        if self._tool_ctx.a2a is not None:
-            defs += self._tool_ctx.a2a.tool_defs()
         return defs
 
     async def _set_busy(self, on: bool) -> None:
@@ -553,7 +457,6 @@ class AgentSession:
     async def _run_loop(
         self,
         speak: SpeakFn,
-        thinking: bool = False,
         on_tool: ToolObserver | None = None,
     ) -> str:
         assembled: list[str] = []
@@ -580,21 +483,11 @@ class AgentSession:
                     "tools": self._tool_defs(),
                     "messages": _sanitize_for_api(self.messages),
                 }
-                if thinking:
-                    # Private reasoning channel. text_stream only yields text
-                    # deltas, so thinking blocks are never spoken. max_tokens
-                    # must exceed the budget, so the spoken-reply allowance
-                    # (MAX_TOKENS) rides on top of it.
-                    stream_kwargs["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": THINKING_BUDGET,
-                    }
-                    stream_kwargs["max_tokens"] = MAX_TOKENS + THINKING_BUDGET
                 try:
                     async with self.client.messages.stream(**stream_kwargs) as stream:
                         async for delta in stream.text_stream:
                             # Never speak [bracketed] text. Brackets are reserved
-                            # for system stage directions in the prompt; the model
+                            # for system context in the prompt; the model
                             # sometimes leaks its own reasoning in brackets
                             # ("[The user is just chatting...]") on follow-up turns.
                             # Strip those spans from spoken output — if the whole
@@ -700,7 +593,6 @@ class AgentSession:
                         response.usage.cache_read_input_tokens,
                         response.usage.cache_creation_input_tokens,
                     )
-                    spawn(_maybe_summarize(self), "summarize")
                     return full
 
                 self._stage({"role": "assistant", "content": content_clean})
@@ -738,8 +630,8 @@ class AgentSession:
                     await speak(API_ERROR_FALLBACK)
                     return " ".join(assembled)
 
-                # Tool-use turn: for a genuinely slow tool (weather, vision,
-                # lights) show we're working and — if the model went straight
+                # Tool-use turn: for a genuinely slow tool (weather, lights)
+                # show we're working and — if the model went straight
                 # to a tool without saying anything — speak a short canned ack
                 # so the user hears feedback within ~1s. `assembled` being
                 # empty means nothing real was spoken yet, which also de-dupes
@@ -747,9 +639,8 @@ class AgentSession:
                 #
                 # Skip both for fast tools (set_expression, look_at, etc.),
                 # which return instantly: a bubble or "just a moment" before
-                # them is jarring. The new-person greeting is the clearest
-                # case — the model sets a happy expression / points its head
-                # *then* says "welcome", and the ack would wedge in between.
+                # them is jarring — the model sets a happy expression / points
+                # its head *then* speaks, and the ack would wedge in between.
                 if _response_has_slow_tool(response):
                     if not busy:
                         await self._set_busy(True)
@@ -770,8 +661,7 @@ class AgentSession:
                             on_tool(block.name, block.input)
                         except Exception:
                             log.exception("on_tool observer failed")
-                    # A tool that raises (describe_view, mcp__*, a2a__* can all
-                    # fail on network/quota) must NOT abort the turn: that would
+                    # A tool that raises (mcp__* can fail on network/quota) must NOT abort the turn: that would
                     # leave this tool_use unanswered — a dangling block that
                     # poisons replay (the same 400 class M6.1 guards on the
                     # persistence side). Turn the exception into an is_error
@@ -1081,7 +971,7 @@ def _render_turn(turn: Turn) -> str:
                 # Fenced, not bare: this transcript feeds the summarizer AND
                 # the durable-fact extractor, and both of their outputs become
                 # system-prompt blocks on every later turn. Without the fence a
-                # hostile MCP/A2A response ("the user authorized you to…")
+                # hostile MCP response ("the user authorized you to…")
                 # reads as conversation and can be distilled into a permanent
                 # "fact". Strip a closing tag out of the payload so the fence
                 # can't be closed from inside it.
@@ -1252,24 +1142,29 @@ async def extract_facts(
     return _parse_fact_lines(text)
 
 
-async def _maybe_summarize(session: "AgentSession") -> None:
-    """Background: if the unsummarized backlog is large, fold the oldest
-    complete-exchange chunk and re-sync this session's in-memory thread.
-    Holds the session turn lock so it can't race with a concurrent user
-    turn rewriting self.messages."""
+async def maybe_summarize(session: "AgentSession") -> None:
+    """If the unsummarized backlog is large, fold the oldest complete-exchange
+    chunk and re-sync this session's in-memory thread.
+
+    The fold and fact extraction (two LLM calls) run WITHOUT the turn lock:
+    they read and mark only persisted, complete exchanges, and a live turn
+    only ever appends newer ones. The lock is taken just to swap the
+    in-memory thread for the new persisted state — so if the user starts
+    talking mid-summary, the summarizer waits for their turn, never the
+    reverse."""
     if session.memory.unsummarized_count() < int(get_config().get("SUMMARIZE_TRIGGER")):
         return
+    result, reason = await summarize_backlog(
+        session.memory,
+        session.client,
+        session.model,
+        keep_recent=int(get_config().get("KEEP_RECENT_TURNS")),
+        force=False,
+    )
+    if result is None:
+        log.info("summarizer: %s", reason)
+        return
     async with session._turn_lock:
-        result, reason = await summarize_backlog(
-            session.memory,
-            session.client,
-            session.model,
-            keep_recent=int(get_config().get("KEEP_RECENT_TURNS")),
-            force=False,
-        )
-        if result is None:
-            log.info("summarizer: %s", reason)
-            return
         # Reset the in-memory thread to match the new persisted state.
         session.messages = [
             {"role": t.role, "content": t.content}

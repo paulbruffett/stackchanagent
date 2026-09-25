@@ -3,20 +3,7 @@
 These are kept dependency-free (no agent_server import) so they run offline on
 any machine, unlike the server module which pulls in Jetson-only deps.
 """
-from policy import effective_sleep_timeout, skin_for_rocky_mode
-
-
-class TestSkinForRockyMode:
-    def test_rocky_mode_on_selects_rocky(self):
-        assert skin_for_rocky_mode(1) == "rocky"
-
-    def test_rocky_mode_off_selects_default(self):
-        assert skin_for_rocky_mode(0) == "default"
-
-    def test_truthy_and_falsy_values(self):
-        assert skin_for_rocky_mode(True) == "rocky"
-        assert skin_for_rocky_mode(False) == "default"
-        assert skin_for_rocky_mode(None) == "default"
+from policy import effective_sleep_timeout
 
 
 class TestEffectiveSleepTimeout:

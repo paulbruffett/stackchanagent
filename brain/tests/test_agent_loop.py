@@ -59,10 +59,10 @@ def test_clean_block_drops_stream_only_decoration():
 
 async def test_tool_turn_commits_whole_exchange(mem, make_agent, speaker):
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("text", "I see a cat.")],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("text", "It is sunny.")],
                       dispatch=_ok_dispatch)
-    full = await sess.respond("what do you see?", speak)
-    assert full == "I see a cat."
+    full = await sess.respond("what's the weather?", speak)
+    assert full == "It is sunny."
     thread = persisted_thread(mem)
     assert validate_thread(thread) == []
     # user, assistant(tool_use), user(tool_result), assistant(text)
@@ -74,10 +74,10 @@ async def test_crash_mid_turn_persists_nothing(mem, make_agent, speaker):
     # assistant tool_use is staged must leave NOTHING in the DB — the M6.1
     # invariant: a half-written exchange is never durable.
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("error", RuntimeError("killed"))],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("error", RuntimeError("killed"))],
                       dispatch=_ok_dispatch)
     with pytest.raises(RuntimeError):
-        await sess.respond("what do you see?", speak)
+        await sess.respond("what's the weather?", speak)
     assert mem.unsummarized_count() == 0
 
 
@@ -88,12 +88,12 @@ async def test_turn_after_a_crash_persists_only_itself(mem, make_agent, speaker)
     # commit would write both exchanges in one batch and durably persist
     # consecutive user messages — the poisoning M6.1 exists to prevent.
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"),
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"),
                        ("error", RuntimeError("killed")),
                        ("text", "Second turn fine.")],
                       dispatch=_ok_dispatch)
     with pytest.raises(RuntimeError):
-        await sess.respond("what do you see?", speak)
+        await sess.respond("what's the weather?", speak)
 
     full = await sess.respond("hello again", speak)
     assert full == "Second turn fine."
@@ -107,9 +107,9 @@ async def test_turn_after_a_crash_persists_only_itself(mem, make_agent, speaker)
 
 async def test_tool_raise_becomes_is_error_and_recovers(mem, make_agent, speaker):
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("text", "I could not.")],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("text", "I could not.")],
                       dispatch=_raising_dispatch)
-    full = await sess.respond("what do you see?", speak)
+    full = await sess.respond("what's the weather?", speak)
     assert full == "I could not."
     # The follow-up request answered the tool_use with an is_error result.
     tr = _tool_results(sess.client.messages.calls[1])[0]
@@ -219,9 +219,9 @@ async def test_over_length_400_drops_the_backlog_durably(mem, make_agent, speake
 
 async def test_max_tokens_drops_the_truncated_tool_use(mem, make_agent, speaker):
     spoken, speak = speaker
-    sess = make_agent([("cutoff", "describe_view", "t1", "Let me look.")],
+    sess = make_agent([("cutoff", "mcp__weather__get_weather", "t1", "Let me look.")],
                       dispatch=_raising_dispatch)
-    full = await sess.respond("what do you see?", speak)
+    full = await sess.respond("what's the weather?", speak)
     # The partial reply is still spoken, the half-parsed tool is not run…
     assert full == "Let me look." and spoken == ["Let me look."]
     assert len(sess.client.messages.calls) == 1
@@ -235,8 +235,8 @@ async def test_max_tokens_with_nothing_but_a_tool_use_stages_no_assistant_turn(
     mem, make_agent, speaker
 ):
     spoken, speak = speaker
-    sess = make_agent([("cutoff", "describe_view", "t1")])
-    assert await sess.respond("what do you see?", speak) == ""
+    sess = make_agent([("cutoff", "mcp__weather__get_weather", "t1")])
+    assert await sess.respond("what's the weather?", speak) == ""
     # An assistant message with zero blocks is not valid API input either.
     assert [t.role for t in mem.list_unsummarized_turns()] == ["user"]
 
@@ -245,7 +245,7 @@ async def test_max_tokens_with_nothing_but_a_tool_use_stages_no_assistant_turn(
 
 async def test_tool_loop_gives_up_after_max_rounds(mem, make_agent, speaker):
     spoken, speak = speaker
-    steps = [("tool", "describe_view", f"t{i}")
+    steps = [("tool", "mcp__weather__get_weather", f"t{i}")
              for i in range(claude_agent.MAX_TOOL_ROUNDS + 1)]
     sess = make_agent(steps, dispatch=_ok_dispatch)
     full = await sess.respond("look", speak)
@@ -316,9 +316,9 @@ async def test_slow_tool_turn_shows_then_clears_the_busy_indicator(
     mem, make_agent, speaker, busy_indicator
 ):
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("text", "I see a cat.")],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("text", "It is sunny.")],
                       dispatch=_ok_dispatch)
-    await sess.respond("what do you see?", speak)
+    await sess.respond("what's the weather?", speak)
     assert [m["on"] for m in sess.ws.cmds("set_busy")] == [True, False]
 
 
@@ -329,10 +329,10 @@ async def test_busy_indicator_cleared_when_the_turn_dies(
     # through the `finally`. Without it the '…' bubble stays latched on the
     # CoreS3 and the device looks wedged until some later turn clears it.
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("error", RuntimeError("killed"))],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("error", RuntimeError("killed"))],
                       dispatch=_ok_dispatch)
     with pytest.raises(RuntimeError):
-        await sess.respond("what do you see?", speak)
+        await sess.respond("what's the weather?", speak)
     assert [m["on"] for m in sess.ws.cmds("set_busy")] == [True, False]
 
 
@@ -340,48 +340,23 @@ async def test_slow_tool_speaks_a_canned_ack_first(
     mem, make_agent, speaker, ack_filler
 ):
     spoken, speak = speaker
-    sess = make_agent([("tool", "describe_view", "t1"), ("text", "I see a cat.")],
+    sess = make_agent([("tool", "mcp__weather__get_weather", "t1"), ("text", "It is sunny.")],
                       dispatch=_ok_dispatch)
-    await sess.respond("what do you see?", speak)
+    await sess.respond("what's the weather?", speak)
     phrases = [p.strip() for p in get_config().get("ACK_FILLER_PHRASES").split("|")]
     assert spoken[0] in phrases
-    assert spoken[1:] == ["I see a cat."]
+    assert spoken[1:] == ["It is sunny."]
 
 
 async def test_fast_tool_turn_shows_no_bubble_and_no_ack(
     mem, make_agent, speaker, busy_indicator, ack_filler
 ):
     # set_expression returns instantly; a bubble or a "just a moment" before it
-    # is jarring — most visibly on the new-person greeting, where the ack would
-    # wedge between the expression change and "welcome".
+    # is jarring — the ack would wedge between the expression change and the
+    # reply.
     spoken, speak = speaker
     sess = make_agent([("tool", "set_expression", "t1"), ("text", "Hello!")],
                       dispatch=_ok_dispatch)
     await sess.respond("look happy", speak)
     assert sess.ws.cmds("set_busy") == []
     assert spoken == ["Hello!"]
-
-
-# --- extended thinking on follow-up / event turns ---------------------------
-
-async def test_follow_up_turn_requests_thinking_with_headroom(
-    mem, make_agent, speaker, follow_up_thinking
-):
-    spoken, speak = speaker
-    sess = make_agent([("text", "Okay.")])
-    await sess.respond_follow_up("turn the light on", speak)
-    kw = sess.client.messages.calls[0]
-    assert kw["thinking"] == {
-        "type": "enabled", "budget_tokens": claude_agent.THINKING_BUDGET,
-    }
-    # The API rejects max_tokens <= budget_tokens, so the spoken-reply
-    # allowance has to ride on top of the budget rather than share it.
-    assert kw["max_tokens"] > claude_agent.THINKING_BUDGET
-
-
-async def test_wakeword_turn_never_thinks(mem, make_agent, speaker, follow_up_thinking):
-    # Even with the knob on: the initial request/response turn stays snappy.
-    spoken, speak = speaker
-    sess = make_agent([("text", "Hi there.")])
-    await sess.respond("hello", speak)
-    assert "thinking" not in sess.client.messages.calls[0]

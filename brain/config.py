@@ -15,7 +15,7 @@ Two classes of knob:
 Usage:
     from config import get_config
     cfg = get_config()
-    interval = cfg.get("LOOK_AROUND_INTERVAL_S")
+    timeout = cfg.get("SLEEP_TIMEOUT_S")
 
 `init_config(memory)` must be called once at startup (agent_server.main)
 before any `get_config()` call.
@@ -99,7 +99,7 @@ SPECS: dict[str, Spec] = {
         "Hard cap on a single utterance length.",
     ),
     "FOLLOW_UP_WINDOW_S": Spec(
-        8.0, "float", False, "capture",
+        4.5, "float", False, "capture",
         "How long the mic stays open after a reply without re-saying the wakeword.",
     ),
     "FOLLOW_UP_GUARD_S": Spec(
@@ -134,13 +134,12 @@ SPECS: dict[str, Spec] = {
         "(risks dropping a very short real follow-up).",
     ),
 
-    # --- Behavior / vision (hot) ----------------------------------------
+    # --- Behavior (hot) -------------------------------------------------
     "SLEEP_TIMEOUT_S": Spec(
         300.0, "float", False, "behavior",
         "Sleep after this many seconds with no interaction (conversation, "
-        "wake word, or head tap). Sleeping turns off the screen and stops "
-        "look-around + face detection until a wake word or tap. 0 = never "
-        "sleep.",
+        "wake word, or head tap). Sleeping turns off the screen until a wake "
+        "word or tap. 0 = never sleep.",
     ),
     "BUDDY_PROMPT_SLEEP_TIMEOUT_S": Spec(
         1800.0, "float", False, "behavior",
@@ -149,50 +148,12 @@ SPECS: dict[str, Spec] = {
         "sleep out from under an unanswered prompt. Never shortens "
         "SLEEP_TIMEOUT_S.",
     ),
-    "GREETING_COOLDOWN_S": Spec(
-        1800.0, "float", False, "behavior",
-        "Minimum time between proactive greetings.",
-    ),
-    "RECENT_INTERACTION_S": Spec(
-        90.0, "float", False, "behavior",
-        "Suppress greeting if the user spoke within this window.",
-    ),
-    "DETECT_INTERVAL_IDLE_S": Spec(
-        20.0, "float", False, "behavior",
-        "Seconds between face-detection passes when idle.",
-    ),
-    "LOOK_AROUND_INTERVAL_S": Spec(
-        180.0, "float", False, "behavior",
-        "Seconds between idle look-around sweeps.",
-    ),
-    "LOOK_AROUND_POSE_DURATION_S": Spec(
-        4.0, "float", False, "behavior",
-        "Dwell time at each look-around pose.",
-    ),
-    "LOOK_AROUND_SPEED": Spec(
-        350, "int", False, "behavior",
-        "Servo spring speed (0-1000) for look-around sweep poses; higher = "
-        "snappier glance. Centering and agent look_at keep the gentler "
-        "firmware default.",
-    ),
-    "CENTERING_COOLDOWN_S": Spec(
-        180.0, "float", False, "behavior",
-        "Lockout after centering on a face before the next centering.",
-    ),
-    "CENTERING_GAIN": Spec(
-        0.7, "float", False, "behavior",
-        "Under-centering factor (FOV is approximate).",
-    ),
 
     # --- MCP / tools (hot) ----------------------------------------------
     "DEFAULT_LOCATION": Spec(
         "Seattle, Washington", "str", False, "tools",
         "Default location for the weather tool when the user doesn't name one.",
     ),
-    # Note: HUE_BRIDGE_IP and HUE_TOKEN live in .env, not here — the Hue
-    # MCP server reads them from its environment (HUE_BRIDGE_IP passes
-    # through the child env; HUE_TOKEN is injected via the server's
-    # env_ref). Set once out-of-band; see mcp_servers/README.md.
 
     # --- Responsiveness during slow tool calls (hot) --------------------
     # int 0/1 are used as booleans (the config layer has no bool type);
@@ -218,16 +179,6 @@ SPECS: dict[str, Spec] = {
         "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
         "Requires firmware with the set_busy command.",
     ),
-    "FOLLOW_UP_THINKING": Spec(
-        1, "int", False, "responsiveness",
-        "Give the model a private extended-thinking channel on follow-up "
-        "and stage-direction (event) turns — the turns where it has to "
-        "judge whether speech is even directed at it. Reasoning then lands "
-        "in thinking (never spoken) instead of leaking into the spoken "
-        "reply, and 'stay silent' becomes an empty spoken turn. Initial "
-        "wake-word request/response turns never think (kept snappy). "
-        "1=on, 0=off. Adds some latency/tokens on those turns.",
-    ),
 
     # --- Memory / summarizer (hot) --------------------------------------
     "SUMMARIZE_TRIGGER": Spec(
@@ -235,6 +186,13 @@ SPECS: dict[str, Spec] = {
         "Unsummarized-turn backlog that triggers a background fold into a "
         "summary. Lower = summarize more eagerly (smaller prompts, more "
         "LLM calls).",
+        minimum=0,
+    ),
+    "SUMMARIZE_IDLE_S": Spec(
+        120.0, "float", False, "memory",
+        "Seconds of idle (no turn, no open mic) after a conversation before "
+        "the backlog is folded. Summarizing waits for the conversation to "
+        "end so its LLM calls never compete with a live turn.",
         minimum=0,
     ),
     "KEEP_RECENT_TURNS": Spec(
@@ -277,25 +235,6 @@ SPECS: dict[str, Spec] = {
         "Override for the durable-fact extraction system prompt. Empty = "
         "built-in default (claude_agent.DEFAULT_EXTRACT_FACTS_SYSTEM).",
         hidden=True,
-    ),
-
-    # --- Rocky mode (hot) — Milestone 4 ---------------------------------
-    # Device-wide character mode: the Rocky persona (broken-English speech)
-    # plus, when a Hume voice is configured in .env, a cloud TTS voice.
-    # Degrades gracefully — persona-only on Piper when no Hume key is set.
-    "ROCKY_MODE": Spec(
-        0, "int", False, "rocky",
-        "Enable Rocky mode: the robot adopts the Rocky persona (broken "
-        "English, third-person self-reference, sentence-ending 'question'). "
-        "If HUME_API_KEY + a Hume voice are set in .env, speech also switches "
-        "to the Hume cloud voice; otherwise the persona runs on the normal "
-        "Piper voice. 1=on, 0=off. Also toggleable by voice ('rocky mode' / "
-        "'normal mode').",
-    ),
-    "ROCKY_SPEED": Spec(
-        1.25, "float", False, "rocky",
-        "Speaking-rate multiplier for the Hume Rocky voice (Hume only; no "
-        "effect on Piper). 1.0 = natural; the default speeds Rocky up a touch.",
     ),
 
     # --- Persona (hot; edited via its own console panel, not the grid) ---
