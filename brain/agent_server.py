@@ -25,6 +25,7 @@ import socket
 import sys
 import time
 import wave
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -47,7 +48,7 @@ from a2a_client import A2aClient
 from mcp_client import McpClient
 from policy import effective_sleep_timeout, skin_for_rocky_mode
 from memory import Memory
-from stt import Transcriber, should_drop_follow_up
+from stt import Transcriber, should_drop_follow_up, strip_wake_word
 from tasks import spawn
 from tts import Synthesizer
 from tts_hume import HumeSynthesizer
@@ -379,6 +380,7 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         # already been sent stop_listening, so just treat it as "heard nothing".
         log.exception("stt failed — going idle")
         return
+    transcript = dataclasses.replace(transcript, text=strip_wake_word(transcript.text))
     if not transcript.text:
         log.info("empty transcript — going idle")
         return

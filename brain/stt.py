@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,17 @@ class Transcript:
     avg_logprob: float = 0.0
     peak_pct: float = 0.0
     rms_pct: float = 0.0
+
+
+# The firmware sends ~500 ms of pre-roll from before the wakeword fired, so a
+# transcript often opens with the tail of the wake word itself.
+_WAKE_WORD_LEAD = re.compile(r"^\W*(?:hey\W+)?(?:com)?puter\b\W*", re.IGNORECASE)
+
+
+def strip_wake_word(text: str) -> str:
+    """Drop a leading "computer" (or its clipped tail, "puter") from a
+    transcript, keeping the rest verbatim."""
+    return _WAKE_WORD_LEAD.sub("", text, count=1)
 
 
 def should_drop_follow_up(

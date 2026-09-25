@@ -1,5 +1,6 @@
 #include "mic_pump.h"
 
+#include <algorithm>
 #include <atomic>
 #include <vector>
 
@@ -35,15 +36,43 @@ constexpr int kFrameMs = 20;
 // only delays audio; a full queue is counted and logged.
 constexpr int kQueueFrames = 50;
 
-QueueHandle_t g_queue = nullptr;
-int g_samples_per_frame = 0;
-
 // Per-second counters, logged from the reader while LISTENING.
 std::atomic<uint32_t> g_read{0};
 std::atomic<uint32_t> g_dropped{0};
 std::atomic<uint32_t> g_sent{0};
 std::atomic<uint32_t> g_send_failed{0};
 std::atomic<uint32_t> g_max_send_us{0};
+
+// Pre-roll: the wakeword fires a beat after "computer" ends, and anything said
+// in that gap ("computer, TURN off the light") used to be lost — the stream
+// only starts on the IDLE→LISTENING transition. Keep the last 500 ms of IDLE
+// audio and send it first. Must stay below kQueueFrames.
+constexpr int kPrerollFrames = 25;
+
+QueueHandle_t g_queue = nullptr;
+int g_samples_per_frame = 0;
+
+// Ring of the most recent IDLE frames, oldest at g_ring_head once full.
+int16_t* g_ring = nullptr;
+int g_ring_head = 0;
+int g_ring_count = 0;
+
+void ring_push(const std::vector<int16_t>& frame)
+{
+    std::copy(frame.begin(), frame.end(), g_ring + g_ring_head * g_samples_per_frame);
+    g_ring_head = (g_ring_head + 1) % kPrerollFrames;
+    if (g_ring_count < kPrerollFrames) ++g_ring_count;
+}
+
+void ring_flush_to_queue()
+{
+    int start = (g_ring_head - g_ring_count + kPrerollFrames) % kPrerollFrames;
+    for (int i = 0; i < g_ring_count; ++i) {
+        const int16_t* f = g_ring + ((start + i) % kPrerollFrames) * g_samples_per_frame;
+        if (xQueueSend(g_queue, f, 0) != pdTRUE) g_dropped.fetch_add(1);
+    }
+    g_ring_count = 0;
+}
 
 void log_stats_if_due(int64_t& last_log_us)
 {
@@ -101,8 +130,13 @@ void task(void*)
     // with this reader on core 1.
     xTaskCreatePinnedToCore(sender_task, "agent_mic_tx", 4096, nullptr, 5, nullptr, 0);
 
+    g_ring = static_cast<int16_t*>(heap_caps_malloc(
+        kPrerollFrames * g_samples_per_frame * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    if (!g_ring) mclog::tagWarn(TAG, "pre-roll alloc failed; streaming without it");
+
     std::vector<int16_t> buf(g_samples_per_frame);
     int64_t last_log_us = esp_timer_get_time();
+    auto prev_mode = state::current();
 
     while (true) {
         auto mode = state::current();
@@ -118,10 +152,15 @@ void task(void*)
         }
         if (mode == state::Mode::Idle) {
             wakeword::feed(buf);
+            if (g_ring) ring_push(buf);
         } else if (mode == state::Mode::Listening) {
+            // Only a wakeword/tap start has fresh pre-roll: a follow-up window
+            // opens from SPEAKING, whose frames were never captured.
+            if (prev_mode == state::Mode::Idle && g_ring) ring_flush_to_queue();
             g_read.fetch_add(1);
             if (xQueueSend(g_queue, buf.data(), 0) != pdTRUE) g_dropped.fetch_add(1);
         }
+        prev_mode = mode;
         log_stats_if_due(last_log_us);
     }
 }
