@@ -42,6 +42,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from claude_agent import AgentSession, maybe_summarize, repair_memory
 from config import get_config, init_config
+import ha_fast_path
 from mcp_client import McpClient
 from policy import effective_sleep_timeout
 from memory import Memory
@@ -349,7 +350,17 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
     # publish its own as empty.
     on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    if follow_up_turn:
+    # Home Assistant first: a device command or state question it matches
+    # locally is answered in ~50 ms with no LLM call. A miss costs the same.
+    fast = await ha_fast_path.try_handle(transcript.text)
+    if fast is not None:
+        async def run(spk: Callable[[str], Awaitable[None]]) -> str:
+            await spk(fast.speech)
+            await agent.record_exchange(
+                transcript.text, fast.speech, follow_up=follow_up_turn
+            )
+            return fast.speech
+    elif follow_up_turn:
         run = lambda spk: agent.respond_follow_up(
             transcript.text, spk, on_tool=on_tool
         )
@@ -357,14 +368,16 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         run = lambda spk: agent.respond(transcript.text, spk, on_tool=on_tool)
     speak_text = await _drive_agent_turn(ws, state, run)
     total_ms = int((time.monotonic() - t0) * 1000)
-    log.info("agent turn: %d ms total, %r", total_ms, speak_text[:120])
+    log.info("%s turn: %d ms total, %r", "ha" if fast else "agent", total_ms, speak_text[:120])
     publish_turn({
         "ts": time.time(),
         "transcript": transcript.text,
         "follow_up": follow_up_turn,
+        "path": "ha" if fast else "llm",
         "tools": tool_calls,
         "reply": speak_text,
         "stt_ms": transcript.latency_ms,
+        "ha_ms": fast.latency_ms if fast else None,
         "total_ms": total_ms,
     })
 

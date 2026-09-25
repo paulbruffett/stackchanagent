@@ -318,6 +318,17 @@ class AgentSession:
                 for t in self.memory.list_unsummarized_turns()
             ]
 
+    async def record_exchange(self, user_text: str, reply: str, *, follow_up: bool) -> None:
+        """Persist a turn something other than the model answered (the Home
+        Assistant fast path), so the next LLM turn knows what just happened —
+        "turn on the office light" then "actually, dim it" has to resolve
+        "it". Same opening prefix and atomic commit as a model turn."""
+        opening = f"[follow-up] {user_text}" if follow_up else user_text
+        async with self._turn_lock:
+            self._begin_exchange({"role": "user", "content": opening})
+            self._stage({"role": "assistant", "content": [{"type": "text", "text": reply}]})
+            self._commit_exchange()
+
     def _stage(self, message: dict[str, Any]) -> None:
         """Append to the live in-memory thread and queue the message for the
         end-of-exchange commit. NOT persisted to SQLite yet — see
