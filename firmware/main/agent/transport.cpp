@@ -235,11 +235,6 @@ bool send_audio(const int16_t* samples, size_t sample_count)
                        sample_count * sizeof(int16_t));
 }
 
-bool send_jpeg(const uint8_t* jpeg, size_t len)
-{
-    return send_binary(OP_JPEG, jpeg, len);
-}
-
 bool send_event_json(std::string_view json)
 {
     auto& s = state();

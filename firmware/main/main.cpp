@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string_view>
 
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
@@ -25,7 +26,6 @@
 #include <display/display.h>
 
 #include "agent/buddy_ble.h"
-#include "agent/camera_pump.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
 #include "agent/speaker_play.h"
@@ -71,10 +71,17 @@ static void network_task(void*)
     set_net_status({});
 
     agent::transport::start(BRAIN_HOST, BRAIN_PORT);
-    agent::camera_pump::start();
+#if CONFIG_STACKCHAN_BUDDY_BLE
     // BLE last, deliberately: this keeps NimBLE's bring-up after the Wi-Fi
     // controller's, the order this build has always run in.
     agent::buddy_ble::start();
+#else
+    // No BLE controller running, so Wi-Fi can stay awake. Modem sleep (the
+    // default, and mandatory under BT coexistence) parks ACKs until the next
+    // beacon, which throttles the mic uplink's TCP window.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    mclog::tagInfo(TAG, "wifi power save off: {}", esp_err_to_name(ps_err));
+#endif
     vTaskDelete(nullptr);
 }
 

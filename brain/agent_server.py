@@ -371,7 +371,14 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         # Whole-file WAV write; off the loop like every other blocking call
         # here, so turning the debug dump on doesn't stall the console/mDNS.
         await asyncio.to_thread(_dump_capture, pcm)
-    transcript = await stt.transcribe(pcm)
+    try:
+        transcript = await stt.transcribe(pcm)
+    except Exception:
+        # A CUDA OOM here used to escape the message loop and drop the socket,
+        # turning one failed utterance into a reconnect. The firmware has
+        # already been sent stop_listening, so just treat it as "heard nothing".
+        log.exception("stt failed — going idle")
+        return
     if not transcript.text:
         log.info("empty transcript — going idle")
         return
@@ -558,6 +565,20 @@ async def _maybe_sync_skin(ws: ServerConnection, state: ConnState) -> None:
     log.info("skin → %s", want)
 
 
+SLEEP_CHECK_INTERVAL_S = 5.0
+
+
+async def _sleep_ticker(ws: ServerConnection, state: ConnState) -> None:
+    """Idle → sleep check on its own clock. It used to ride the camera frame
+    stream (~every 1.5 s), which the firmware no longer sends: frames shared
+    the socket with the mic and starved it. Cancelled by handle() on
+    disconnect."""
+    while True:
+        await asyncio.sleep(SLEEP_CHECK_INTERVAL_S)
+        if _should_sleep(state):
+            await go_to_sleep(ws, state)
+
+
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
     """Enter sleep: tell the firmware to turn the screen off (it sets a
     sleepy face first), and stop look-around + face detection. The wake
@@ -724,6 +745,7 @@ async def handle(ws: ServerConnection) -> None:
     # Sync the avatar skin to the current ROCKY_MODE on connect (boot brings up
     # the default skin; this flips it to Rocky if ROCKY_MODE is on).
     await _maybe_sync_skin(ws, state)
+    sleep_ticker = spawn(_sleep_ticker(ws, state), "sleep_ticker")
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -794,12 +816,6 @@ async def handle(ws: ServerConnection) -> None:
                 # so describe_view still has a recent one after waking.
                 if state.asleep:
                     continue
-                # Awake + idle long enough → sleep. Checked on each frame
-                # (~every 1.5 s), which is a fine cadence for a minutes-scale
-                # timeout.
-                if _should_sleep(state):
-                    await go_to_sleep(ws, state)
-                    continue
                 interval = (
                     DETECT_INTERVAL_LOOK_AROUND_S
                     if state.behavior.look_around_in_progress
@@ -851,6 +867,7 @@ async def handle(ws: ServerConnection) -> None:
         # deliberately left to finish — cancelling it at an arbitrary await is
         # how the M6.1 half-written tool_use corruption happens.
         _cancel_follow_up_timeout(state)
+        sleep_ticker.cancel()
         log.info("esp32 disconnected")
 
 
