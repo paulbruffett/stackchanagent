@@ -43,13 +43,13 @@ log = logging.getLogger("brain.webui")
 
 TOKEN_HEADER = "x-stackchan-token"
 
-# `env_ref` names the one .env variable a child MCP server / A2A endpoint is
-# allowed to see, which is the point of the field (HUE_TOKEN for the Hue
+# `env_ref` names the one .env variable a child MCP server is allowed to see,
+# which is the point of the field (e.g. HA_TOKEN for a Home Assistant http
 # server). What it must never name is a credential the *brain* itself holds:
 # mcp_client._child_env strips secret-looking vars from the child environment
 # and then re-adds exactly the named one, so `env_ref: ANTHROPIC_API_KEY`
 # hands our own key to whatever command that registry row launches.
-PROTECTED_ENV = {"ANTHROPIC_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
+PROTECTED_ENV = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
 
 # The only two mcp_client._open_session knows how to open. Anything else was
 # accepted by the registry and then failed at connect time with a ValueError
@@ -106,7 +106,7 @@ def _check_transport(transport: Any) -> None:
 
 
 def create_app(
-    memory: Memory, config: Config, mcp: Any = None, a2a: Any = None,
+    memory: Memory, config: Config, mcp: Any = None,
     *,
     token: str | None = None,
     resync_sessions: Callable[[], Awaitable[int]] | None = None,
@@ -451,69 +451,6 @@ def create_app(
             raise HTTPException(503, "MCP client not available")
         await mcp.reload()
         return {"servers": mcp.status()}
-
-    # --- A2A servers (Phase 9c) ---------------------------------------
-    @app.get("/api/a2a/servers")
-    async def list_a2a() -> dict[str, Any]:
-        # Merge persisted registry rows with live connection status.
-        status = {s["name"]: s for s in (a2a.status() if a2a else [])}
-        servers = []
-        for s in memory.list_a2a_servers():
-            live = status.get(s.name, {})
-            servers.append({
-                "id": s.id, "name": s.name, "url": s.url,
-                "env_ref": s.env_ref, "enabled": s.enabled,
-                "connected": live.get("connected", False),
-                "error": live.get("error"),
-                "agent": live.get("agent"),
-                "delegates": live.get("delegates", []),
-            })
-        return {"servers": servers, "a2a_available": a2a is not None}
-
-    @app.post("/api/a2a/servers")
-    async def add_a2a(body: dict[str, Any]) -> dict[str, Any]:
-        name = (body.get("name") or "").strip()
-        url = (body.get("url") or "").strip()
-        if not name:
-            raise HTTPException(400, "missing 'name'")
-        if not url:
-            raise HTTPException(400, "missing 'url'")
-        _check_env_ref(body.get("env_ref"))
-        try:
-            sid = memory.add_a2a_server(
-                name=name,
-                url=url,
-                env_ref=body.get("env_ref") or None,
-                enabled=bool(body.get("enabled", True)),
-            )
-        except Exception as exc:
-            raise HTTPException(400, f"could not add server: {exc}")
-        return {"id": sid}
-
-    @app.put("/api/a2a/servers/{server_id}")
-    async def edit_a2a(server_id: int, body: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "url", "env_ref", "enabled"}
-        fields = {k: v for k, v in body.items() if k in allowed}
-        if not fields:
-            raise HTTPException(400, "no editable fields")
-        if "env_ref" in fields:
-            _check_env_ref(fields["env_ref"])
-        if not memory.update_a2a_server(server_id, **fields):
-            raise HTTPException(404, "no such server")
-        return {"ok": True}
-
-    @app.delete("/api/a2a/servers/{server_id}")
-    async def remove_a2a(server_id: int) -> dict[str, Any]:
-        if not memory.delete_a2a_server(server_id):
-            raise HTTPException(404, "no such server")
-        return {"ok": True}
-
-    @app.post("/api/a2a/reload")
-    async def reload_a2a() -> dict[str, Any]:
-        if a2a is None:
-            raise HTTPException(503, "A2A client not available")
-        await a2a.reload()
-        return {"servers": a2a.status()}
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")

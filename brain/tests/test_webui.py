@@ -65,11 +65,11 @@ async def test_mcp_env_ref_cannot_name_the_brains_own_key(client, mem):
 
 async def test_mcp_env_ref_still_allows_a_server_secret(client, mem):
     r = await client.post("/api/mcp/servers", headers=AUTH, json={
-        "name": "hue", "transport": "stdio", "command": "python",
-        "env_ref": "HUE_TOKEN",
+        "name": "home-assistant", "transport": "stdio", "command": "python",
+        "env_ref": "HA_TOKEN",
     })
     assert r.status_code == 200
-    assert [s.env_ref for s in mem.list_mcp_servers()] == ["HUE_TOKEN"]
+    assert [s.env_ref for s in mem.list_mcp_servers()] == ["HA_TOKEN"]
 
 
 async def test_unknown_mcp_transport_is_refused(client, mem):
