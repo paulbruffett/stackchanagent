@@ -154,13 +154,10 @@ SPECS: dict[str, Spec] = {
         1, "int", False, "tools",
         "Try Home Assistant's local intent matcher before the LLM. A definite "
         "hit (a device action or state answer) is spoken straight back with "
-        "no LLM call; anything else falls through. Needs HA_TOKEN in .env. "
+        "no LLM call; anything else falls through. Needs HA_TOKEN (and "
+        "optionally HA_URL) in .env. "
         "0 = off.",
         minimum=0, maximum=1,
-    ),
-    "HA_URL": Spec(
-        "http://localhost:8123", "str", False, "tools",
-        "Home Assistant base URL for the intent fast path.",
     ),
     "DEFAULT_LOCATION": Spec(
         "Seattle, Washington", "str", False, "tools",
