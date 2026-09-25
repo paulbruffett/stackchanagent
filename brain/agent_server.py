@@ -119,6 +119,10 @@ class ConnState:
     # last_activity_s of the idle stretch the summarizer already ran in, so a
     # long quiet spell folds the backlog once rather than every tick.
     summarized_for_activity_s: float = -1.0
+    # The in-flight fold, if any, and when the last one started (spaces out
+    # retries of the overflow fold if the LLM call keeps failing).
+    summarize_task: asyncio.Task | None = None
+    last_summarize_s: float = 0.0
     # monotonic time the most recent TTS playback is expected to finish on
     # the device. The brain sends audio faster than real time, so when the
     # speaker worker returns the device still has buffered audio playing;
@@ -463,15 +467,30 @@ def _should_sleep(state: ConnState) -> bool:
 IDLE_CHECK_INTERVAL_S = 5.0
 
 
+# A conversation that never goes quiet for SUMMARIZE_IDLE_S would otherwise
+# never fold, and an ever-growing backlog ends in an over-length 400 whose
+# recovery deletes the whole unsummarized history. Past this multiple of
+# SUMMARIZE_TRIGGER, fold between turns anyway.
+SUMMARIZE_OVERFLOW_FACTOR = 2
+SUMMARIZE_RETRY_S = 60.0
+
+
 def _should_summarize(state: ConnState) -> bool:
-    """True once per idle stretch, SUMMARIZE_IDLE_S after the last turn, when
-    no mic is open — i.e. the conversation is over."""
-    if state.agent is None or state.listening or state.speaking:
+    """Fold once per idle stretch, SUMMARIZE_IDLE_S after the last turn — or
+    between turns if the backlog has overflowed. Never while a mic is open or
+    a fold is already running."""
+    if state.listening or state.speaking:
         return False
+    if state.summarize_task is not None and not state.summarize_task.done():
+        return False
+    cfg = get_config()
+    now = time.monotonic()
+    trigger = int(cfg.get("SUMMARIZE_TRIGGER"))
+    if memory.unsummarized_count() >= trigger * SUMMARIZE_OVERFLOW_FACTOR:
+        return now - state.last_summarize_s >= SUMMARIZE_RETRY_S
     if state.summarized_for_activity_s == state.last_activity_s:
         return False
-    idle_for = time.monotonic() - state.last_activity_s
-    return idle_for >= float(get_config().get("SUMMARIZE_IDLE_S"))
+    return now - state.last_activity_s >= float(cfg.get("SUMMARIZE_IDLE_S"))
 
 
 async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
@@ -482,7 +501,12 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
         await asyncio.sleep(IDLE_CHECK_INTERVAL_S)
         if _should_summarize(state):
             state.summarized_for_activity_s = state.last_activity_s
-            spawn(maybe_summarize(state.agent), "summarize")
+            state.last_summarize_s = time.monotonic()
+            # A fresh connection (reconnect, brain restart) has no session
+            # until its first turn; the backlog it inherited still needs
+            # folding, so make one.
+            agent = ensure_agent(ws, state)
+            state.summarize_task = spawn(maybe_summarize(agent), "summarize")
         if _should_sleep(state):
             await go_to_sleep(ws, state)
 
@@ -540,6 +564,9 @@ async def handle(ws: ServerConnection) -> None:
     # durable self-heal (firmware → IDLE on WS disconnect, "Fix A") is queued
     # for the next reflash.
     await ws.send(json.dumps({"cmd": "stop_speaking"}))
+    # Rocky mode is gone, but a firmware that was showing the Rocky skin when
+    # the old brain went away keeps it until told otherwise.
+    await ws.send(json.dumps({"cmd": "set_skin", "value": "default"}))
     state = ConnState()
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.

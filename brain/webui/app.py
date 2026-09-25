@@ -49,7 +49,7 @@ TOKEN_HEADER = "x-stackchan-token"
 # mcp_client._child_env strips secret-looking vars from the child environment
 # and then re-adds exactly the named one, so `env_ref: ANTHROPIC_API_KEY`
 # hands our own key to whatever command that registry row launches.
-PROTECTED_ENV = {"ANTHROPIC_API_KEY", "CONSOLE_TOKEN"}
+PROTECTED_ENV = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
 
 # The only two mcp_client._open_session knows how to open. Anything else was
 # accepted by the registry and then failed at connect time with a ValueError

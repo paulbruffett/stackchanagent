@@ -20,6 +20,7 @@ Default model: claude-haiku-4-5. Sonnet escalation is Phase 6.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -997,6 +998,8 @@ async def summarize_backlog(
     keep_recent: int,
     trigger: int | None = None,
     force: bool = False,
+    commit_lock: asyncio.Lock | None = None,
+    on_commit: Callable[[], None] | None = None,
 ) -> tuple[Summary | None, str]:
     """Fold the oldest complete-exchange chunk of unsummarized turns into a
     single summary row and mark those turns summarized. Always keeps the
@@ -1053,7 +1056,19 @@ async def summarize_backlog(
         if not summary:
             return None, "summarizer returned empty text"
 
-        sid = memory.save_summary(span[0].id, span[-1].id, summary)
+        # The LLM call above ran unlocked; the write does not. Under
+        # `commit_lock` (the session turn lock) no turn is mid-flight, so none
+        # sees a summary appear in its system prompt while its thread still
+        # holds the same turns verbatim. And a turn that purged the backlog
+        # meanwhile (over-length recovery) must not get a summary of rows
+        # that no longer exist.
+        async with commit_lock or contextlib.nullcontext():
+            live_ids = {t.id for t in memory.list_unsummarized_turns()}
+            if any(t.id not in live_ids for t in span):
+                return None, "backlog changed while summarizing; skipped"
+            sid = memory.save_summary(span[0].id, span[-1].id, summary)
+            if on_commit is not None:
+                on_commit()
         log.info("summary %d saved (%d chars): %r", sid, len(summary), summary[:160])
 
         # Harvest enduring facts from the same span into permanent memory.
@@ -1146,25 +1161,14 @@ async def maybe_summarize(session: "AgentSession") -> None:
     """If the unsummarized backlog is large, fold the oldest complete-exchange
     chunk and re-sync this session's in-memory thread.
 
-    The fold and fact extraction (two LLM calls) run WITHOUT the turn lock:
-    they read and mark only persisted, complete exchanges, and a live turn
-    only ever appends newer ones. The lock is taken just to swap the
-    in-memory thread for the new persisted state — so if the user starts
-    talking mid-summary, the summarizer waits for their turn, never the
-    reverse."""
+    The fold and fact extraction (two LLM calls) run WITHOUT the turn lock, so
+    a user who starts talking mid-summary is never queued behind them. Only
+    the write — saving the summary, re-syncing the thread, pruning — takes the
+    lock (see summarize_backlog's commit_lock)."""
     if session.memory.unsummarized_count() < int(get_config().get("SUMMARIZE_TRIGGER")):
         return
-    result, reason = await summarize_backlog(
-        session.memory,
-        session.client,
-        session.model,
-        keep_recent=int(get_config().get("KEEP_RECENT_TURNS")),
-        force=False,
-    )
-    if result is None:
-        log.info("summarizer: %s", reason)
-        return
-    async with session._turn_lock:
+
+    def commit() -> None:
         # Reset the in-memory thread to match the new persisted state.
         session.messages = [
             {"role": t.role, "content": t.content}
@@ -1177,3 +1181,15 @@ async def maybe_summarize(session: "AgentSession") -> None:
         if s_del:
             log.info("pruned: %d summaries / %d turns (retention=%d)",
                      s_del, t_del, retention)
+
+    result, reason = await summarize_backlog(
+        session.memory,
+        session.client,
+        session.model,
+        keep_recent=int(get_config().get("KEEP_RECENT_TURNS")),
+        force=False,
+        commit_lock=session._turn_lock,
+        on_commit=commit,
+    )
+    if result is None:
+        log.info("summarizer: %s", reason)

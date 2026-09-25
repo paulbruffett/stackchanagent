@@ -183,9 +183,10 @@ SPECS: dict[str, Spec] = {
     # --- Memory / summarizer (hot) --------------------------------------
     "SUMMARIZE_TRIGGER": Spec(
         20, "int", False, "memory",
-        "Unsummarized-turn backlog that triggers a background fold into a "
-        "summary. Lower = summarize more eagerly (smaller prompts, more "
-        "LLM calls).",
+        "Unsummarized-turn backlog at which the next idle stretch "
+        "(SUMMARIZE_IDLE_S) folds it into a summary; at twice this it folds "
+        "between turns even mid-conversation. Lower = summarize more eagerly "
+        "(smaller prompts, more LLM calls).",
         minimum=0,
     ),
     "SUMMARIZE_IDLE_S": Spec(
