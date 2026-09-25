@@ -43,6 +43,12 @@ _SENT_END = re.compile(r'(?<=[A-Za-z0-9\)\]\"\'])[.!?](?=\s|$)')
 
 SpeakFn = Callable[[str], Awaitable[None]]
 
+
+def _opening(user_text: str, follow_up: bool) -> str:
+    """The stored user message. The system prompt keys on this prefix to tell
+    a no-wake-word follow-up from a direct request."""
+    return f"[follow-up] {user_text}" if follow_up else user_text
+
 # Per-turn observer, called with (tool_name, tool_input) as each tool is
 # dispatched (the web console's turn recorder). Threaded through the respond*
 # entrypoints rather than parked on the session: _turn_lock is acquired INSIDE
@@ -290,7 +296,7 @@ class AgentSession:
         robot or was a brief closing."""
         async with self._turn_lock:
             self._begin_exchange(
-                {"role": "user", "content": f"[follow-up] {user_text}"}
+                {"role": "user", "content": _opening(user_text, follow_up=True)}
             )
             return await self._run_loop(speak, on_tool=on_tool)
 
@@ -317,6 +323,16 @@ class AgentSession:
                 {"role": t.role, "content": t.content}
                 for t in self.memory.list_unsummarized_turns()
             ]
+
+    async def record_exchange(self, user_text: str, reply: str, *, follow_up: bool) -> None:
+        """Persist a turn something other than the model answered (the Home
+        Assistant fast path), so the next LLM turn knows what just happened —
+        "turn on the office light" then "actually, dim it" has to resolve
+        "it". Same opening prefix and atomic commit as a model turn."""
+        async with self._turn_lock:
+            self._begin_exchange({"role": "user", "content": _opening(user_text, follow_up)})
+            self._stage({"role": "assistant", "content": [{"type": "text", "text": reply}]})
+            self._commit_exchange()
 
     def _stage(self, message: dict[str, Any]) -> None:
         """Append to the live in-memory thread and queue the message for the

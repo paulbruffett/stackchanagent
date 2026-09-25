@@ -449,7 +449,7 @@ function appendLog(item) {
 function appendTurn(t) {
   const list = $("#tx-list");
   const card = el("div", { className: "card tx" });
-  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") }));
+  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") + (t.path === "ha" ? " · home assistant" : "") }));
   card.append(el("div", {}, el("span", { className: "t", textContent: "“" + (t.transcript || "") + "”" })));
   if (t.tools && t.tools.length)
     card.append(el("div", { innerHTML: t.tools.map((x) => `<span class="pill">${esc(x.name)} ${esc(JSON.stringify(x.input))}</span>`).join("") }));
@@ -457,6 +457,7 @@ function appendTurn(t) {
   else card.append(el("div", { className: "muted", textContent: "(silent)" }));
   const meta = [];
   if (t.stt_ms != null) meta.push(`stt ${t.stt_ms}ms`);
+  if (t.ha_ms != null) meta.push(`ha ${t.ha_ms}ms`);
   if (t.total_ms != null) meta.push(`turn ${t.total_ms}ms`);
   card.append(el("div", { className: "meta", textContent: meta.join(" · ") }));
   list.prepend(card);
