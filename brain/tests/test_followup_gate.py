@@ -72,3 +72,12 @@ def test_strip_wake_word_leaves_other_text_alone():
     assert strip_wake_word("turn off the computer monitor") == "turn off the computer monitor"
     assert strip_wake_word("computers are neat") == "computers are neat"
     assert strip_wake_word("") == ""
+
+
+def test_starts_with_wake_word():
+    from stt import starts_with_wake_word
+
+    assert starts_with_wake_word("Computer, turn on the office light.")
+    assert starts_with_wake_word("...puter turn on the light")
+    assert not starts_with_wake_word("turn on the computer")
+    assert not starts_with_wake_word("Thanks.")

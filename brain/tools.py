@@ -151,6 +151,23 @@ NOTHING_SAVED = "Empty fact — nothing saved."
 NATIVE_EFFECT_TOOLS = frozenset({"set_expression", "look_at", "remember_fact"})
 
 
+def clean_mcp_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Drop argument values that only mean "not given". Models fill every
+    optional property of a schema with a blank — Home Assistant's intent tools
+    have no required fields at all — and HA rejects the whole call over one
+    of them ("Received invalid slot info" for floor="" or device_class=[];
+    "Failed to call turn_on" for a colour temperature of 0 K). Blank strings,
+    empty lists/dicts and None are never meaningful slot values; a colour
+    temperature of 0 or below never is either. A brightness of 0 is real and
+    stays."""
+    out = {k: v for k, v in args.items() if v not in (None, "", [], {})}
+    if name.rsplit("__", 1)[-1].startswith("Hass"):
+        temp = out.get("temperature")
+        if isinstance(temp, (int, float)) and temp <= 0:
+            del out["temperature"]
+    return out
+
+
 async def dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
 ) -> str:
@@ -173,7 +190,7 @@ async def _dispatch(
     # MCP tools (Phase 9b) take priority — they're namespaced (`mcp__…`)
     # so they can't collide with the native tools below.
     if ctx.mcp is not None and ctx.mcp.is_mcp_tool(name):
-        return await ctx.mcp.dispatch(name, input_)
+        return await ctx.mcp.dispatch(name, clean_mcp_args(name, input_))
     if name == "set_expression":
         await ctx.ws.send(
             json.dumps({"cmd": "set_expression", "value": input_["expression"]})

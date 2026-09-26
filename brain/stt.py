@@ -53,6 +53,12 @@ def strip_wake_word(text: str) -> str:
     return _WAKE_WORD_LEAD.sub("", text, count=1)
 
 
+def starts_with_wake_word(text: str) -> bool:
+    """True when the transcript opens with the wake word — the user
+    addressed the robot directly even though the mic was already open."""
+    return bool(_WAKE_WORD_LEAD.match(text))
+
+
 def should_drop_follow_up(
     t: Transcript,
     voiced_ms: float,
