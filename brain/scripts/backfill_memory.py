@@ -50,7 +50,7 @@ async def main() -> None:
 
     if summaries:
         transcript = "\n\n".join(s.summary for s in summaries)
-        client = claude_agent.make_client()
+        client = claude_agent.get_client()
         new_facts = await claude_agent.extract_facts(
             client, model, transcript, facts_before
         )

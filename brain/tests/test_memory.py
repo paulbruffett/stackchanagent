@@ -41,8 +41,12 @@ def test_update_turn(mem):
         {"role": "assistant", "content": "hi", "tool_calls": [call]},
     ])
     assert mem.list_unsummarized_turns()[0].extra == {"tool_calls": [call]}
-    # Stripping the calls clears extra_json entirely.
-    assert mem.update_turn(tid, "hi") is True
+    # The 2-arg form replaces content only; extra_json is left alone.
+    assert mem.update_turn(tid, "hello") is True
+    assert mem.list_unsummarized_turns()[0].message == {
+        "role": "assistant", "content": "hello", "tool_calls": [call]}
+    # Passing extra replaces it; {} clears it entirely.
+    assert mem.update_turn(tid, "hi", {}) is True
     rows = mem.list_unsummarized_turns()
     assert rows[0].message == {"role": "assistant", "content": "hi"}
     assert mem.update_turn(9999, "x") is False
@@ -244,3 +248,15 @@ def test_merge_facts_dedupes_case_insensitively(mem):
     ])
     assert added == 1
     assert mem.list_facts() == ["Paul likes coffee", "Paul lives in Seattle"]
+
+
+def test_delete_block_list_turns_spares_strings_and_nulls(mem):
+    mem.append_turns([
+        {"role": "user", "content": "keep"},
+        {"role": "assistant", "content": [{"type": "text", "text": "legacy"}]},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "user", "content": "[bracketed but a string]"},
+    ])
+    assert mem.delete_block_list_turns() == 1
+    assert [t.content for t in mem.recent_turns()] == [
+        "keep", None, "[bracketed but a string]"]

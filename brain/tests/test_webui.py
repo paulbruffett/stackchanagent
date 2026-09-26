@@ -18,7 +18,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from config import get_config
+from config import SPECS, get_config
 from webui.app import TOKEN_HEADER, create_app
 
 TOKEN = "test-console-token"
@@ -168,3 +168,41 @@ async def test_turn_listing_carries_tool_calls_and_legacy_rows(client, mem):
     assert turns[0]["content"] == [{"type": "text", "text": "legacy"}]
     assert turns[2]["tool_calls"] == [call]
     assert turns[3] == {"id": 4, "role": "tool", "tool_call_id": "c1", "content": "ok"}
+
+
+# --- model / effort knobs are validated ---------------------------------------
+
+@pytest.mark.parametrize("key, value", [
+    ("MODEL", "claude-haiku-4-5"),        # an Anthropic-era id: no vendor
+    ("MODEL", ""),
+    ("MODEL", "openai/"),
+    ("SUMMARY_MODEL", "gpt 5"),
+    ("REASONING_EFFORT", "extreme"),
+])
+async def test_bad_model_or_effort_is_a_400(client, key, value):
+    r = await client.put("/api/config", headers=AUTH, json={"key": key, "value": value})
+    assert r.status_code == 400
+    assert get_config().get(key) == SPECS[key].default
+
+
+@pytest.mark.parametrize("key, value, stored", [
+    ("MODEL", " anthropic/claude-haiku-4.5 ", "anthropic/claude-haiku-4.5"),
+    ("SUMMARY_MODEL", "", ""),                 # empty = use MODEL
+    ("REASONING_EFFORT", "HIGH", "high"),
+    ("REASONING_EFFORT", "", ""),
+])
+async def test_good_model_or_effort_is_stored_normalised(client, key, value, stored):
+    r = await client.put("/api/config", headers=AUTH, json={"key": key, "value": value})
+    assert r.status_code == 200
+    assert get_config().get(key) == stored
+
+
+def test_stale_stored_model_is_ignored_on_reload(mem):
+    # memory.db on the Jetson may still hold MODEL=claude-haiku-4-5 from the
+    # Anthropic days; reload must fall back to the default, not 400 each turn.
+    mem.set_config("MODEL", "claude-haiku-4-5")
+    mem.set_config("REASONING_EFFORT", "turbo")
+    cfg = get_config()
+    cfg.reload()
+    assert cfg.get("MODEL") == SPECS["MODEL"].default
+    assert cfg.get("REASONING_EFFORT") == "low"

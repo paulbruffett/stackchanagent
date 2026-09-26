@@ -27,6 +27,8 @@ class _FakeLLM:
         self.during = during
         self.locked_during_call: list[bool] = []
         self.calls: list[dict] = []
+        self.reply = "they talked"
+        self.finish = "stop"
 
     async def create(self, **kw):
         self.calls.append(kw)
@@ -34,7 +36,7 @@ class _FakeLLM:
         if self.during:
             self.during()
         return SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content="they talked"))])
+            message=SimpleNamespace(content=self.reply), finish_reason=self.finish)])
 
 
 async def test_llm_runs_unlocked_and_commit_resyncs(mem, make_agent):
@@ -122,3 +124,30 @@ async def test_below_trigger_does_nothing(mem, make_agent, monkeypatch):
 
     monkeypatch.setattr(claude_agent, "summarize_backlog", boom)
     await claude_agent.maybe_summarize(sess)
+
+
+async def test_truncated_summary_is_not_saved(mem, make_agent):
+    # finish_reason=length: the summary text is cut off mid-sentence, and a
+    # saved summary replaces those turns forever — so nothing is saved.
+    get_config().set("AUTO_FACT_EXTRACTION", 0)
+    _seed_turns(mem, 3)
+    sess = make_agent([])
+    llm = _FakeLLM({"s": sess})
+    llm.reply, llm.finish = "The user asked about", "length"
+    summary, reason = await claude_agent.summarize_backlog(
+        mem, llm, "m", keep_recent=2, force=True)
+    assert summary is None and "failed" in reason
+    assert mem.list_summaries() == []
+    assert llm.calls[0]["max_tokens"] == 2048
+
+
+async def test_truncated_fact_extraction_saves_nothing(mem, make_agent):
+    sess = make_agent([])
+    llm = _FakeLLM({"s": sess})
+    llm.reply, llm.finish = "The user's name is Pa", "length"
+    assert await claude_agent.extract_facts(llm, "m", "User: I'm Paul", []) == []
+    llm.finish = "stop"
+    assert await claude_agent.consolidate_facts(llm, "m", ["a", "b"]) == [
+        "The user's name is Pa"]
+    llm.finish = "length"
+    assert await claude_agent.consolidate_facts(llm, "m", ["a", "b"]) == ["a", "b"]

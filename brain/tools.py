@@ -140,6 +140,17 @@ def is_error_result(result: str) -> bool:
     return result.startswith(TOOL_ERROR_PREFIX)
 
 
+# remember_fact's result when it was handed an empty fact: not an error the
+# tool raises, but nothing happened, so the model must get a round to react.
+NOTHING_SAVED = "Empty fact — nothing saved."
+
+# The native tools that are a single effect with nothing to read back: a
+# WebSocket command to the firmware or a local DB write, done in well under a
+# second. The agent loop derives both "no busy bubble / ack" and "may ride
+# along with a single-round device command" from this one set.
+NATIVE_EFFECT_TOOLS = frozenset({"set_expression", "look_at", "remember_fact"})
+
+
 async def dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
 ) -> str:
@@ -180,7 +191,7 @@ async def _dispatch(
     if name == "remember_fact":
         fact = input_["fact"].strip()
         if not fact:
-            return "Empty fact — nothing saved."
+            return NOTHING_SAVED
         ctx.memory.add_fact(fact)
         log.info("remembered: %r", fact)
         return f"Remembered: {fact}"

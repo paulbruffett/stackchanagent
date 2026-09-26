@@ -128,6 +128,10 @@ MIGRATIONS: list[str] = [
 ]
 
 
+# update_turn's "leave extra_json as it is" default.
+_KEEP = object()
+
+
 @dataclass(frozen=True)
 class Turn:
     id: int
@@ -245,15 +249,22 @@ class Memory:
         return [_turn(r) for r in rows]
 
     def update_turn(
-        self, turn_id: int, content: Any, extra: dict[str, Any] | None = None
+        self, turn_id: int, content: Any, extra: Any = _KEEP
     ) -> bool:
-        """Replace a turn's content and extra fields (used by the integrity
-        pass to strip unanswered tool calls in place). Role is unchanged.
-        Returns True if a row was updated."""
-        cur = self._conn.execute(
-            "UPDATE turns SET content_json = ?, extra_json = ? WHERE id = ?",
-            (json.dumps(content), json.dumps(extra) if extra else None, turn_id),
-        )
+        """Replace a turn's content, and its extra fields only when `extra` is
+        passed ({} or None clears them). Used by the integrity pass to strip
+        unanswered tool calls in place. Role is unchanged. Returns True if a
+        row was updated."""
+        if extra is _KEEP:
+            cur = self._conn.execute(
+                "UPDATE turns SET content_json = ? WHERE id = ?",
+                (json.dumps(content), turn_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE turns SET content_json = ?, extra_json = ? WHERE id = ?",
+                (json.dumps(content), json.dumps(extra) if extra else None, turn_id),
+            )
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -281,6 +292,15 @@ class Memory:
         the next session re-hydrate them and get rejected again. Summarized
         rows — already folded into a summary — are untouched."""
         cur = self._conn.execute("DELETE FROM turns WHERE summarized = 0")
+        self._conn.commit()
+        return cur.rowcount
+
+    def delete_block_list_turns(self) -> int:
+        """Hard-delete every row whose content is a JSON list — the Anthropic
+        content-block format from before the OpenRouter switch (the OpenAI
+        format only ever stores a string or null), summarized or not. Returns
+        the number deleted. Summaries are untouched."""
+        cur = self._conn.execute("DELETE FROM turns WHERE content_json LIKE '[%'")
         self._conn.commit()
         return cur.rowcount
 

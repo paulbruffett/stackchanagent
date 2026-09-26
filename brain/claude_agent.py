@@ -7,7 +7,7 @@ so the robot remembers prior chats across WS reconnects and process restarts.
 Each round: stream → as text deltas arrive, flush completed sentences to a TTS
 callback; on stream end, if the model called tools dispatch them and loop
 again, else done. A device command whose spoken confirmation arrived in the
-same message as the tool call ends after ONE round (see _is_fire_and_forget).
+same message as the tool call ends after ONE round (see _ends_turn).
 
 Request structure:
   messages: [
@@ -34,7 +34,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from openai import APIError, AsyncOpenAI, BadRequestError
+import httpcore2
+import httpx2
+from openai import APIError, AsyncOpenAI, BadRequestError, Timeout
 from websockets.asyncio.server import ServerConnection
 
 import tools
@@ -53,11 +55,31 @@ SpeakFn = Callable[[str], Awaitable[None]]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-def make_client() -> AsyncOpenAI:
-    """An OpenRouter client. A missing key is logged rather than raised: the
-    session still comes up, and every turn degrades to the spoken
-    API_ERROR_FALLBACK (a 401 is an APIError) instead of the WS handler
-    dying on connect."""
+# Per request: 5 s to connect, and 30 s for any single read/write — a stalled
+# stream fails the round (and gets the transient-error retry) instead of
+# holding the turn lock. One SDK-level retry for connection errors and 5xx
+# before a request; the loop adds its own retry around the whole round.
+_CLIENT_TIMEOUT = Timeout(30.0, connect=5.0)
+_CLIENT_MAX_RETRIES = 1
+
+_client: AsyncOpenAI | None = None
+
+
+def get_client() -> AsyncOpenAI:
+    """The process-wide OpenRouter client, created on first use (inside the
+    running event loop) and shared by every AgentSession and the web
+    console's background jobs, so there is one connection pool and a missing
+    key is reported once."""
+    global _client
+    if _client is None:
+        _client = _make_client()
+    return _client
+
+
+def _make_client() -> AsyncOpenAI:
+    """A missing key is logged rather than raised: the session still comes
+    up, and every turn degrades to the spoken API_ERROR_FALLBACK (a 401 is an
+    APIError) instead of the WS handler dying on connect."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         log.error("OPENROUTER_API_KEY is not set — every LLM call will fail")
@@ -68,6 +90,8 @@ def make_client() -> AsyncOpenAI:
         base_url=OPENROUTER_BASE_URL,
         api_key=key,
         default_headers={"X-Title": "stackchan"},
+        timeout=_CLIENT_TIMEOUT,
+        max_retries=_CLIENT_MAX_RETRIES,
     )
 
 
@@ -95,7 +119,9 @@ async def _complete_text(
     client: AsyncOpenAI, model: str, system: str, user: str, *, max_tokens: int
 ) -> str:
     """One non-streaming system+user call, returning the reply text ("" if
-    none). Raises on an API error — callers decide how to degrade."""
+    none). Raises on an API error, and on a reply cut off by max_tokens: a
+    truncated summary or fact must never be saved as if it were whole.
+    Callers decide how to degrade."""
     resp = await client.chat.completions.create(**_llm_kwargs(
         model,
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -103,7 +129,14 @@ async def _complete_text(
     ))
     if not resp.choices:
         return ""
-    return (resp.choices[0].message.content or "").strip()
+    choice = resp.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        raise TruncatedReply(f"{model} hit max_tokens={max_tokens}")
+    return (choice.message.content or "").strip()
+
+
+class TruncatedReply(RuntimeError):
+    """A background LLM reply stopped at max_tokens (finish_reason=length)."""
 
 
 def _opening(user_text: str, follow_up: bool) -> str:
@@ -148,14 +181,12 @@ def _pick_filler() -> str:
     return random.choice(phrases) if phrases else ""
 
 
-# Native tools fast enough that no "working…" feedback is warranted: each is
-# a single WebSocket send or a local DB write and returns in well under a
-# second. Everything else — any MCP tool (`mcp__…`, e.g. weather or Home
-# Assistant, which round-trips an external server) — is treated as slow, so
-# we show the busy indicator and speak a canned ack while it runs.
-_FAST_TOOLS = frozenset(
-    {"set_expression", "look_at", "remember_fact", "end_conversation"}
-)
+# Native tools fast enough that no "working…" feedback is warranted: the
+# single-effect tools (tools.NATIVE_EFFECT_TOOLS) plus end_conversation, which
+# only sets a flag. Everything else — any MCP tool (`mcp__…`, e.g. weather or
+# Home Assistant, which round-trips an external server) — is treated as slow,
+# so we show the busy indicator and speak a canned ack while it runs.
+_FAST_TOOLS = tools.NATIVE_EFFECT_TOOLS | {"end_conversation"}
 
 
 def _has_slow_tool(names: list[str]) -> bool:
@@ -164,30 +195,62 @@ def _has_slow_tool(names: list[str]) -> bool:
     return any(n not in _FAST_TOOLS for n in names)
 
 
-# Tools whose only job is an effect, with nothing in the result the model
-# needs to read back. When the model already SAID its confirmation in the
-# same message as the call ("Turning on the office light."), a second round
-# would only rephrase it — so the turn ends once they run cleanly. Native:
-# the face/head/memory/goodbye tools. Home Assistant: its MCP server's
-# `Hass*` intent tools are the device actions (HassTurnOn, HassLightSet, …),
-# except the ones that read state back (HassGetState, HassGetWeather,
-# HassClimateGetTemperature, HassTimerStatus); GetLiveContext isn't
-# `Hass`-prefixed at all.
-_FIRE_AND_FORGET_NATIVE = frozenset(
-    {"set_expression", "look_at", "remember_fact", "end_conversation"}
-)
-_HA_TOOL_PREFIX = "mcp__homeassistant__"
+# Home Assistant intents that change something and report nothing the model
+# needs to read back. An allowlist, not a Hass* prefix rule: HA keeps adding
+# intents, and one that reads state (HassGetState, GetLiveContext, …) must
+# never end a turn before its answer is spoken.
+HA_ACTION_INTENTS = frozenset({
+    "HassTurnOn", "HassTurnOff", "HassToggle", "HassLightSet",
+    "HassSetPosition", "HassFanSetSpeed", "HassClimateSetTemperature",
+    "HassMediaPause", "HassMediaUnpause", "HassMediaNext", "HassMediaPrevious",
+    "HassSetVolume", "HassSetVolumeRelative", "HassMediaPlayerMute",
+    "HassMediaPlayerUnmute", "HassVacuumStart", "HassVacuumReturnToBase",
+    "HassBroadcast", "HassListAddItem", "HassListCompleteItem",
+    "HassListRemoveItem", "HassCancelAllTimers",
+})
 
 
-def _is_fire_and_forget(name: str) -> bool:
-    if name in _FIRE_AND_FORGET_NATIVE:
-        return True
-    if not name.startswith(_HA_TOOL_PREFIX):
+def _is_ha_action(name: str) -> bool:
+    """An MCP tool (`mcp__<server>__<intent>`, whatever the server is called)
+    whose intent is in HA_ACTION_INTENTS."""
+    return name.startswith("mcp__") and name.rsplit("__", 1)[-1] in HA_ACTION_INTENTS
+
+
+def _ends_turn(names: list[str]) -> bool:
+    """Whether a round of these tool calls (with spoken text, none failed)
+    may end the turn without a second model round. Needs a device action —
+    or the goodbye — to be the point of the round; the expressive native
+    tools may ride along but never end a turn on their own, since a preamble
+    beside a look_at is usually the lead-in to an answer still to come."""
+    if not all(_is_ha_action(n) or n in _FAST_TOOLS for n in names):
         return False
-    intent = name[len(_HA_TOOL_PREFIX):]
-    return (intent.startswith("Hass")
-            and "Get" not in intent
-            and not intent.endswith("Status"))
+    return any(_is_ha_action(n) for n in names) or "end_conversation" in names
+
+
+def _result_failed(name: str, text: str) -> bool:
+    """Whether a tool result reports that nothing (or not everything)
+    happened, even though the tool didn't raise. Any such round goes back to
+    the model so it can say so."""
+    if tools.is_error_result(text):
+        return True
+    if name == "remember_fact":
+        return text == tools.NOTHING_SAVED
+    if not _is_ha_action(name):
+        return False
+    # HA's MCP server answers an intent with the intent response as JSON
+    # ({"response_type": "action_done", "data": {"success": [...],
+    # "failed": [...]}}); a target it could not match comes back as an MCP
+    # error instead (already TOOL_ERROR_PREFIX). Be defensive about shape.
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    if body.get("success") is False or body.get("response_type") == "error":
+        return True
+    data = body.get("data")
+    return isinstance(data, dict) and bool(data.get("failed"))
 
 
 log = logging.getLogger("brain.agent")
@@ -204,7 +267,7 @@ DEFAULT_SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a scre
 
 You have tools to change your facial expression, point your head, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
-When you call a tool that controls a device or your own face or head, include a short spoken confirmation as text in the SAME message as the tool call (for example "Turning on the office light."), so the user hears it while the tool runs.
+When the user's whole request is a device command (turning something on or off, dimming a light, and so on), say a short confirmation as text in the SAME message as the tool call (for example "Turning on the office light."). If they asked for anything more (an answer, a joke, some information), don't speak alongside the tool call: call the tool, then answer once you have its result.
 
 What the user says reaches you through speech recognition, which sometimes mishears — especially names. If a word doesn't make sense, act on the closest plausible request rather than taking it literally ("turn on office air" almost certainly means the office light), and only ask if it is genuinely ambiguous.
 
@@ -325,6 +388,22 @@ _CONTEXT_LENGTH_PHRASES = (
 )
 
 
+# Failures below the SDK's error mapping: the SDK turns connection errors
+# before the response into APIConnectionError (an APIError), but an error
+# while the stream is being read comes straight from the transport. Treated
+# exactly like a transient API error: retried if nothing was spoken yet.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx2.HTTPError, httpx2.StreamError,
+    httpcore2.NetworkError, httpcore2.ProtocolError,
+    TimeoutError, OSError,
+)
+
+# Below this many durable unsummarized turns, a context-length rejection is
+# not the backlog's fault: the model's window can't hold the system prompt
+# and tools, and purging the conversation would only lose it for nothing.
+MIN_PURGEABLE_TURNS = 4
+
+
 def _is_context_length_error(e: BadRequestError) -> bool:
     """Whether a 400 is a context-length rejection rather than a malformed
     request. If the wording isn't recognised we simply fall back to the older,
@@ -395,33 +474,88 @@ def _parse_arguments(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return value, None
 
 
-def _merge_tool_call_delta(partial: dict[int, dict[str, str]], tc: Any) -> None:
-    """Fold one streamed tool-call fragment into `partial`, keyed by its
-    index: id and name arrive once, arguments stream in pieces."""
-    slot = partial.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
-    if tc.id:
-        slot["id"] = tc.id
-    fn = getattr(tc, "function", None)
-    if fn is not None:
-        if fn.name and not slot["name"]:
-            slot["name"] = fn.name
-        if fn.arguments:
-            slot["arguments"] += fn.arguments
+class _CallAccumulator:
+    """Rebuilds tool calls from streamed fragments. Each fragment names an
+    index; id and name arrive once, arguments stream in pieces. A fragment at
+    an index already in use but carrying a DIFFERENT id starts a new call —
+    some providers send every call at index 0."""
+
+    def __init__(self) -> None:
+        self._slots: list[dict[str, str]] = []        # in arrival order
+        self._current: dict[int, dict[str, str]] = {}  # index → open slot
+
+    def add(self, tc: Any) -> None:
+        slot = self._current.get(tc.index)
+        if slot is None or (tc.id and slot["id"] and tc.id != slot["id"]):
+            slot = {"id": "", "name": "", "arguments": ""}
+            self._slots.append(slot)
+            self._current[tc.index] = slot
+        if tc.id:
+            slot["id"] = tc.id
+        fn = getattr(tc, "function", None)
+        if fn is not None:
+            if fn.name and not slot["name"]:
+                slot["name"] = fn.name
+            if fn.arguments:
+                slot["arguments"] += fn.arguments
+
+    def finish(self) -> list[_ToolCall]:
+        out: list[_ToolCall] = []
+        for slot in self._slots:
+            if not slot["name"]:
+                log.warning("dropping a streamed tool call with no name: %r", slot)
+                continue
+            # A call without an id couldn't be answered; mint one so the round
+            # stays well-formed (not every upstream provider sends ids).
+            call_id = slot["id"] or f"call_{uuid.uuid4().hex[:24]}"
+            args, error = _parse_arguments(slot["arguments"])
+            out.append(_ToolCall(call_id, slot["name"], slot["arguments"], args, error))
+        return out
 
 
-def _finish_tool_calls(partial: dict[int, dict[str, str]]) -> list[_ToolCall]:
-    out: list[_ToolCall] = []
-    for index in sorted(partial):
-        slot = partial[index]
-        if not slot["name"]:
-            log.warning("dropping a streamed tool call with no name: %r", slot)
-            continue
-        # A call without an id couldn't be answered; mint one so the round
-        # stays well-formed (not every upstream provider sends ids).
-        call_id = slot["id"] or f"call_{uuid.uuid4().hex[:24]}"
-        args, error = _parse_arguments(slot["arguments"])
-        out.append(_ToolCall(call_id, slot["name"], slot["arguments"], args, error))
-    return out
+def _as_dict(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        return dict(item)
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    if hasattr(item, "__dict__"):
+        return dict(vars(item))
+    return None
+
+
+class _ReasoningAccumulator:
+    """Collects OpenRouter's streamed `reasoning_details` so they can be sent
+    back on the assistant message. Providers that sign their thinking
+    (Anthropic, Gemini via OpenRouter) reject a tool-call replay without it.
+    Fragments of one entry share an index (else they're separate entries):
+    string payloads are concatenated, other fields keep their latest value."""
+
+    _TEXT_FIELDS = ("text", "summary", "data")
+
+    def __init__(self) -> None:
+        self._entries: list[dict[str, Any]] = []
+        self._by_index: dict[Any, dict[str, Any]] = {}
+
+    def add(self, delta: Any) -> None:
+        for item in getattr(delta, "reasoning_details", None) or []:
+            d = _as_dict(item)
+            if not d:
+                continue
+            idx = d.get("index")
+            entry = self._by_index.get(idx) if idx is not None else None
+            if entry is None:
+                self._entries.append(d)
+                if idx is not None:
+                    self._by_index[idx] = d
+                continue
+            for k, v in d.items():
+                if k in self._TEXT_FIELDS and isinstance(v, str) and isinstance(entry.get(k), str):
+                    entry[k] += v
+                elif v is not None:
+                    entry[k] = v
+
+    def details(self) -> list[dict[str, Any]]:
+        return self._entries
 
 
 def _tool_message(call_id: str, content: str) -> dict[str, Any]:
@@ -445,7 +579,7 @@ class AgentSession:
         mcp: Any = None,
     ) -> None:
         self.ws = ws
-        self.client = make_client()
+        self.client = get_client()
         self.memory = memory
         # Serializes user turns and the background summarizer so
         # self.messages isn't rewritten mid-call.
@@ -612,8 +746,8 @@ class AgentSession:
                     self.messages = self.messages[i:]
                 return
 
-    async def _recover_api_error(self, e: APIError, *, can_retry: bool) -> bool:
-        """Handle an LLM API error raised mid-turn. Returns True if the
+    async def _recover_api_error(self, e: BaseException, *, can_retry: bool) -> bool:
+        """Handle an LLM API or transport error raised mid-turn. Returns True if the
         caller should retry the request once, False to give up (caller then
         speaks a fallback). A 400 means the sanitized thread still wasn't
         accepted, so we log the offending thread and truncate history to the
@@ -639,6 +773,14 @@ class AgentSession:
             # well be a malformed tool schema rather than history, and deleting
             # the user's real conversation on that guess is the worse mistake.
             if _is_context_length_error(e):
+                # The current exchange is only staged, so this counts the
+                # replayed backlog alone.
+                if self.memory.unsummarized_count() < MIN_PURGEABLE_TURNS:
+                    log.error(
+                        "model context too small for the system prompt "
+                        "(MODEL=%s); not purging history", get_config().get("MODEL"),
+                    )
+                    return False
                 dropped = self.memory.delete_unsummarized_turns()
                 log.warning(
                     "dropped %d unsummarized turn(s) from memory.db: the "
@@ -657,7 +799,7 @@ class AgentSession:
     ) -> bool:
         """Run each call and stage one tool message per call id, in order.
         Returns whether any of them failed (bad arguments, a raise, or a
-        result flagged with tools.TOOL_ERROR_PREFIX)."""
+        result that reports failure — see _result_failed)."""
         failed = False
         for call in calls:
             if call.args is None:
@@ -682,7 +824,7 @@ class AgentSession:
             # gracefully ("I couldn't reach the weather service").
             try:
                 result = await tools.dispatch(call.name, call.args, self._tool_ctx)
-                failed = failed or tools.is_error_result(result)
+                failed = _result_failed(call.name, result) or failed
             except Exception as e:
                 log.exception("tool %s dispatch failed", call.name)
                 result = (
@@ -731,7 +873,8 @@ class AgentSession:
                 bracket_depth = 0
                 spoken_at_start = len(assembled)
                 text_parts: list[str] = []
-                partial_calls: dict[int, dict[str, str]] = {}
+                call_parts = _CallAccumulator()
+                reasoning = _ReasoningAccumulator()
                 finish: str | None = None
                 request = _llm_kwargs(
                     model,
@@ -763,7 +906,8 @@ class AgentSession:
                             if delta is None:
                                 continue
                             for tc in delta.tool_calls or []:
-                                _merge_tool_call_delta(partial_calls, tc)
+                                call_parts.add(tc)
+                            reasoning.add(delta)
                             if not delta.content:
                                 continue
                             text_parts.append(delta.content)
@@ -796,7 +940,7 @@ class AgentSession:
                                         busy = False
                                     assembled.append(sentence)
                                     await speak(sentence)
-                except APIError as e:
+                except (APIError, *_TRANSPORT_ERRORS) as e:
                     if busy:
                         await self._set_busy(False)
                         busy = False
@@ -826,7 +970,13 @@ class AgentSession:
                     await speak(tail)
 
                 raw_text = "".join(text_parts)
-                calls = _finish_tool_calls(partial_calls)
+                calls = call_parts.finish()
+                # Sent back verbatim with the assistant message (see
+                # _ReasoningAccumulator); persisted with it in extra_json.
+                reasoning_extra = (
+                    {"reasoning_details": reasoning.details()}
+                    if reasoning.details() else {}
+                )
                 if calls and finish == "length":
                     # The output budget ran out mid-message, so the last call's
                     # arguments are cut off (and any earlier one is suspect).
@@ -846,7 +996,8 @@ class AgentSession:
                     # not valid API input, so stage nothing rather than a
                     # hollow turn.
                     if raw_text:
-                        self._stage({"role": "assistant", "content": raw_text})
+                        self._stage({"role": "assistant", "content": raw_text,
+                                     **reasoning_extra})
                     if busy:
                         await self._set_busy(False)
                         busy = False
@@ -859,6 +1010,7 @@ class AgentSession:
                     "role": "assistant",
                     "content": raw_text or None,
                     "tool_calls": [c.as_message_part() for c in calls],
+                    **reasoning_extra,
                 })
 
                 rounds += 1
@@ -909,14 +1061,13 @@ class AgentSession:
                 failed = await self._run_tools(calls, on_tool)
 
                 # Single round for device commands: the model already spoke
-                # its confirmation alongside the call, every call is an
-                # effect with nothing to read back, and none failed — a second
-                # round would only rephrase what the user already heard. The
-                # exchange ends on tool results; the next user message follows
-                # them directly, which is a valid thread.
+                # its confirmation alongside a device action (see _ends_turn),
+                # and nothing failed — a second round would only rephrase what
+                # the user already heard. The exchange ends on tool results;
+                # the next user message follows them directly, which is a
+                # valid thread.
                 spoke_this_round = len(assembled) > spoken_at_start
-                if (spoke_this_round and not failed
-                        and all(_is_fire_and_forget(n) for n in names)):
+                if spoke_this_round and not failed and _ends_turn(names):
                     if busy:
                         await self._set_busy(False)
                         busy = False
@@ -1140,16 +1291,20 @@ TURN_FORMAT = "openai"
 def migrate_turn_format(memory: Memory) -> int:
     """One-time switch to OpenAI-format history (run at startup, before
     repair_memory). The unsummarized tail from before it is in Anthropic block
-    format and can't be replayed, so it is dropped; facts and summaries are
-    plain text and stay, as do already-summarized rows (never replayed, only
-    pruned). Idempotent via TURN_FORMAT_KEY. Returns the rows dropped."""
+    format and can't be replayed, so it is dropped — and so is every
+    block-format row already summarized, so the console's "delete summary +
+    un-mark its turns" can never bring one back into the replayed tail.
+    Summaries and facts are plain text and stay (a summarized plain-string
+    user row may stay too: it is valid as-is). Idempotent via TURN_FORMAT_KEY.
+    Returns the rows dropped."""
     if memory.get_runtime_state(TURN_FORMAT_KEY) == TURN_FORMAT:
         return 0
     dropped = memory.delete_unsummarized_turns()
+    dropped += memory.delete_block_list_turns()
     memory.set_runtime_state(TURN_FORMAT_KEY, TURN_FORMAT)
     log.warning(
-        "turn format migrated to %s: dropped %d unsummarized pre-migration "
-        "turn(s); facts and summaries kept", TURN_FORMAT, dropped,
+        "turn format migrated to %s: dropped %d pre-migration turn(s); facts "
+        "and summaries kept", TURN_FORMAT, dropped,
     )
     return dropped
 
@@ -1287,7 +1442,7 @@ async def summarize_backlog(
         )
         try:
             summary = await _complete_text(
-                client, model, _summarize_system(), transcript, max_tokens=1024
+                client, model, _summarize_system(), transcript, max_tokens=2048
             )
         except Exception:
             log.exception("summarizer call failed")
@@ -1351,7 +1506,7 @@ async def consolidate_facts(
     listing = "\n".join(f"- {f}" for f in facts)
     try:
         text = await _complete_text(
-            client, model, CONSOLIDATE_FACTS_SYSTEM, listing, max_tokens=2048
+            client, model, CONSOLIDATE_FACTS_SYSTEM, listing, max_tokens=4096
         )
     except Exception:
         log.exception("fact consolidation call failed")
@@ -1381,7 +1536,7 @@ async def extract_facts(
     user = f"{known}\n\nTranscript:\n{transcript}"
     try:
         text = await _complete_text(
-            client, model, _extract_facts_system(), user, max_tokens=1024
+            client, model, _extract_facts_system(), user, max_tokens=2048
         )
     except Exception:
         log.exception("fact extraction call failed")

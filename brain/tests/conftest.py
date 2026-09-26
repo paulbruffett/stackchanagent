@@ -142,10 +142,30 @@ def _build_stream(step: tuple):
     ("tools", [(name, id, args), …][, lead])   → several calls in one message
     ("cutoff", name, call_id[, lead_text])     → a tool call whose arguments
                                                  are cut off, finish "length"
+    ("same_index", [(name, id, args), …][, lead])
+                                               → several calls all streamed at
+                                                 index 0 (told apart by id)
+    ("reasoning", [detail, …], inner_step)     → inner_step, preceded by chunks
+                                                 whose delta carries each
+                                                 reasoning_details fragment
     ("error", exception)                       → create() raises (no tokens)
     ("stream_error", ["chu", "nks"], exc)      → deltas stream, then it raises
     """
     kind = step[0]
+    if kind == "same_index":
+        lead = step[2] if len(step) > 2 else ""
+        chunks = _texts(lead)
+        for name, cid, args in step[1]:
+            chunks += _tool_chunks(0, cid, name, args)
+        return _FakeStream(chunks + [_finish_chunk("tool_calls"), _usage_chunk()])
+    if kind == "reasoning":
+        inner = _build_stream(step[2])
+        pre = [_ns(choices=[_ns(delta=_ns(content=None, tool_calls=None,
+                                          reasoning_details=[d]),
+                                finish_reason=None, index=0)], usage=None)
+               for d in step[1]]
+        inner._chunks = pre + inner._chunks
+        return inner
     if kind in ("text", "text_chunks"):
         return _FakeStream(_texts(step[1]) + [_finish_chunk("stop"), _usage_chunk()])
     if kind == "tool":
@@ -216,6 +236,8 @@ def make_agent(mem, monkeypatch) -> Callable:
                 self.chat = SimpleNamespace(completions=FakeCompletions())
 
         monkeypatch.setattr(claude_agent, "AsyncOpenAI", FakeClient)
+        # The real client is one per process; each test gets a fresh fake.
+        monkeypatch.setattr(claude_agent, "_client", None)
         if dispatch is not None:
             monkeypatch.setattr(tools, "dispatch", dispatch)
         return claude_agent.AgentSession(ws=FakeWs(), memory=mem)

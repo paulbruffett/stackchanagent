@@ -32,7 +32,7 @@ from claude_agent import (
     DEFAULT_SYSTEM_PROMPT,
     OPENROUTER_BASE_URL,
     consolidate_facts,
-    make_client,
+    get_client,
     repair_memory,
     summarize_backlog,
     summary_model,
@@ -150,15 +150,10 @@ def create_app(
         log.warning("web console running WITHOUT a token — every API route, "
                     "including MCP server registration, is open")
 
-    # Lazy OpenRouter client for operator-triggered LLM jobs (summarize now,
-    # fact compaction). Created on first use inside the app's event loop and
-    # reused; the agent has its own per-session client.
-    _llm: dict[str, AsyncOpenAI] = {}
-
+    # OpenRouter client for operator-triggered LLM jobs (summarize now, fact
+    # compaction): the same process-wide client the agent sessions use.
     def llm_client() -> AsyncOpenAI:
-        if "c" not in _llm:
-            _llm["c"] = make_client()
-        return _llm["c"]
+        return get_client()
 
     # (fetched_at, models) — only successful fetches are cached, so a
     # transient failure is retried on the next config-tab load.

@@ -219,6 +219,8 @@ async def test_over_length_400_drops_the_backlog_durably(mem, make_agent, speake
     mem.append_turns([
         {"role": "user", "content": "huge q"},
         {"role": "assistant", "content": "huge a"},
+        {"role": "user", "content": "huge q2"},
+        {"role": "assistant", "content": "huge a2"},
     ])
     spoken, speak = speaker
     too_long = _api_error(
@@ -232,6 +234,20 @@ async def test_over_length_400_drops_the_backlog_durably(mem, make_agent, speake
     # Only the recovered exchange remains; the oversized pair is gone for good.
     assert [t.content for t in mem.list_unsummarized_turns()][0] == "new question"
     assert mem.unsummarized_count() == 2
+
+
+async def test_over_length_with_a_tiny_backlog_purges_nothing(mem, make_agent, speaker):
+    # A model whose window can't hold the system prompt + tools: the backlog
+    # isn't the problem, so deleting it would lose the conversation for nothing.
+    mem.append_turns([{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": "a"}])
+    spoken, speak = speaker
+    too_long = _api_error(BadRequestError, 400, "boom",
+                          body={"code": "context_length_exceeded"})
+    sess = make_agent([("error", too_long), ("text", "unused")])
+    assert await sess.respond("hello", speak) == claude_agent.API_ERROR_FALLBACK
+    assert len(model_calls(sess)) == 1          # no pointless retry
+    assert [t.content for t in mem.list_unsummarized_turns()] == ["q", "a"]
 
 
 @pytest.mark.parametrize("message, body, expected", [
@@ -437,14 +453,33 @@ async def test_next_turn_after_a_single_round_command_replays_validly(
 ):
     # assistant(tool_calls) → tool → the next user message: valid as-is.
     spoken, speak = speaker
-    sess = make_agent([("tool", "set_expression", "c1", "Here's my happy face!",
-                        '{"expression": "happy"}'),
+    sess = make_agent([("tool", HASS_ON, "c1", "Lamp on.", '{"name": "lamp"}'),
                        ("text", "Sure.")], dispatch=_ok_dispatch)
-    await sess.respond("make a happy face", speak)
+    await sess.respond("lamp on", speak)
     await sess.respond("thanks", speak)
     replay = model_calls(sess)[1]["messages"][1:]
     assert [m["role"] for m in replay] == ["user", "assistant", "tool", "user"]
     assert validate_thread(replay) == []
+
+
+@pytest.mark.parametrize("tool", ["set_expression", "look_at", "remember_fact"])
+async def test_native_effect_tools_alone_never_end_the_turn(mem, make_agent, speaker, tool):
+    # "Let me think… [look_at]" is a lead-in: the joke / answer comes after.
+    spoken, speak = speaker
+    sess = make_agent([("tool", tool, "c1", "Hmm, let me think."),
+                       ("text", "Why did the robot cross the road?")],
+                      dispatch=_ok_dispatch)
+    await sess.respond("tell me a joke", speak)
+    assert len(model_calls(sess)) == 2
+    assert spoken == ["Hmm, let me think.", "Why did the robot cross the road?"]
+
+
+async def test_goodbye_with_end_conversation_is_one_round(mem, make_agent, speaker):
+    spoken, speak = speaker
+    sess = make_agent([("tool", "end_conversation", "c1", "Goodnight!")],
+                      dispatch=_ok_dispatch)
+    assert await sess.respond("goodnight", speak) == "Goodnight!"
+    assert len(model_calls(sess)) == 1
 
 
 async def test_several_fire_and_forget_calls_are_still_one_round(mem, make_agent, speaker):
@@ -511,16 +546,66 @@ async def test_raising_device_command_gets_a_second_round(mem, make_agent, speak
     assert len(model_calls(sess)) == 2
 
 
-def test_fire_and_forget_predicate():
-    ff = claude_agent._is_fire_and_forget
-    for name in ["set_expression", "look_at", "remember_fact", "end_conversation",
-                 HASS_ON, "mcp__homeassistant__HassTurnOff",
-                 "mcp__homeassistant__HassLightSet"]:
-        assert ff(name), name
+def test_ha_action_allowlist_and_ends_turn():
+    act = claude_agent._is_ha_action
+    for name in [HASS_ON, "mcp__homeassistant__HassTurnOff",
+                 "mcp__homeassistant__HassLightSet", "mcp__hass__HassMediaPause",
+                 "mcp__home_assistant__HassListAddItem"]:   # any server name
+        assert act(name), name
     for name in ["mcp__homeassistant__HassGetState", "mcp__homeassistant__GetLiveContext",
-                 "mcp__homeassistant__HassTimerStatus", "mcp__hue__HassTurnOn",
-                 "mcp__weather__get_weather", "unknown"]:
-        assert not ff(name), name
+                 "mcp__homeassistant__HassMediaSearchAndPlay",  # not allowlisted
+                 "mcp__homeassistant__todo_get_items", "HassTurnOn",  # not MCP
+                 "mcp__weather__get_weather", "set_expression"]:
+        assert not act(name), name
+    ends = claude_agent._ends_turn
+    assert ends([HASS_ON]) and ends(["look_at", HASS_ON]) and ends(["end_conversation"])
+    assert not ends(["look_at"]) and not ends(["set_expression", "remember_fact"])
+    assert not ends([HASS_ON, "mcp__homeassistant__GetLiveContext"])
+
+
+@pytest.mark.parametrize("name, text, failed", [
+    (HASS_ON, '{"response_type": "action_done", "data": {"success": [{"name": "Lamp"}], '
+              '"failed": []}}', False),
+    (HASS_ON, '{"response_type": "action_done", "data": {"success": [], '
+              '"failed": [{"name": "Lamp"}]}}', True),
+    (HASS_ON, '{"success": false, "error": "nope"}', True),
+    (HASS_ON, '{"response_type": "error"}', True),
+    (HASS_ON, "Turned on the lamp", False),          # plain text: trust it
+    (HASS_ON, "[tool error] Error calling tool: MatchFailedError", True),
+    ("remember_fact", "Empty fact — nothing saved.", True),
+    ("remember_fact", "Remembered: tea", False),
+    ("mcp__weather__get_weather", '{"success": false}', False),  # not an HA action
+])
+def test_result_failed(name, text, failed):
+    assert claude_agent._result_failed(name, text) is failed
+
+
+async def test_ha_in_band_failure_gets_a_second_round(mem, make_agent, speaker):
+    spoken, speak = speaker
+
+    async def partial_failure(name, input_, ctx):
+        return '{"response_type": "action_done", "data": {"failed": [{"name": "Lamp"}]}}'
+
+    sess = make_agent([("tool", HASS_ON, "c1", "Turning on the lamp."),
+                       ("text", "Hmm, the lamp didn't respond.")], dispatch=partial_failure)
+    await sess.respond("lamp on", speak)
+    assert len(model_calls(sess)) == 2
+
+
+async def test_empty_remember_fact_gets_a_second_round(mem, make_agent, speaker):
+    # The real remember_fact handler: an empty fact saves nothing.
+    import tools as tools_mod
+    real = tools_mod.dispatch
+
+    async def dispatch(name, input_, ctx):
+        return await real(name, input_, ctx) if name == "remember_fact" else "ok"
+
+    spoken, speak = speaker
+    sess = make_agent([("tools", [("remember_fact", "a", '{"fact": " "}'),
+                                  (HASS_ON, "b", "{}")], "Noted, lamp on."),
+                       ("text", "Actually I didn't catch that.")], dispatch=dispatch)
+    await sess.respond("remember that and turn the lamp on", speak)
+    assert len(model_calls(sess)) == 2
 
 
 # --- tool-call arguments are the model's JSON, parsed defensively ------------
@@ -568,3 +653,85 @@ async def test_length_cutoff_never_dispatches_the_partial_call(mem, make_agent, 
     thread = persisted_thread(mem)
     assert [m["role"] for m in thread] == ["user", "assistant"]
     assert "tool_calls" not in thread[1]
+
+
+async def test_two_calls_streamed_at_the_same_index_stay_separate(mem, make_agent, speaker):
+    spoken, speak = speaker
+    seen = []
+
+    async def dispatch(name, input_, ctx):
+        seen.append((name, input_))
+        return "ok"
+
+    sess = make_agent([("same_index", [(HASS_ON, "a", '{"name": "lamp"}'),
+                                       ("mcp__homeassistant__HassTurnOff", "b",
+                                        '{"name": "fan"}')], "Lamp on, fan off.")],
+                      dispatch=dispatch)
+    await sess.respond("lamp on and fan off", speak)
+    assert seen == [(HASS_ON, {"name": "lamp"}),
+                    ("mcp__homeassistant__HassTurnOff", {"name": "fan"})]
+    thread = persisted_thread(mem)
+    assert [c["id"] for c in thread[1]["tool_calls"]] == ["a", "b"]
+    assert validate_thread(thread) == []
+
+
+# --- reasoning_details are replayed with the assistant message ---------------
+
+async def test_reasoning_details_are_staged_persisted_and_replayed(mem, make_agent, speaker):
+    spoken, speak = speaker
+    frags = [
+        {"type": "reasoning.text", "index": 0, "text": "The user wants ", "format": "x"},
+        {"type": "reasoning.text", "index": 0, "text": "the light on.", "signature": "sig"},
+    ]
+    sess = make_agent([("reasoning", frags, ("tool", "mcp__weather__get_weather", "c1")),
+                       ("text", "Sunny."), ("text", "Bye.")], dispatch=_ok_dispatch)
+    await sess.respond("weather?", speak)
+    expected = [{"type": "reasoning.text", "index": 0, "format": "x",
+                 "text": "The user wants the light on.", "signature": "sig"}]
+    # Round two replays the tool-call message with its reasoning attached…
+    replayed = [m for m in model_calls(sess)[1]["messages"] if m.get("tool_calls")]
+    assert replayed[0]["reasoning_details"] == expected
+    # …and it survives persistence, so a later session replays it too.
+    assert persisted_thread(mem)[1]["reasoning_details"] == expected
+    assert "reasoning_details" not in persisted_thread(mem)[3]
+    await sess.respond("thanks", speak)
+    later = [m for m in model_calls(sess)[2]["messages"] if m.get("tool_calls")]
+    assert later[0]["reasoning_details"] == expected
+
+
+# --- transport failures mid-stream never escape respond() --------------------
+
+async def test_transport_error_before_speech_is_retried(mem, make_agent, speaker):
+    import httpx2
+    spoken, speak = speaker
+    sess = make_agent([("stream_error", [], httpx2.ReadError("reset")),
+                       ("text", "All good now.")])
+    assert await sess.respond("hello", speak) == "All good now."
+    assert len(model_calls(sess)) == 2
+
+
+async def test_connect_error_raised_by_create_is_retried(mem, make_agent, speaker):
+    import httpx2
+    spoken, speak = speaker
+    sess = make_agent([("error", httpx2.ConnectError("refused")), ("text", "Hi.")])
+    assert await sess.respond("hello", speak) == "Hi."
+
+
+async def test_transport_error_after_speech_speaks_the_fallback(mem, make_agent, speaker):
+    import httpcore2
+    spoken, speak = speaker
+    sess = make_agent([("stream_error", ["Hello there. ", "More"],
+                        httpcore2.RemoteProtocolError("peer closed")),
+                       ("text", "unused")])
+    full = await sess.respond("hello", speak)
+    assert full == claude_agent.API_ERROR_FALLBACK
+    assert spoken == ["Hello there.", claude_agent.API_ERROR_FALLBACK]
+    assert mem.unsummarized_count() == 0
+
+
+async def test_stream_timeout_is_transient(mem, make_agent, speaker):
+    spoken, speak = speaker
+    sess = make_agent([("stream_error", [], TimeoutError()),
+                       ("stream_error", [], TimeoutError())])
+    assert await sess.respond("hello", speak) == claude_agent.API_ERROR_FALLBACK
+    assert len(model_calls(sess)) == 2

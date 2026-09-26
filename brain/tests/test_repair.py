@@ -182,13 +182,15 @@ def _seed_legacy(mem):
 
 def test_migration_drops_the_legacy_tail_exactly_once(mem):
     ids = _seed_legacy(mem)
-    assert migrate_turn_format(mem) == 4          # the unsummarized tail
+    # The unsummarized tail (4) plus the summarized block-format row (1).
+    assert migrate_turn_format(mem) == 5
     assert mem.unsummarized_count() == 0
     assert mem.get_runtime_state(TURN_FORMAT_KEY) == "openai"
-    # Facts and summaries are plain text and survive; so do summarized rows.
+    # Facts and summaries are plain text and survive, as does the summarized
+    # plain-string user row (valid in either format).
     assert mem.list_facts() == ["The user's name is Paul."]
     assert [s.summary for s in mem.list_summaries()] == ["They chatted."]
-    assert [t.id for t in mem.recent_turns()] == ids[:2]
+    assert [t.id for t in mem.recent_turns()] == ids[:1]
 
     # New-format turns written afterwards are never touched again.
     mem.append_turns([{"role": "user", "content": "new q"},
@@ -200,3 +202,13 @@ def test_migration_drops_the_legacy_tail_exactly_once(mem):
 def test_migration_on_a_fresh_db_just_stamps_the_format(mem):
     assert migrate_turn_format(mem) == 0
     assert mem.get_runtime_state(TURN_FORMAT_KEY) == "openai"
+
+
+def test_deleting_a_summary_after_migration_resurrects_nothing_invalid(mem):
+    _seed_legacy(mem)
+    migrate_turn_format(mem)
+    (summary,) = mem.list_summaries()
+    mem.delete_summary(summary.id, unmark_turns=True)   # the console path
+    thread = persisted_thread(mem)
+    assert thread == [{"role": "user", "content": "old folded q"}]
+    assert validate_thread(thread) == []
