@@ -36,11 +36,11 @@ from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
-# Load ANTHROPIC_API_KEY (and any other env) from the project root .env
-# before importing the agent module (which constructs the Anthropic client).
+# Load OPENROUTER_API_KEY (and any other env) from the project root .env
+# before importing the agent module (which constructs the OpenRouter client).
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from claude_agent import AgentSession, maybe_summarize, repair_memory
+from claude_agent import AgentSession, maybe_summarize, migrate_turn_format, repair_memory
 from config import get_config, init_config
 import ha_fast_path
 from mcp_client import McpClient
@@ -197,8 +197,13 @@ async def run_speaker(
     speaking face) and `stop_speaking` only if we ever started."""
     started = False
     state.speaking = True
-    play_start: float | None = None
-    total_audio_s = 0.0
+    # When the device's speaker will run dry. Each sentence starts playing
+    # when its first frame arrives or when the previous one ends, whichever
+    # is later — NOT back-to-back from the first sentence: a spoken ack
+    # filler followed by seconds of tool call + second model round leaves the
+    # speaker idle in between, and summing audio from the first sentence
+    # reopened the follow-up mic ~2 s early, into the robot's own voice.
+    play_end = 0.0
     try:
         while True:
             sentence = await queue.get()
@@ -214,20 +219,15 @@ async def run_speaker(
                 "tts: %d ms, %.2fs audio, %r",
                 int((time.monotonic() - t0) * 1000), audio_s, sentence[:80],
             )
-            # Playback starts ~when the first frame reaches the device.
-            if play_start is None:
-                play_start = time.monotonic()
-            total_audio_s += audio_s
+            play_end = max(play_end, time.monotonic()) + audio_s
             await send_pcm_stream(ws, tts_pcm)
         if started:
             await ws.send(json.dumps({"cmd": "stop_speaking"}))
     finally:
         state.speaking = False
-        # Device plays at real time from play_start; record when the last
-        # sample will have left the speaker so respond() can wait it out.
-        state.est_playback_end_s = (
-            play_start + total_audio_s if play_start is not None else 0.0
-        )
+        # Record when the last sample will have left the speaker so
+        # respond() can wait it out before reopening the mic.
+        state.est_playback_end_s = play_end
 
 
 async def _drive_agent_turn(
@@ -850,8 +850,11 @@ async def main() -> None:
     # model is loaded until first use — so reconstructing here is cheap and
     # picks up any web-UI override saved on a previous run.
     cfg = init_config(memory)
-    # M6.5: heal any durable conversation-state corruption (dangling tool_use
-    # from a pre-M6.1 crash, etc.) before the first turn replays it.
+    # One-time: drop the unsummarized Anthropic-format tail left from before
+    # the OpenRouter switch (a no-op on every later start).
+    migrate_turn_format(memory)
+    # M6.5: heal any durable conversation-state corruption (a dangling tool
+    # call from a crash, etc.) before the first turn replays it.
     repair_memory(memory)
     tts = Synthesizer(voice=cfg.get("PIPER_VOICE"))
     stt = Transcriber(

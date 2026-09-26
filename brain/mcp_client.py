@@ -1,9 +1,9 @@
-"""MCP client — a second tool source for the Claude tool-use loop (Phase 9b).
+"""MCP client — a second tool source for the agent's tool-call loop (Phase 9b).
 
 Connects to the MCP servers in the registry (`memory.mcp_servers`), lists
 their tools, and exposes them to the agent namespaced as
 `mcp__<server>__<tool>`. The agent loop merges `tool_defs()` into its
-`tools=` list and routes `tool_use` blocks whose name `is_mcp_tool()` to
+`tools=` list and routes tool calls whose name `is_mcp_tool()` to
 `dispatch()`.
 
 Concurrency model — one **owning task per server** ("connection actor"):
@@ -21,7 +21,7 @@ entered.
 Secrets: `env_ref` names a single environment variable (loaded from
 `.env`); for stdio servers only that one var is added back to an env that
 has had secret-looking keys stripped, so a child server can't read the
-brain's other secrets (e.g. ANTHROPIC_API_KEY). For http servers the same
+brain's other secrets (e.g. OPENROUTER_API_KEY). For http servers the same
 var supplies a bearer token. Either way the DB stores only the name.
 """
 
@@ -38,6 +38,7 @@ from mcp.client.stdio import stdio_client
 
 from config import get_config
 from memory import McpServer, Memory
+from tools import TOOL_ERROR_PREFIX
 
 log = logging.getLogger("brain.mcp")
 
@@ -49,7 +50,7 @@ CALL_TIMEOUT_S = 30.0
 DISPATCH_TIMEOUT_S = CALL_TIMEOUT_S + 15.0
 # How long stop() gives a server to wind down before it stops waiting on it.
 STOP_TIMEOUT_S = 10.0
-# The Messages API constrains a tool name to ^[a-zA-Z0-9_-]{1,64}$, and it
+# The LLM APIs constrain a tool name to ^[a-zA-Z0-9_-]{1,64}$, and they
 # rejects the whole `tools` array — every turn — if one name is too long.
 MAX_TOOL_NAME = 64
 _MAX_SERVER_FRAGMENT = 24
@@ -59,11 +60,11 @@ MAX_RESULT_CHARS = 8000
 
 _NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 _SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PASS")
-_SECRET_KEYS = {"ANTHROPIC_API_KEY"}
+_SECRET_KEYS = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"}
 
 
 def _sanitize(part: str) -> str:
-    """Make a name fragment safe for an Anthropic tool name."""
+    """Make a name fragment safe for an API tool name."""
     return _NAME_RE.sub("_", part)
 
 
@@ -432,13 +433,13 @@ class McpClient:
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
         entry = self._index.get(name)
         if entry is None:
-            return f"Unknown MCP tool {name}"
+            return f"{TOOL_ERROR_PREFIX} Unknown MCP tool {name}"
         conn, raw = entry
         try:
             out = _flatten_result(await conn.call(raw, arguments))
         except Exception as exc:  # noqa: BLE001
             log.warning("mcp call %s failed: %s", name, exc)
-            out = f"The {conn.spec.name} tool failed: {exc}"
+            out = f"{TOOL_ERROR_PREFIX} The {conn.spec.name} tool failed: {exc}"
         return _clamp_result(name, out)
 
     # -- web UI --
@@ -477,5 +478,5 @@ def _flatten_result(result: Any) -> str:
             parts.append(text)
     text = "\n".join(parts).strip()
     if getattr(result, "isError", False):
-        return f"[tool error] {text or 'the tool reported an error'}"
+        return f"{TOOL_ERROR_PREFIX} {text or 'the tool reported an error'}"
     return text or "(the tool returned no text)"

@@ -104,3 +104,67 @@ async def test_reset_resyncs_the_live_session(mem):
         r = await c.post("/api/memories/reset", headers=AUTH)
         assert r.json() == {"ok": True, "deleted": 1, "live_synced": 1}
     assert calls == [1]
+
+
+# --- OpenRouter model suggestions --------------------------------------------
+
+_CATALOG = {"data": [
+    {"id": "z/tools-model", "name": "Z", "context_length": 8000,
+     "pricing": {"prompt": "0.1"}, "supported_parameters": ["tools", "max_tokens"]},
+    {"id": "a/no-tools", "name": "A", "context_length": 4000,
+     "pricing": {}, "supported_parameters": ["max_tokens"]},
+    {"id": "b/tools-too", "name": "B", "context_length": 128000,
+     "pricing": {"prompt": "0"}, "supported_parameters": ["tool_choice", "tools"]},
+    {"id": "c/no-params", "name": "C"},
+]}
+
+
+async def test_models_lists_only_tool_capable_models_sorted_and_cached(
+    client, monkeypatch
+):
+    import webui.app as webui_app
+
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        return httpx.Response(200, json=_CATALOG)
+
+    monkeypatch.setattr(webui_app, "_MODELS_TRANSPORT", httpx.MockTransport(handler))
+    r = await client.get("/api/models", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == [
+        {"id": "b/tools-too", "name": "B", "context_length": 128000,
+         "pricing": {"prompt": "0"}},
+        {"id": "z/tools-model", "name": "Z", "context_length": 8000,
+         "pricing": {"prompt": "0.1"}},
+    ]
+    assert hits == ["https://openrouter.ai/api/v1/models"]
+    await client.get("/api/models", headers=AUTH)
+    assert len(hits) == 1  # served from the cache
+
+
+async def test_models_degrades_to_an_empty_list(client, monkeypatch):
+    import webui.app as webui_app
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream down")
+
+    monkeypatch.setattr(webui_app, "_MODELS_TRANSPORT", httpx.MockTransport(handler))
+    r = await client.get("/api/models", headers=AUTH)
+    assert r.status_code == 200 and r.json() == []
+
+
+async def test_turn_listing_carries_tool_calls_and_legacy_rows(client, mem):
+    call = {"id": "c1", "type": "function",
+            "function": {"name": "look_at", "arguments": "{}"}}
+    mem.append_turns([
+        {"role": "assistant", "content": [{"type": "text", "text": "legacy"}]},
+        {"role": "user", "content": "look left"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ])
+    turns = (await client.get("/api/memories/turns", headers=AUTH)).json()["turns"]
+    assert turns[0]["content"] == [{"type": "text", "text": "legacy"}]
+    assert turns[2]["tool_calls"] == [call]
+    assert turns[3] == {"id": 4, "role": "tool", "tool_call_id": "c1", "content": "ok"}

@@ -70,6 +70,26 @@ function setStatus(msg, cls = "") {
 }
 
 // ---- config ----
+// Model knobs get OpenRouter's tool-capable models as suggestions (a
+// <datalist>, so any id can still be typed). Fetched once per page load; an
+// empty list just means no suggestions.
+const MODEL_KEYS = new Set(["MODEL", "SUMMARY_MODEL"]);
+let modelList = null;
+async function modelDatalist() {
+  let dl = $("#or-models");
+  if (dl) return dl;
+  dl = el("datalist", { id: "or-models" });
+  document.body.append(dl);
+  if (!modelList) {
+    try { modelList = await (await fetch("/api/models")).json(); } catch { modelList = []; }
+  }
+  for (const m of modelList) {
+    const ctx = m.context_length ? ` · ${Math.round(m.context_length / 1000)}k ctx` : "";
+    dl.append(el("option", { value: m.id, label: `${m.name}${ctx}` }));
+  }
+  return dl;
+}
+
 async function loadConfig() {
   const { items } = await (await fetch("/api/config")).json();
   const root = $("#config");
@@ -80,6 +100,7 @@ async function loadConfig() {
     const sec = el("div", { className: "group" }, el("h2", { textContent: g }));
     for (const it of rows) {
       const input = el("input", { value: it.value });
+      if (MODEL_KEYS.has(it.key)) modelDatalist().then((dl) => input.setAttribute("list", dl.id));
       const label = el("div", { className: "k" });
       label.append(it.key, el("small", { textContent: it.help }));
       const save = el("button", { className: "act", textContent: "Save" });
@@ -262,7 +283,7 @@ async function loadMemories() {
   for (const t of turns.turns) {
     tsec.append(el("div", { className: "card" },
       el("div", { className: "muted", textContent: `#${t.id} ${t.role}` }),
-      el("div", { innerHTML: renderContent(t.content) })));
+      el("div", { innerHTML: renderTurn(t) })));
   }
   root.append(tsec);
 }
@@ -332,6 +353,20 @@ async function compactFacts() {
     el("div", { className: "toolbar" }, el("span", { style: "flex:1" }), cancel, apply),
   );
   out.append(card);
+}
+
+// A stored turn: OpenAI chat messages carry tool calls beside the content
+// (assistant) or answer one (role "tool"); pre-OpenRouter rows have
+// Anthropic block-list content, which renderContent still handles.
+function renderTurn(t) {
+  const parts = [];
+  if (t.role === "tool") parts.push(`<span class="pill">result</span>${esc(t.content ?? "")}`);
+  else if (t.content != null && t.content !== "") parts.push(renderContent(t.content));
+  for (const c of t.tool_calls || []) {
+    const fn = c.function || {};
+    parts.push(`<span class="pill">tool ${esc(fn.name ?? "?")}</span>${esc(fn.arguments ?? "")}`);
+  }
+  return parts.join("<br>");
 }
 
 function renderContent(content) {

@@ -9,7 +9,8 @@ description = "Jetson-side agent for the M5StackChan refactor"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "websockets>=12.0",
-    "anthropic>=0.40.0",
+    # LLM calls go to OpenRouter through its OpenAI-compatible API.
+    "openai>=1.60",
     "zeroconf>=0.131.0",
     "python-dotenv>=1.0",
     "numpy>=1.26",

@@ -8,7 +8,7 @@ Two classes of knob:
   - hot   : read at the use site every time, so a write takes effect on
             the next turn/tick with no restart.
   - restart : bound when a long-lived object is constructed (the TTS
-            voice, the STT model, the Anthropic model name). Editing it
+            voice, the STT model). Editing it
             is persisted but only applies after a process restart; the
             UI surfaces this.
 
@@ -59,8 +59,20 @@ SPECS: dict[str, Spec] = {
         "Piper TTS voice model name.",
     ),
     "MODEL": Spec(
-        "claude-haiku-4-5", "str", True, "voice",
-        "Anthropic model for conversational turns.",
+        "openai/gpt-5.6-luna", "str", False, "voice",
+        "OpenRouter model id for conversational turns (must support tool "
+        "calls). Read per turn — no restart needed.",
+    ),
+    "SUMMARY_MODEL": Spec(
+        "", "str", False, "voice",
+        "OpenRouter model id for background jobs: conversation summaries, "
+        "fact extraction and fact compaction. Empty = same as MODEL.",
+    ),
+    "REASONING_EFFORT": Spec(
+        "low", "str", False, "voice",
+        "Reasoning effort sent to OpenRouter (minimal/low/medium/high) for "
+        "models that reason. Higher is slower. Empty = don't send it (the "
+        "model's own default).",
     ),
     "STT_DEVICE": Spec(
         "cuda", "str", True, "voice",

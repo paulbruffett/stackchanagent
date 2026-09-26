@@ -1,12 +1,12 @@
 # stackchan brain
 
 Jetson-side Python agent. The ESP32 firmware connects to this over a single
-WebSocket on the LAN; the brain runs STT, the Claude tool-use loop (with
+WebSocket on the LAN; the brain runs STT, the LLM tool-call loop (OpenRouter, with
 MCP tools), and TTS.
 
 ## Install
 
-All runtime deps (websockets, anthropic, faster-whisper, piper-tts, numpy)
+All runtime deps (websockets, openai, faster-whisper, piper-tts, numpy)
 are required and live in the base dependency list — there are no optional
 groups to opt into.
 
@@ -34,11 +34,11 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-`ANTHROPIC_API_KEY` is loaded from a `.env` at the repo root (one level
+`OPENROUTER_API_KEY` is loaded from a `.env` at the repo root (one level
 above `brain/`). Create it once:
 
 ```bash
-echo 'ANTHROPIC_API_KEY=sk-ant-...' > ../.env
+echo 'OPENROUTER_API_KEY=sk-or-...' > ../.env
 ```
 
 First-run downloads (cached afterwards):
@@ -82,4 +82,4 @@ Once that passes we layer in `faster-whisper` and `piper-tts` in phase 2.
 
 ## Env
 
-`ANTHROPIC_API_KEY` is required from phase 3 onward.
+`OPENROUTER_API_KEY` is required from phase 3 onward.

@@ -18,20 +18,24 @@ import ipaddress
 import logging
 import secrets
 import socket
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 from claude_agent import (
     DEFAULT_SYSTEM_PROMPT,
+    OPENROUTER_BASE_URL,
     consolidate_facts,
+    make_client,
     repair_memory,
     summarize_backlog,
+    summary_model,
 )
 from config import SPECS, Config
 from memory import Memory
@@ -47,7 +51,7 @@ TOKEN_HEADER = "x-stackchan-token"
 # which is the point of the field (e.g. HA_TOKEN for a Home Assistant http
 # server). What it must never name is a credential the *brain* itself holds:
 # mcp_client._child_env strips secret-looking vars from the child environment
-# and then re-adds exactly the named one, so `env_ref: ANTHROPIC_API_KEY`
+# and then re-adds exactly the named one, so `env_ref: OPENROUTER_API_KEY`
 # hands our own key to whatever command that registry row launches.
 PROTECTED_ENV = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
 
@@ -55,6 +59,35 @@ PROTECTED_ENV = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "HUME_API_KEY", "CON
 # accepted by the registry and then failed at connect time with a ValueError
 # the operator only ever saw as a red dot.
 MCP_TRANSPORTS = ("stdio", "http")
+
+# OpenRouter's public model catalog, offered as suggestions for the MODEL and
+# SUMMARY_MODEL knobs. It changes rarely and is a few hundred KB, so it is
+# cached in memory rather than fetched on every config-tab load.
+MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
+MODELS_TTL_S = 3600.0
+# Test seam: an httpx transport to fetch the catalog through (None = network).
+_MODELS_TRANSPORT: httpx.AsyncBaseTransport | None = None
+
+
+async def _fetch_tool_models() -> list[dict[str, Any]]:
+    """OpenRouter models that accept tool calls — the only ones this agent
+    can use — as [{id, name, context_length, pricing}] sorted by id. Raises
+    on any network or shape error; the endpoint degrades that to []."""
+    async with httpx.AsyncClient(timeout=10.0, transport=_MODELS_TRANSPORT) as client:
+        resp = await client.get(MODELS_URL)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+    out = [
+        {
+            "id": m["id"],
+            "name": m.get("name") or m["id"],
+            "context_length": m.get("context_length"),
+            "pricing": m.get("pricing"),
+        }
+        for m in data
+        if "tools" in (m.get("supported_parameters") or [])
+    ]
+    return sorted(out, key=lambda m: m["id"])
 
 
 def _host_allowed(host_header: str) -> bool:
@@ -117,15 +150,19 @@ def create_app(
         log.warning("web console running WITHOUT a token — every API route, "
                     "including MCP server registration, is open")
 
-    # Lazy Anthropic client for operator-triggered LLM jobs (summarize now,
+    # Lazy OpenRouter client for operator-triggered LLM jobs (summarize now,
     # fact compaction). Created on first use inside the app's event loop and
     # reused; the agent has its own per-session client.
-    _llm: dict[str, AsyncAnthropic] = {}
+    _llm: dict[str, AsyncOpenAI] = {}
 
-    def llm_client() -> AsyncAnthropic:
+    def llm_client() -> AsyncOpenAI:
         if "c" not in _llm:
-            _llm["c"] = AsyncAnthropic()
+            _llm["c"] = make_client()
         return _llm["c"]
+
+    # (fetched_at, models) — only successful fetches are cached, so a
+    # transient failure is retried on the next config-tab load.
+    _models: dict[str, Any] = {"at": 0.0, "items": None}
 
     async def resync_live() -> int:
         """Push a durable-history rewrite into the live conversation(s).
@@ -213,6 +250,21 @@ def create_app(
         # write failed when it had landed.
         return {"key": key, "value": value, "restart": SPECS[key].restart}
 
+    @app.get("/api/models")
+    async def list_models() -> list[dict[str, Any]]:
+        """Tool-capable OpenRouter models, for the MODEL / SUMMARY_MODEL
+        suggestion lists. [] when the catalog can't be fetched — the inputs
+        still take free text, so this must never fail the config tab."""
+        if _models["items"] is not None and time.monotonic() - _models["at"] < MODELS_TTL_S:
+            return _models["items"]
+        try:
+            items = await _fetch_tool_models()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not fetch the OpenRouter model list: %s", exc)
+            return []
+        _models.update(at=time.monotonic(), items=items)
+        return items
+
     # --- persona / system prompt --------------------------------------
     # The persona is a hot config knob (SYSTEM_PROMPT) but too large for the
     # generic config grid, so it gets its own panel. An empty override means
@@ -280,9 +332,7 @@ def create_app(
     @app.post("/api/memories/facts/compact")
     async def compact_facts() -> dict[str, Any]:
         facts = memory.list_facts()
-        proposed = await consolidate_facts(
-            llm_client(), config.get("MODEL"), facts
-        )
+        proposed = await consolidate_facts(llm_client(), summary_model(), facts)
         return {"original": facts, "proposed": proposed}
 
     @app.post("/api/memories/facts/apply")
@@ -332,7 +382,7 @@ def create_app(
         result, reason = await summarize_backlog(
             memory,
             llm_client(),
-            config.get("MODEL"),
+            summary_model(),
             keep_recent=int(config.get("KEEP_RECENT_TURNS")),
             force=True,
         )
@@ -355,16 +405,19 @@ def create_app(
     async def list_turns(limit: int = 50) -> dict[str, Any]:
         limit = max(1, min(limit, 500))
         return {
+            # The whole stored message: tool_calls / tool_call_id ride beside
+            # the content. Pre-OpenRouter rows still carry block-list content;
+            # the page renders both.
             "turns": [
-                {"id": t.id, "role": t.role, "content": t.content}
+                {"id": t.id, **t.message}
                 for t in memory.recent_turns(limit)
             ]
         }
 
     @app.post("/api/memories/repair")
     async def repair_conversation() -> dict[str, Any]:
-        """Run the M6.5 integrity pass on demand: heal dangling tool_use /
-        orphan tool_result corruption in the unsummarized tail and report the
+        """Run the M6.5 integrity pass on demand: heal dangling tool-call /
+        orphan tool-result corruption in the unsummarized tail and report the
         counts. Safe to run anytime; a clean DB changes nothing."""
         counts = repair_memory(memory)
         live = await resync_live()
