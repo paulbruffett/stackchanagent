@@ -12,6 +12,7 @@ The brain registers it as a stdio server in the MCP tab.
 
 from __future__ import annotations
 
+import datetime
 import os
 
 import httpx
@@ -40,13 +41,20 @@ def _default_location() -> str:
     return os.environ.get("DEFAULT_LOCATION") or "Seattle, Washington"
 
 
+MAX_DAYS = 7
+
+
 @mcp.tool()
-async def get_weather(location: str | None = None) -> str:
-    """Get the current weather for a location (city/place name). If no
-    location is given, uses the robot's configured default location.
-    Returns a short spoken-friendly summary: conditions, temperature, and
-    today's high/low in Fahrenheit."""
+async def get_weather(location: str | None = None, days: int = 1) -> str:
+    """Get the weather for a location (city/place name). If no location is
+    given, uses the robot's configured default location.
+
+    days=1 (default): current conditions plus today's high/low.
+    days=2..7: also a day-by-day forecast — use days=2 for "tomorrow",
+    up to 7 for "this week". Temperatures in Fahrenheit. Returns a short
+    spoken-friendly summary."""
     place = (location or _default_location()).strip()
+    days = max(1, min(MAX_DAYS, int(days or 1)))
     async with httpx.AsyncClient(timeout=TIMEOUT) as http:
         # Open-Meteo's geocoder matches a single place name, not
         # "City, State". Try the full string, then fall back to the
@@ -74,11 +82,12 @@ async def get_weather(location: str | None = None) -> str:
         fc = await http.get(FORECAST_URL, params={
             "latitude": lat, "longitude": lon,
             "current": "temperature_2m,weather_code,wind_speed_10m",
-            "daily": "temperature_2m_max,temperature_2m_min",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "precipitation_probability_max",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
             "timezone": "auto",
-            "forecast_days": 1,
+            "forecast_days": days,
         })
         fc.raise_for_status()
         data = fc.json()
@@ -98,7 +107,30 @@ async def get_weather(location: str | None = None) -> str:
         parts.append(f"with a high of {round(hi)} and a low of {round(lo)}")
     if wind is not None and wind >= 12:
         parts.append(f"winds around {round(wind)} mph")
-    return ", ".join(parts) + "."
+    out = ", ".join(parts) + "."
+    if days > 1:
+        out += " " + _daily_forecast(daily, days)
+    return out
+
+
+def _daily_forecast(daily: dict, days: int) -> str:
+    """One short sentence per day after today: "Tomorrow: light rain, 58 to
+    64, 70% chance of rain." """
+    dates = daily.get("time") or []
+    codes = daily.get("weather_code") or []
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    rain = daily.get("precipitation_probability_max") or []
+    out = []
+    for i in range(1, min(days, len(dates))):
+        name = "Tomorrow" if i == 1 else datetime.date.fromisoformat(dates[i]).strftime("%A")
+        line = f"{name}: {WMO.get(codes[i] if i < len(codes) else None, 'unknown conditions')}"
+        if i < len(highs) and i < len(lows) and highs[i] is not None and lows[i] is not None:
+            line += f", {round(lows[i])} to {round(highs[i])}"
+        if i < len(rain) and rain[i] is not None and rain[i] >= 20:
+            line += f", {round(rain[i])}% chance of rain"
+        out.append(line + ".")
+    return " ".join(out)
 
 
 if __name__ == "__main__":

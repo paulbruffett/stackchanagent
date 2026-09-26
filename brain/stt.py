@@ -95,6 +95,9 @@ class Transcriber:
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
+        # Space-separated hint phrases for Whisper (see transcribe). Replaced
+        # wholesale by the brain's vocabulary refresher; a str swap is atomic.
+        self.hotwords: str = ""
         self._model: WhisperModel | None = None
         # Everything that touches the model runs on a worker thread now, and
         # faster-whisper's model object is not safe to drive from two threads
@@ -157,6 +160,9 @@ class Transcriber:
                 audio,
                 language="en",
                 beam_size=1,
+                # Device and room names from Home Assistant (set by the
+                # brain); biases a quiet "office light" away from "office air".
+                hotwords=self.hotwords or None,
                 # Short utterances; word timestamps and VAD aren't needed.
                 vad_filter=False,
                 condition_on_previous_text=False,

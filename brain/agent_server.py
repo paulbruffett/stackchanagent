@@ -701,6 +701,22 @@ async def handle(ws: ServerConnection) -> None:
         log.info("esp32 disconnected")
 
 
+STT_VOCAB_REFRESH_S = 600.0
+
+
+async def _refresh_stt_vocabulary() -> None:
+    """Keep Whisper's hint words in step with the device and room names Home
+    Assistant exposes, so renames and new aliases land without a restart."""
+    while True:
+        words = await ha_fast_path.fetch_vocabulary()
+        if words:
+            hotwords = ", ".join(words)
+            if hotwords != stt.hotwords:
+                log.info("stt vocabulary: %d names from home assistant", len(words))
+            stt.hotwords = hotwords
+        await asyncio.sleep(STT_VOCAB_REFRESH_S)
+
+
 def lan_ip() -> str:
     """The address the ESP32 can actually reach us at.
 
@@ -849,6 +865,7 @@ async def main() -> None:
     # Background, not awaited: the socket should be accepting connections
     # while the model comes up.
     spawn(stt.warm(), "stt_warm")
+    spawn(_refresh_stt_vocabulary(), "stt_vocabulary")
 
     # MCP servers (Phase 9b): seed the local weather server on first run so
     # it works out of the box. Then connect — best-effort, a down server just
