@@ -46,7 +46,7 @@ import ha_fast_path
 from mcp_client import McpClient
 from policy import effective_sleep_timeout
 from memory import Memory
-from stt import Transcriber, should_drop_follow_up, strip_wake_word
+from stt import Transcriber, should_drop_follow_up, starts_with_wake_word, strip_wake_word
 from tasks import spawn
 from tts import Synthesizer
 from webui.app import create_app
@@ -302,6 +302,13 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         # already been sent stop_listening, so just treat it as "heard nothing".
         log.exception("stt failed — going idle")
         return
+    if follow_up_turn and starts_with_wake_word(transcript.text):
+        # The firmware's wake word is paused while the follow-up mic is open,
+        # so "computer, turn on the office light" said inside the window
+        # arrives as a follow-up. Saying the wake word is the user addressing
+        # us directly: no follow-up judgement, and the HA fast path applies.
+        log.info("wake word inside the follow-up window — direct request")
+        follow_up_turn = False
     transcript = dataclasses.replace(transcript, text=strip_wake_word(transcript.text))
     if not transcript.text:
         log.info("empty transcript — going idle")
@@ -710,7 +717,11 @@ async def _refresh_stt_vocabulary() -> None:
     while True:
         words = await ha_fast_path.fetch_vocabulary()
         if words:
-            hotwords = ", ".join(words)
+            # The wake word first: the firmware's pre-roll often opens a
+            # capture with the tail of "computer", and with only device names
+            # to go on Whisper bent it into one ("bedroom, what's the
+            # weather"), which strip_wake_word then can't remove.
+            hotwords = ", ".join(["Computer", *words])
             if hotwords != stt.hotwords:
                 log.info("stt vocabulary: %d names from home assistant", len(words))
             stt.hotwords = hotwords
