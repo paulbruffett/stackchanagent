@@ -107,7 +107,8 @@ async def test_record_exchange_persists_the_fast_path_turn(mem, make_agent):
     turns = mem.list_unsummarized_turns()
     assert [t.role for t in turns] == ["user", "assistant"]
     assert turns[0].content == "turn off the light"
-    assert sess.messages[-1]["content"] == [{"type": "text", "text": "Turned off the light"}]
+    assert sess.messages[-1] == {"role": "assistant", "content": "Turned off the light"}
+    assert turns[1].message == sess.messages[-1]
 
 
 def test_vocabulary_takes_exposed_names_aliases_and_areas():

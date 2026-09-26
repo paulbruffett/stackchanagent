@@ -2,16 +2,21 @@
 
 One DB per device at ~/.stackchan/memory.db. Three tables:
 
-  turns(id, ts, role, content_json, summarized)
-      One row per Claude message (user or assistant). content_json holds
-      the original Anthropic content (either a string or a list of
-      content blocks — tool_use, tool_result, text). summarized flips
-      to 1 once a row has been absorbed into a summary; the agent only
-      replays unsummarized rows verbatim.
+  turns(id, ts, role, content_json, summarized, extra_json)
+      One row per OpenAI chat message (role user, assistant or tool).
+      content_json holds the message `content` (a string, or null for an
+      assistant message that only calls tools); extra_json holds the rest of
+      the message — `tool_calls` on an assistant turn, `tool_call_id` on a
+      tool result — or NULL. Rows written before the OpenRouter migration
+      hold Anthropic content blocks (a list) instead; only summarized ones
+      can survive (claude_agent.migrate_turn_format drops the rest), and
+      they are never replayed. summarized flips to 1 once a row has been
+      absorbed into a summary; the agent only replays unsummarized rows
+      verbatim.
 
   summaries(id, ts, summary, span_from, span_to)
       A natural-language summary of turns whose id falls in
-      [span_from, span_to]. Replayed to Claude as a leading
+      [span_from, span_to]. Replayed to the model as a leading
       "earlier in our conversation:" message. EPISODIC + bounded: only
       the most recent SUMMARY_RETENTION summaries are kept; older ones
       are permanently purged after each background fold, and the raw
@@ -47,7 +52,7 @@ import logging
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +66,8 @@ CREATE TABLE IF NOT EXISTS turns (
     ts REAL NOT NULL,
     role TEXT NOT NULL,
     content_json TEXT NOT NULL,
-    summarized INTEGER NOT NULL DEFAULT 0
+    summarized INTEGER NOT NULL DEFAULT 0,
+    extra_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_unsummarized
@@ -115,14 +121,29 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 # inside Memory()/repair_memory at startup, before either port binds, leaving a
 # systemd restart loop and no console to fix it from. Put such changes here as
 # ALTER TABLE statements and add the column to SCHEMA as well.
-MIGRATIONS: list[str] = []
+MIGRATIONS: list[str] = [
+    # 0 → 1: OpenAI chat format. Assistant tool calls and tool-result ids
+    # live beside the content, not inside it.
+    "ALTER TABLE turns ADD COLUMN extra_json TEXT;",
+]
+
+
+# update_turn's "leave extra_json as it is" default.
+_KEEP = object()
 
 
 @dataclass(frozen=True)
 class Turn:
     id: int
-    role: str
-    content: Any   # str or list[dict] (Anthropic content blocks)
+    role: str      # "user" | "assistant" | "tool"
+    content: Any   # str | None; a list of Anthropic blocks on a legacy row
+    # The message's other fields: {"tool_calls": [...]} or {"tool_call_id": ...}.
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def message(self) -> dict[str, Any]:
+        """The row as the OpenAI chat message it was stored from."""
+        return {"role": self.role, "content": self.content, **self.extra}
 
 
 @dataclass(frozen=True)
@@ -192,30 +213,26 @@ class Memory:
             self._conn.commit()
 
     def append_turn(self, role: str, content: Any) -> int:
-        """Append a Claude message. Returns the new turn id."""
-        content_json = json.dumps(content, default=_anthropic_default)
-        cur = self._conn.execute(
-            "INSERT INTO turns(ts, role, content_json) VALUES (?, ?, ?)",
-            (time.time(), role, content_json),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        """Append a single message with no extra fields. Returns the new turn
+        id."""
+        (tid,) = self.append_turns([{"role": role, "content": content}])
+        return tid
 
     def append_turns(self, messages: list[dict[str, Any]]) -> list[int]:
-        """Persist a batch of Claude messages in ONE transaction — either
+        """Persist a batch of chat messages in ONE transaction — either
         all land or none do. Used to commit a completed exchange atomically
-        (M6.1) so a crash mid-turn can't leave a dangling tool_use in durable
-        history. Returns the new turn ids in append order."""
+        (M6.1) so a crash mid-turn can't leave an unanswered tool call in
+        durable history. Returns the new turn ids in append order."""
         if not messages:
             return []
         now = time.time()
         ids: list[int] = []
         try:
             for m in messages:
-                content_json = json.dumps(m["content"], default=_anthropic_default)
                 cur = self._conn.execute(
-                    "INSERT INTO turns(ts, role, content_json) VALUES (?, ?, ?)",
-                    (now, m["role"], content_json),
+                    "INSERT INTO turns(ts, role, content_json, extra_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (now, m["role"], json.dumps(m["content"]), _extra_json(m)),
                 )
                 ids.append(cur.lastrowid)
             self._conn.commit()
@@ -226,23 +243,28 @@ class Memory:
 
     def list_unsummarized_turns(self) -> list[Turn]:
         rows = self._conn.execute(
-            "SELECT id, role, content_json FROM turns "
+            "SELECT id, role, content_json, extra_json FROM turns "
             "WHERE summarized = 0 ORDER BY id"
         ).fetchall()
-        return [
-            Turn(id=r["id"], role=r["role"], content=json.loads(r["content_json"]))
-            for r in rows
-        ]
+        return [_turn(r) for r in rows]
 
-    def update_turn(self, turn_id: int, content: Any) -> bool:
-        """Replace a turn's content (used by the integrity pass to strip a
-        dangling tool_use / orphan tool_result block in place). Role is
-        unchanged. Returns True if a row was updated."""
-        content_json = json.dumps(content, default=_anthropic_default)
-        cur = self._conn.execute(
-            "UPDATE turns SET content_json = ? WHERE id = ?",
-            (content_json, turn_id),
-        )
+    def update_turn(
+        self, turn_id: int, content: Any, extra: Any = _KEEP
+    ) -> bool:
+        """Replace a turn's content, and its extra fields only when `extra` is
+        passed ({} or None clears them). Used by the integrity pass to strip
+        unanswered tool calls in place. Role is unchanged. Returns True if a
+        row was updated."""
+        if extra is _KEEP:
+            cur = self._conn.execute(
+                "UPDATE turns SET content_json = ? WHERE id = ?",
+                (json.dumps(content), turn_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE turns SET content_json = ?, extra_json = ? WHERE id = ?",
+                (json.dumps(content), json.dumps(extra) if extra else None, turn_id),
+            )
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -270,6 +292,15 @@ class Memory:
         the next session re-hydrate them and get rejected again. Summarized
         rows — already folded into a summary — are untouched."""
         cur = self._conn.execute("DELETE FROM turns WHERE summarized = 0")
+        self._conn.commit()
+        return cur.rowcount
+
+    def delete_block_list_turns(self) -> int:
+        """Hard-delete every row whose content is a JSON list — the Anthropic
+        content-block format from before the OpenRouter switch (the OpenAI
+        format only ever stores a string or null), summarized or not. Returns
+        the number deleted. Summaries are untouched."""
+        cur = self._conn.execute("DELETE FROM turns WHERE content_json LIKE '[%'")
         self._conn.commit()
         return cur.rowcount
 
@@ -487,15 +518,12 @@ class Memory:
         """Most-recent turns (any summarized state), oldest-first within
         the returned window. For the web-UI memories view."""
         rows = self._conn.execute(
-            "SELECT id, role, content_json FROM turns "
+            "SELECT id, role, content_json, extra_json FROM turns "
             "ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
         rows.reverse()
-        return [
-            Turn(id=r["id"], role=r["role"], content=json.loads(r["content_json"]))
-            for r in rows
-        ]
+        return [_turn(r) for r in rows]
 
     # --- config (Phase 9a web UI) -------------------------------------
 
@@ -616,11 +644,17 @@ class Memory:
         self._conn.close()
 
 
-def _anthropic_default(obj: Any) -> Any:
-    """JSON fallback for Anthropic SDK content blocks. The SDK returns
-    pydantic-like models; pull their dict form."""
-    if hasattr(obj, "model_dump"):
-        return obj.model_dump()
-    if hasattr(obj, "dict"):
-        return obj.dict()
-    raise TypeError(f"cannot serialize {type(obj).__name__} for memory")
+def _extra_json(message: dict[str, Any]) -> str | None:
+    """Everything in a chat message except role and content, JSON-encoded,
+    or None when there is nothing else (plain user/assistant text)."""
+    extra = {k: v for k, v in message.items() if k not in ("role", "content")}
+    return json.dumps(extra) if extra else None
+
+
+def _turn(r: sqlite3.Row) -> Turn:
+    return Turn(
+        id=r["id"],
+        role=r["role"],
+        content=json.loads(r["content_json"]),
+        extra=json.loads(r["extra_json"]) if r["extra_json"] else {},
+    )

@@ -1,4 +1,4 @@
-"""Shared fixtures + a scripted fake Anthropic streaming client.
+"""Shared fixtures + a scripted fake OpenAI-style streaming client.
 
 The brain is a flat collection of modules run with `.venv/bin/python`, so we
 prepend brain/ to sys.path here and import the modules directly (no package).
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -54,142 +55,143 @@ def ack_filler(mem):
 
 
 # --- scripted fake streaming client ----------------------------------------
+#
+# Models the OpenAI SDK's streaming Chat Completions: `create(stream=True)`
+# returns an async-iterable, async-context-managed stream of chunks, each with
+# `choices[0].delta.content` / `.delta.tool_calls[i]` (index, id,
+# function.name, function.arguments) and `finish_reason`, then a final
+# usage-only chunk with no choices.
 
-class _FakeBlock:
-    def __init__(self, **kw: Any) -> None:
-        self.__dict__.update(kw)
-
-    def model_dump(self, exclude_none: bool = True) -> dict[str, Any]:
-        # Honouring exclude_none is not pedantry: it is what actually keeps the
-        # SDK's unset optionals (`citations`) and stream-only decorations
-        # (`parsed_output`) out of the message we replay next turn. A fake that
-        # ignored the flag would let `_clean_block` lose it and stay green.
-        d = dict(self.__dict__)
-        if exclude_none:
-            d = {k: v for k, v in d.items() if v is not None}
-        return d
+def _ns(**kw: Any) -> SimpleNamespace:
+    return SimpleNamespace(**kw)
 
 
-def _text_block(text: str) -> _FakeBlock:
-    """A streamed text block as the SDK hands it over — carrying the optional
-    fields it always attaches, which must not survive into persisted history."""
-    return _FakeBlock(type="text", text=text, citations=None, parsed_output=None)
+def _content_chunk(text: str) -> SimpleNamespace:
+    return _ns(choices=[_ns(delta=_ns(content=text, tool_calls=None),
+                            finish_reason=None, index=0)], usage=None)
 
 
-class _FakeUsage:
-    input_tokens = output_tokens = 0
-    cache_read_input_tokens = cache_creation_input_tokens = 0
+def _tool_chunks(index: int, call_id: str, name: str, arguments: str) -> list[SimpleNamespace]:
+    """A tool call as providers stream it: id and name first, then the
+    arguments in fragments."""
+    head = _ns(index=index, id=call_id, type="function",
+               function=_ns(name=name, arguments=""))
+    cut = len(arguments) // 2
+    frags = [a for a in (arguments[:cut], arguments[cut:]) if a]
+    out = [_ns(choices=[_ns(delta=_ns(content=None, tool_calls=[head]),
+                            finish_reason=None, index=0)], usage=None)]
+    for frag in frags:
+        piece = _ns(index=index, id=None, type=None, function=_ns(name=None, arguments=frag))
+        out.append(_ns(choices=[_ns(delta=_ns(content=None, tool_calls=[piece]),
+                                    finish_reason=None, index=0)], usage=None))
+    return out
 
 
-class _FakeResp:
-    def __init__(self, content: list[Any], stop: str) -> None:
-        self.content = content
-        self.stop_reason = stop
-        self.usage = _FakeUsage()
+def _finish_chunk(reason: str) -> SimpleNamespace:
+    return _ns(choices=[_ns(delta=_ns(content=None, tool_calls=None),
+                            finish_reason=reason, index=0)], usage=None)
 
 
-class _OkStream:
-    def __init__(self, text: str | list[str], resp: _FakeResp) -> None:
-        # A list models the real thing: deltas arrive in arbitrary pieces, so
-        # brackets and sentence ends land across chunk boundaries.
-        self._chunks = [text] if isinstance(text, str) else list(text)
-        self._resp = resp
-
-    async def __aenter__(self) -> "_OkStream":
-        return self
-
-    async def __aexit__(self, *a: Any) -> bool:
-        return False
-
-    @property
-    def text_stream(self):
-        async def gen():
-            for chunk in self._chunks:
-                if chunk:
-                    yield chunk
-        return gen()
-
-    async def get_final_message(self) -> _FakeResp:
-        return self._resp
+def _usage_chunk() -> SimpleNamespace:
+    return _ns(choices=[], usage=_ns(prompt_tokens=100, completion_tokens=10, cost=0.0001))
 
 
-class _ErrStream:
-    """Raises on context entry — models the request being rejected before any
-    token streams (the real 400 / connection-error timing)."""
+class _FakeStream:
+    """Yields scripted chunks, then raises `exc` if one is given — a
+    connection flap after the user has already heard part of the reply."""
 
-    def __init__(self, exc: BaseException) -> None:
-        self._exc = exc
-
-    async def __aenter__(self):
-        raise self._exc
-
-    async def __aexit__(self, *a: Any) -> bool:
-        return False
-
-
-class _MidStreamErrStream:
-    """Streams some deltas and then raises — a connection flap after the user
-    has already heard part of the reply. `_ErrStream` can't model this (it dies
-    before any token), so it's the only way to exercise the `spoke_partial`
-    guard that stops a retry from double-speaking."""
-
-    def __init__(self, chunks: list[str], exc: BaseException) -> None:
+    def __init__(self, chunks: list[Any], exc: BaseException | None = None) -> None:
         self._chunks = chunks
         self._exc = exc
+        self.closed = False
 
-    async def __aenter__(self) -> "_MidStreamErrStream":
+    async def __aenter__(self) -> "_FakeStream":
         return self
 
     async def __aexit__(self, *a: Any) -> bool:
+        self.closed = True
         return False
 
-    @property
-    def text_stream(self):
+    def __aiter__(self):
         chunks, exc = self._chunks, self._exc
 
         async def gen():
             for chunk in chunks:
                 yield chunk
-            raise exc
+            if exc is not None:
+                raise exc
         return gen()
 
 
-def _build_stream(step: tuple):
-    """Turn a script step into one fake stream.
+def _texts(text: str | list[str]) -> list[SimpleNamespace]:
+    # A list models the real thing: deltas arrive in arbitrary pieces, so
+    # brackets and sentence ends land across chunk boundaries.
+    pieces = [text] if isinstance(text, str) else list(text)
+    return [_content_chunk(p) for p in pieces if p]
 
-    ("text", "spoken reply")                 → end_turn with that text
-    ("text_chunks", ["spo", "ken reply"])    → same, streamed in pieces
-    ("tool", name, tool_id[, lead_text])     → tool_use turn (optional pre-text)
-    ("cutoff", name, tool_id[, lead_text])   → tool_use cut off by max_tokens
-    ("error", exception)                     → request raises (no tokens)
-    ("stream_error", ["chu", "nks"], exc)    → deltas stream, then it raises
+
+def _build_stream(step: tuple):
+    """Turn a script step into one fake stream (or the exception create raises).
+
+    ("text", "spoken reply")                   → finish "stop" with that text
+    ("text_chunks", ["spo", "ken reply"])      → same, streamed in pieces
+    ("tool", name, call_id[, lead_text[, args]])
+                                               → a tool call (optional text in
+                                                 the same message), finish
+                                                 "tool_calls"; args default "{}"
+    ("tools", [(name, id, args), …][, lead])   → several calls in one message
+    ("cutoff", name, call_id[, lead_text])     → a tool call whose arguments
+                                                 are cut off, finish "length"
+    ("same_index", [(name, id, args), …][, lead])
+                                               → several calls all streamed at
+                                                 index 0 (told apart by id)
+    ("reasoning", [detail, …], inner_step)     → inner_step, preceded by chunks
+                                                 whose delta carries each
+                                                 reasoning_details fragment
+    ("error", exception)                       → create() raises (no tokens)
+    ("stream_error", ["chu", "nks"], exc)      → deltas stream, then it raises
     """
     kind = step[0]
-    if kind == "text":
-        txt = step[1]
-        return _OkStream(txt, _FakeResp([_text_block(txt)], "end_turn"))
-    if kind == "text_chunks":
-        chunks = list(step[1])
-        return _OkStream(chunks, _FakeResp([_text_block("".join(chunks))], "end_turn"))
+    if kind == "same_index":
+        lead = step[2] if len(step) > 2 else ""
+        chunks = _texts(lead)
+        for name, cid, args in step[1]:
+            chunks += _tool_chunks(0, cid, name, args)
+        return _FakeStream(chunks + [_finish_chunk("tool_calls"), _usage_chunk()])
+    if kind == "reasoning":
+        inner = _build_stream(step[2])
+        pre = [_ns(choices=[_ns(delta=_ns(content=None, tool_calls=None,
+                                          reasoning_details=[d]),
+                                finish_reason=None, index=0)], usage=None)
+               for d in step[1]]
+        inner._chunks = pre + inner._chunks
+        return inner
+    if kind in ("text", "text_chunks"):
+        return _FakeStream(_texts(step[1]) + [_finish_chunk("stop"), _usage_chunk()])
     if kind == "tool":
-        name, tid = step[1], step[2]
+        name, cid = step[1], step[2]
         lead = step[3] if len(step) > 3 else ""
-        block = _FakeBlock(type="tool_use", id=tid, name=name, input={})
-        return _OkStream(lead, _FakeResp([block], "tool_use"))
+        args = step[4] if len(step) > 4 else "{}"
+        return _FakeStream(_texts(lead) + _tool_chunks(0, cid, name, args)
+                           + [_finish_chunk("tool_calls"), _usage_chunk()])
+    if kind == "tools":
+        lead = step[2] if len(step) > 2 else ""
+        chunks = _texts(lead)
+        for i, (name, cid, args) in enumerate(step[1]):
+            chunks += _tool_chunks(i, cid, name, args)
+        return _FakeStream(chunks + [_finish_chunk("tool_calls"), _usage_chunk()])
     if kind == "cutoff":
-        # What the SDK actually returns when the response is truncated inside
-        # a tool_use: the block is present with partial-JSON input, no
-        # exception is raised, and stop_reason is "max_tokens" — NOT
-        # "tool_use", so the loop treats the turn as finished.
-        name, tid = step[1], step[2]
+        # What a provider sends when max_tokens lands inside a tool call: the
+        # call's arguments stop mid-JSON and finish_reason is "length", not
+        # "tool_calls". Nothing raises.
+        name, cid = step[1], step[2]
         lead = step[3] if len(step) > 3 else ""
-        blocks = [_FakeBlock(type="text", text=lead)] if lead else []
-        blocks.append(_FakeBlock(type="tool_use", id=tid, name=name, input={}))
-        return _OkStream(lead, _FakeResp(blocks, "max_tokens"))
+        return _FakeStream(_texts(lead) + _tool_chunks(0, cid, name, '{"location": "Sea')
+                           + [_finish_chunk("length"), _usage_chunk()])
     if kind == "error":
-        return _ErrStream(step[1])
+        return step[1]
     if kind == "stream_error":
-        return _MidStreamErrStream(list(step[1]), step[2])
+        return _FakeStream(_texts(list(step[1])), step[2])
     raise ValueError(f"bad script step: {step!r}")
 
 
@@ -218,19 +220,24 @@ def make_agent(mem, monkeypatch) -> Callable:
     def factory(steps: list[tuple], dispatch=None):
         streams = [_build_stream(s) for s in steps]
 
-        class FakeMessages:
+        class FakeCompletions:
             def __init__(self) -> None:
                 self.calls: list[dict[str, Any]] = []
 
-            def stream(self, **kw: Any):
+            async def create(self, **kw: Any):
                 self.calls.append(kw)
-                return streams.pop(0)
+                nxt = streams.pop(0)
+                if isinstance(nxt, BaseException):
+                    raise nxt
+                return nxt
 
         class FakeClient:
             def __init__(self, *a: Any, **k: Any) -> None:
-                self.messages = FakeMessages()
+                self.chat = SimpleNamespace(completions=FakeCompletions())
 
-        monkeypatch.setattr(claude_agent, "AsyncAnthropic", FakeClient)
+        monkeypatch.setattr(claude_agent, "AsyncOpenAI", FakeClient)
+        # The real client is one per process; each test gets a fresh fake.
+        monkeypatch.setattr(claude_agent, "_client", None)
         if dispatch is not None:
             monkeypatch.setattr(tools, "dispatch", dispatch)
         return claude_agent.AgentSession(ws=FakeWs(), memory=mem)
@@ -251,5 +258,10 @@ def speaker() -> Callable:
 
 
 def persisted_thread(mem) -> list[dict]:
-    """The committed unsummarized thread as plain dicts (for validate_thread)."""
-    return [{"role": t.role, "content": t.content} for t in mem.list_unsummarized_turns()]
+    """The committed unsummarized thread as chat messages (for validate_thread)."""
+    return [t.message for t in mem.list_unsummarized_turns()]
+
+
+def model_calls(sess) -> list[dict[str, Any]]:
+    """Every chat.completions.create kwargs the session sent, in order."""
+    return sess.client.chat.completions.calls

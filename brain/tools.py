@@ -1,4 +1,4 @@
-"""Tool definitions for the Claude tool-use loop.
+"""Tool definitions for the agent's tool-call loop.
 
 Each tool maps to either a JSON command the firmware understands or a
 brain-local action (like saving a fact). Handlers take a context
@@ -36,8 +36,10 @@ class ToolContext:
     conversation_ended: bool = False
 
 
-# Schemas exposed to Claude. Keep tight — descriptions are what drive
-# tool selection, so be explicit about when to call each.
+# Schemas exposed to the model. Keep tight — descriptions are what drive
+# tool selection, so be explicit about when to call each. Written in the
+# neutral {name, description, input_schema} shape MCP tools also arrive in;
+# claude_agent._openai_tool converts both to the Chat Completions shape.
 TOOL_DEFS: list[dict[str, Any]] = [
     {
         "name": "set_expression",
@@ -127,6 +129,27 @@ TOOL_DEFS: list[dict[str, Any]] = [
 # far more than a reply this robot speaks aloud can use.
 MAX_TOOL_RESULT_CHARS = 8000
 
+# Marks a tool result that reports a failure rather than an outcome. Chat
+# Completions tool messages have no is_error flag, so the agent loop reads
+# this prefix (is_error_result) to decide a device command did not land and
+# the model must get a second round to say so.
+TOOL_ERROR_PREFIX = "[tool error]"
+
+
+def is_error_result(result: str) -> bool:
+    return result.startswith(TOOL_ERROR_PREFIX)
+
+
+# remember_fact's result when it was handed an empty fact: not an error the
+# tool raises, but nothing happened, so the model must get a round to react.
+NOTHING_SAVED = "Empty fact — nothing saved."
+
+# The native tools that are a single effect with nothing to read back: a
+# WebSocket command to the firmware or a local DB write, done in well under a
+# second. The agent loop derives both "no busy bubble / ack" and "may ride
+# along with a single-round device command" from this one set.
+NATIVE_EFFECT_TOOLS = frozenset({"set_expression", "look_at", "remember_fact"})
+
 
 async def dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
@@ -168,7 +191,7 @@ async def _dispatch(
     if name == "remember_fact":
         fact = input_["fact"].strip()
         if not fact:
-            return "Empty fact — nothing saved."
+            return NOTHING_SAVED
         ctx.memory.add_fact(fact)
         log.info("remembered: %r", fact)
         return f"Remembered: {fact}"
@@ -179,4 +202,4 @@ async def _dispatch(
         ctx.conversation_ended = True
         return "Conversation ended."
     log.warning("unknown tool: %s", name)
-    return f"Unknown tool {name}"
+    return f"{TOOL_ERROR_PREFIX} Unknown tool {name}"

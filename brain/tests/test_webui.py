@@ -18,7 +18,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from config import get_config
+from config import SPECS, get_config
 from webui.app import TOKEN_HEADER, create_app
 
 TOKEN = "test-console-token"
@@ -104,3 +104,105 @@ async def test_reset_resyncs_the_live_session(mem):
         r = await c.post("/api/memories/reset", headers=AUTH)
         assert r.json() == {"ok": True, "deleted": 1, "live_synced": 1}
     assert calls == [1]
+
+
+# --- OpenRouter model suggestions --------------------------------------------
+
+_CATALOG = {"data": [
+    {"id": "z/tools-model", "name": "Z", "context_length": 8000,
+     "pricing": {"prompt": "0.1"}, "supported_parameters": ["tools", "max_tokens"]},
+    {"id": "a/no-tools", "name": "A", "context_length": 4000,
+     "pricing": {}, "supported_parameters": ["max_tokens"]},
+    {"id": "b/tools-too", "name": "B", "context_length": 128000,
+     "pricing": {"prompt": "0"}, "supported_parameters": ["tool_choice", "tools"]},
+    {"id": "c/no-params", "name": "C"},
+]}
+
+
+async def test_models_lists_only_tool_capable_models_sorted_and_cached(
+    client, monkeypatch
+):
+    import webui.app as webui_app
+
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        return httpx.Response(200, json=_CATALOG)
+
+    monkeypatch.setattr(webui_app, "_MODELS_TRANSPORT", httpx.MockTransport(handler))
+    r = await client.get("/api/models", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == [
+        {"id": "b/tools-too", "name": "B", "context_length": 128000,
+         "pricing": {"prompt": "0"}},
+        {"id": "z/tools-model", "name": "Z", "context_length": 8000,
+         "pricing": {"prompt": "0.1"}},
+    ]
+    assert hits == ["https://openrouter.ai/api/v1/models"]
+    await client.get("/api/models", headers=AUTH)
+    assert len(hits) == 1  # served from the cache
+
+
+async def test_models_degrades_to_an_empty_list(client, monkeypatch):
+    import webui.app as webui_app
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream down")
+
+    monkeypatch.setattr(webui_app, "_MODELS_TRANSPORT", httpx.MockTransport(handler))
+    r = await client.get("/api/models", headers=AUTH)
+    assert r.status_code == 200 and r.json() == []
+
+
+async def test_turn_listing_carries_tool_calls_and_legacy_rows(client, mem):
+    call = {"id": "c1", "type": "function",
+            "function": {"name": "look_at", "arguments": "{}"}}
+    mem.append_turns([
+        {"role": "assistant", "content": [{"type": "text", "text": "legacy"}]},
+        {"role": "user", "content": "look left"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ])
+    turns = (await client.get("/api/memories/turns", headers=AUTH)).json()["turns"]
+    assert turns[0]["content"] == [{"type": "text", "text": "legacy"}]
+    assert turns[2]["tool_calls"] == [call]
+    assert turns[3] == {"id": 4, "role": "tool", "tool_call_id": "c1", "content": "ok"}
+
+
+# --- model / effort knobs are validated ---------------------------------------
+
+@pytest.mark.parametrize("key, value", [
+    ("MODEL", "claude-haiku-4-5"),        # an Anthropic-era id: no vendor
+    ("MODEL", ""),
+    ("MODEL", "openai/"),
+    ("SUMMARY_MODEL", "gpt 5"),
+    ("REASONING_EFFORT", "extreme"),
+])
+async def test_bad_model_or_effort_is_a_400(client, key, value):
+    r = await client.put("/api/config", headers=AUTH, json={"key": key, "value": value})
+    assert r.status_code == 400
+    assert get_config().get(key) == SPECS[key].default
+
+
+@pytest.mark.parametrize("key, value, stored", [
+    ("MODEL", " anthropic/claude-haiku-4.5 ", "anthropic/claude-haiku-4.5"),
+    ("SUMMARY_MODEL", "", ""),                 # empty = use MODEL
+    ("REASONING_EFFORT", "HIGH", "high"),
+    ("REASONING_EFFORT", "", ""),
+])
+async def test_good_model_or_effort_is_stored_normalised(client, key, value, stored):
+    r = await client.put("/api/config", headers=AUTH, json={"key": key, "value": value})
+    assert r.status_code == 200
+    assert get_config().get(key) == stored
+
+
+def test_stale_stored_model_is_ignored_on_reload(mem):
+    # memory.db on the Jetson may still hold MODEL=claude-haiku-4-5 from the
+    # Anthropic days; reload must fall back to the default, not 400 each turn.
+    mem.set_config("MODEL", "claude-haiku-4-5")
+    mem.set_config("REASONING_EFFORT", "turbo")
+    cfg = get_config()
+    cfg.reload()
+    assert cfg.get("MODEL") == SPECS["MODEL"].default
+    assert cfg.get("REASONING_EFFORT") == "low"

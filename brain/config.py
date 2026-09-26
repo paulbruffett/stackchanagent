@@ -8,7 +8,7 @@ Two classes of knob:
   - hot   : read at the use site every time, so a write takes effect on
             the next turn/tick with no restart.
   - restart : bound when a long-lived object is constructed (the TTS
-            voice, the STT model, the Anthropic model name). Editing it
+            voice, the STT model). Editing it
             is persisted but only applies after a process restart; the
             UI surfaces this.
 
@@ -48,6 +48,14 @@ class Spec:
     # value that merely casts cleanly used to be persisted forever.
     minimum: float | None = None
     maximum: float | None = None
+    # str knobs: the allowed values (matched case-insensitively, stored
+    # lowercase).
+    choices: tuple[str, ...] | None = None
+    # str knobs holding an OpenRouter model id ("vendor/model"). An empty
+    # value is allowed only when the default is empty ("use the fallback").
+    # Catches a leftover Anthropic-era MODEL ("claude-haiku-4-5") that would
+    # otherwise 400 every turn.
+    model_id: bool = False
 
 
 # The knob catalog. Keys mirror the original module constant names so the
@@ -59,8 +67,23 @@ SPECS: dict[str, Spec] = {
         "Piper TTS voice model name.",
     ),
     "MODEL": Spec(
-        "claude-haiku-4-5", "str", True, "voice",
-        "Anthropic model for conversational turns.",
+        "openai/gpt-5.6-luna", "str", False, "voice",
+        "OpenRouter model id (vendor/model) for conversational turns; must "
+        "support tool calls. Read per turn — no restart needed.",
+        model_id=True,
+    ),
+    "SUMMARY_MODEL": Spec(
+        "", "str", False, "voice",
+        "OpenRouter model id (vendor/model) for background jobs: conversation "
+        "summaries, fact extraction and fact compaction. Empty = same as MODEL.",
+        model_id=True,
+    ),
+    "REASONING_EFFORT": Spec(
+        "low", "str", False, "voice",
+        "Reasoning effort sent to OpenRouter for models that reason: minimal, "
+        "low, medium or high. Higher is slower. Empty = don't send it (the "
+        "model's own default).",
+        choices=("", "minimal", "low", "medium", "high"),
     ),
     "STT_DEVICE": Spec(
         "cuda", "str", True, "voice",
@@ -271,6 +294,18 @@ def _coerce(spec: Spec, value: Any) -> Any:
         # as SYSTEM_PROMPT, surviving every restart.
         if not isinstance(value, str):
             raise TypeError(f"expected a string, got {type(value).__name__}")
+        if spec.choices is not None:
+            value = value.strip().lower()
+            if value not in spec.choices:
+                raise ValueError(f"{value!r} is not one of {spec.choices}")
+        if spec.model_id:
+            value = value.strip()
+            vendor, _, name = value.partition("/")
+            if value or spec.default:
+                if not (vendor and name) or any(c.isspace() for c in value):
+                    raise ValueError(
+                        f"{value!r} is not an OpenRouter model id (vendor/model)"
+                    )
         return value
     # bool is an int subclass and containers have a length, so both would
     # otherwise slip through int()/float() as 1/0 or a TypeError-free cast.
