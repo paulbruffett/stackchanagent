@@ -28,7 +28,7 @@ constexpr uint32_t kBackoffMaxMs = 16000;
 // A session must last this long before it counts as healthy enough to reset
 // the backoff ladder. A brain that accepts the handshake and dies immediately
 // (systemd crash-loop) would otherwise pin us at kBackoffMinMs forever: a new
-// socket, a new tcp_receive task and a boot/stop_speaking/set_skin exchange
+// socket, a new tcp_receive task and a boot/stop_speaking/set_buddy exchange
 // every second for as long as it stays broken.
 constexpr uint32_t kStableSessionMs = 10000;
 

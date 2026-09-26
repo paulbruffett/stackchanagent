@@ -11,8 +11,8 @@
  *   {"cmd":"sleep"}            screen off + sleepy face (wake word/tap wakes)
  *   {"cmd":"wake"}             restore screen (also done locally on input)
  *
- * Skin (follows the brain's ROCKY_MODE; emitted on connect + on change):
- *   {"cmd":"set_skin","value":"rocky"|"default"}   swap the live avatar skin
+ * BLE buddy (follows the brain's BUDDY_ENABLED; emitted on connect + change):
+ *   {"cmd":"set_buddy","enabled":true|false}   persist to NVS; reboot if changed
  *
  * The screen is also relit automatically by any activity command
  * (set_expression / look_at / set_busy / start_speaking), so the device
@@ -36,6 +36,12 @@ void enqueue(std::string_view json);
 // Run every queued command on the calling task. Call from the main idle loop,
 // OUTSIDE the LVGL lock (dispatch takes it itself).
 void drain();
+
+// Drop back to Idle (as stop_listening would) if the device has been
+// LISTENING for 15 s with no brain command in that time — a connected but
+// wedged brain would otherwise leave the wakeword paused forever. Call from
+// the main idle loop, after drain().
+void check_listening_watchdog();
 
 // Relight the screen if it was turned off for sleep; no-op otherwise.
 // Called locally from the wake word / head-tap handlers so waking is

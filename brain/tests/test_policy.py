@@ -3,7 +3,7 @@
 These are kept dependency-free (no agent_server import) so they run offline on
 any machine, unlike the server module which pulls in Jetson-only deps.
 """
-from policy import effective_sleep_timeout
+from policy import buddy_sync_command, effective_sleep_timeout
 
 
 class TestEffectiveSleepTimeout:
@@ -22,3 +22,17 @@ class TestEffectiveSleepTimeout:
         # SLEEP_TIMEOUT_S==0 (sleep disabled) is handled by the caller before
         # this helper, so here a 0 base with a pending prompt still elongates.
         assert effective_sleep_timeout(0.0, 1800.0, True) == 1800.0
+
+
+class TestBuddySyncCommand:
+    def test_first_push_always_sends(self):
+        assert buddy_sync_command(0, None) == {"cmd": "set_buddy", "enabled": False}
+        assert buddy_sync_command(1, None) == {"cmd": "set_buddy", "enabled": True}
+
+    def test_unchanged_knob_sends_nothing(self):
+        assert buddy_sync_command(0, False) is None
+        assert buddy_sync_command(1, True) is None
+
+    def test_changed_knob_sends_new_value(self):
+        assert buddy_sync_command(1, False) == {"cmd": "set_buddy", "enabled": True}
+        assert buddy_sync_command(0, True) == {"cmd": "set_buddy", "enabled": False}

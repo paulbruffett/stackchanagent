@@ -71,17 +71,21 @@ static void network_task(void*)
     set_net_status({});
 
     agent::transport::start(BRAIN_HOST, BRAIN_PORT);
-#if CONFIG_STACKCHAN_BUDDY_BLE
-    // BLE last, deliberately: this keeps NimBLE's bring-up after the Wi-Fi
-    // controller's, the order this build has always run in.
-    agent::buddy_ble::start();
-#else
-    // No BLE controller running, so Wi-Fi can stay awake. Modem sleep (the
-    // default, and mandatory under BT coexistence) parks ACKs until the next
-    // beacon, which throttles the mic uplink's TCP window.
-    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
-    mclog::tagInfo(TAG, "wifi power save off: {}", esp_err_to_name(ps_err));
-#endif
+    // Runtime setting in NVS, pushed by the brain's BUDDY_ENABLED knob
+    // (set_buddy reboots on change, so it is only ever read here).
+    if (agent::buddy_ble::enabled()) {
+        mclog::tagInfo(TAG, "BLE buddy: on");
+        // BLE last, deliberately: this keeps NimBLE's bring-up after the
+        // Wi-Fi controller's, the order this build has always run in.
+        agent::buddy_ble::start();
+    } else {
+        // No BLE controller running, so Wi-Fi can stay awake. Modem sleep
+        // (the default, and mandatory under BT coexistence) parks ACKs until
+        // the next beacon, which throttles the mic uplink's TCP window.
+        esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+        mclog::tagInfo(TAG, "BLE buddy: off; wifi power save off: {}",
+                       esp_err_to_name(ps_err));
+    }
     vTaskDelete(nullptr);
 }
 
@@ -250,6 +254,7 @@ extern "C" void app_main(void)
         // Brain commands run here, on the one task that owns StackChan and the
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
+        agent::commands::check_listening_watchdog();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();
@@ -270,11 +275,6 @@ extern "C" void app_main(void)
             if (offline != last_offline_state) {
                 LvglLockGuard lock;
                 offline_badge->setHidden(!offline);
-                // set_skin rebuilds the avatar as a new, opaque, full-screen
-                // child of the same screen, so LVGL draws it over the badge.
-                // With ROCKY_MODE on that happens on the first brain connect —
-                // before the badge has ever been shown. Re-raise it here.
-                offline_badge->moveForeground();
                 last_offline_state = offline;
                 mclog::tagInfo(TAG, "brain link: {}",
                                offline ? "OFFLINE" : "online");

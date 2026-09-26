@@ -44,7 +44,7 @@ from claude_agent import AgentSession, maybe_summarize, migrate_turn_format, rep
 from config import get_config, init_config
 import ha_fast_path
 from mcp_client import McpClient
-from policy import effective_sleep_timeout
+from policy import buddy_sync_command, effective_sleep_timeout
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up, starts_with_wake_word, strip_wake_word
 from tasks import spawn
@@ -134,6 +134,9 @@ class ConnState:
     # emits {"event":"buddy_prompt","pending":...}). Elongates the sleep
     # timeout so the device doesn't sleep out from under an unanswered prompt.
     buddy_prompt_pending: bool = False
+    # Last BUDDY_ENABLED value sent to the firmware as set_buddy on this
+    # connection (None until the connect-time push).
+    buddy_sent: bool | None = None
 
 
 def frame_rms(frame: bytes) -> float:
@@ -534,6 +537,23 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
             state.summarize_task = spawn(maybe_summarize(agent), "summarize")
         if _should_sleep(state):
             await go_to_sleep(ws, state)
+        await _sync_buddy(ws, state)
+
+
+async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
+    """Send set_buddy when BUDDY_ENABLED differs from what this connection
+    last sent. A change makes the firmware reboot (~15 s), dropping the link;
+    the reconnect's push then finds the two in agreement."""
+    msg = buddy_sync_command(get_config().get("BUDDY_ENABLED"), state.buddy_sent)
+    if msg is None:
+        return
+    try:
+        await ws.send(json.dumps(msg))
+    except Exception:
+        log.exception("set_buddy send failed")
+        return
+    state.buddy_sent = msg["enabled"]
+    log.info("set_buddy enabled=%s", msg["enabled"])
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -589,10 +609,10 @@ async def handle(ws: ServerConnection) -> None:
     # durable self-heal (firmware → IDLE on WS disconnect, "Fix A") is queued
     # for the next reflash.
     await ws.send(json.dumps({"cmd": "stop_speaking"}))
-    # Rocky mode is gone, but a firmware that was showing the Rocky skin when
-    # the old brain went away keeps it until told otherwise.
-    await ws.send(json.dumps({"cmd": "set_skin", "value": "default"}))
     state = ConnState()
+    # Push the BLE-buddy setting. The firmware keeps it in NVS and reboots
+    # only when it changes, so this is a no-op on every ordinary connect.
+    await _sync_buddy(ws, state)
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.
     state.last_activity_s = time.monotonic()

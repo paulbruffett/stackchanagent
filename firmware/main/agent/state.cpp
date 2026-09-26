@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 
+#include <esp_timer.h>
 #include <mooncake_log.h>
 
 #include "wakeword.h"
@@ -14,6 +15,7 @@ namespace {
 constexpr const char* TAG = "agent.state";
 
 std::atomic<Mode> mode_{Mode::Idle};
+std::atomic<int64_t> entered_at_ms_{0};
 
 // Serialises transition() end to end. The exchange alone is atomic but the
 // wakeword pause/resume that follows is not part of it, and there is a UART
@@ -36,6 +38,11 @@ const char* name(Mode m)
 
 }  // namespace
 
+int64_t entered_at_ms()
+{
+    return entered_at_ms_.load();
+}
+
 Mode current()
 {
     return mode_.load(std::memory_order_relaxed);
@@ -46,6 +53,7 @@ void transition(Mode next)
     std::lock_guard<std::mutex> lock(mu_);
     Mode prev = mode_.exchange(next, std::memory_order_acq_rel);
     if (prev == next) return;
+    entered_at_ms_.store(esp_timer_get_time() / 1000);
     mclog::tagInfo(TAG, "{} -> {}", name(prev), name(next));
 
     switch (next) {

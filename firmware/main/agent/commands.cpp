@@ -1,6 +1,7 @@
 #include "commands.h"
 
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -8,11 +9,10 @@
 #include <string_view>
 
 #include <ArduinoJson.h>
+#include <esp_timer.h>
 #include <hal/hal.h>
 #include <mooncake_log.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
-#include <stackchan/avatar/skins/default/default.h>
-#include <stackchan/avatar/skins/rocky/rocky.h>
 #include <stackchan/stackchan.h>
 
 #include "buddy_ble.h"
@@ -53,8 +53,7 @@ std::mutex g_face_mu;
 // spring teleports — a visible head jump plus a dropped pose. The same two
 // tasks were also racing on _angle_anim, which no bus lock would cover. So
 // queue the raw frame here and let the idle loop run it: one task owns
-// StackChan. It also gets apply_set_skin's LVGL rebuild off tcp_receive's
-// 4 KB stack.
+// StackChan. It also keeps set_buddy's NVS write + restart off tcp_receive.
 constexpr size_t kMaxQueuedCommands = 16;
 
 std::mutex g_queue_mu;
@@ -76,8 +75,8 @@ void apply_set_expression(JsonDocument& doc)
     const char* value = doc["value"] | "neutral";
     LvglLockGuard lock;
     if (std::string_view{value} == "celebrate") {
-        // No "celebrate" Emotion; skins decide how to render it (Rocky adds
-        // confetti, the default maps it to Happy).
+        // No "celebrate" Emotion; the avatar decides how to render it (the
+        // default maps it to Happy).
         GetStackChan().avatar().celebrate();
     } else {
         GetStackChan().avatar().setEmotion(parse_emotion(value));
@@ -131,40 +130,32 @@ void apply_set_busy(JsonDocument& doc)
     mclog::tagInfo(TAG, "busy: {}", on);
 }
 
-// Active skin. Boot brings up DefaultAvatar (hal/board/stackchan_display.cc
-// SetupUI), so this starts at Default; the brain syncs it via set_skin on
-// connect and whenever ROCKY_MODE changes.
-enum class Skin { Default, Rocky };
-Skin g_current_skin = Skin::Default;
+// LISTENING watchdog. Nothing on-device ends a LISTENING turn: the brain
+// closes it (stop_listening / start_speaking), and the wakeword is paused and
+// the head tap gated to Idle meanwhile. transport already drops to Idle when
+// the link goes down, but a brain that is connected yet wedged would leave the
+// robot deaf. Its own longest capture is 10 s (+ a 4.5 s follow-up window it
+// opens with start_listening, itself a command), so 15 s without any command
+// is safely past anything legitimate.
+constexpr int64_t kListeningWatchdogMs = 15000;
 
-// Runtime skin swap. Both skins ship in the build; ROCKY_MODE (a brain knob)
-// is the single source of truth and the brain emits set_skin. The framework
-// swap is pointer-safe: the Breath/Blink/HeadPet modifiers re-fetch
-// avatar().leftEye()/mouth()/getEmotion() fresh every tick, so they need no
-// teardown — they simply poke the new avatar next tick.
-void apply_set_skin(JsonDocument& doc)
+// Arrival time of the most recent brain frame. Written on tcp_receive, read
+// on the idle loop.
+std::atomic<int64_t> g_last_cmd_ms{0};
+
+int64_t now_ms()
 {
-    const char* value = doc["value"] | "default";
-    Skin want         = (std::string_view{value} == "rocky") ? Skin::Rocky : Skin::Default;
-    if (want == g_current_skin) {
+    return esp_timer_get_time() / 1000;
+}
+
+void apply_set_buddy(JsonDocument& doc)
+{
+    if (!doc["enabled"].is<bool>()) {
+        mclog::tagWarn(TAG, "set_buddy: missing/non-bool enabled");
         return;
     }
-    LvglLockGuard lock;
-    auto& stackchan = GetStackChan();
-    if (want == Skin::Rocky) {
-        auto a = std::make_unique<stackchan::avatar::RockyAvatar>();
-        a->init(lv_screen_active());
-        stackchan.attachAvatar(std::move(a));
-    } else {
-        auto a = std::make_unique<stackchan::avatar::DefaultAvatar>();
-        a->init(lv_screen_active());
-        stackchan.attachAvatar(std::move(a));
-    }
-    g_current_skin = want;
-    // The new avatar starts blank — let the BLE buddy redraw any pending
-    // prompt/PIN bubble that the rebuild wiped.
-    buddy_ble::notify_avatar_swapped();
-    mclog::tagInfo(TAG, "skin: {}", value);
+    // May not return: restarts the device when the setting changes.
+    buddy_ble::set_enabled(doc["enabled"].as<bool>());
 }
 
 }  // namespace
@@ -200,6 +191,7 @@ bool face_is_off()
 
 void enqueue(std::string_view json)
 {
+    g_last_cmd_ms.store(now_ms());
     std::lock_guard<std::mutex> lock(g_queue_mu);
     if (g_queue.size() >= kMaxQueuedCommands) {
         // The idle loop drains everything every ~20 ms, so this only fires if
@@ -223,6 +215,20 @@ void drain()
         // Outside g_queue_mu: dispatch takes the LVGL lock and can block.
         dispatch(json);
     }
+}
+
+void check_listening_watchdog()
+{
+    if (state::current() != state::Mode::Listening) return;
+    int64_t now  = now_ms();
+    int64_t last = g_last_cmd_ms.load();
+    int64_t entered = state::entered_at_ms();
+    if (entered > last) last = entered;
+    if (now - last < kListeningWatchdogMs) return;
+    mclog::tagWarn(TAG, "LISTENING for {} ms with no brain command; back to idle",
+                   now - last);
+    // Same path as the brain's stop_listening.
+    state::transition(state::Mode::Idle);
 }
 
 void dispatch(std::string_view json)
@@ -266,8 +272,8 @@ void dispatch(std::string_view json)
     } else if (c == "set_busy") {
         wake_face();
         apply_set_busy(doc);
-    } else if (c == "set_skin") {
-        apply_set_skin(doc);
+    } else if (c == "set_buddy") {
+        apply_set_buddy(doc);
     } else if (c == "sleep") {
         sleep_face();
     } else if (c == "wake") {

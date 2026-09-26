@@ -11,6 +11,9 @@
 
 #include <ArduinoJson.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <nvs.h>
 #include <hal/hal.h>
 #include <mooncake_log.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
@@ -71,10 +74,6 @@ bool g_last_face_off = false;     // backlight state observed on the previous ti
 bool g_ws_was_connected = false;  // brain-WS state observed on the previous tick
 uint32_t g_last_adv_check_ms = 0;   // last "are we still advertising?" poll
 uint32_t g_last_prompt_try_ms = 0;  // last buddy_prompt announcement attempt
-// Set from the WS/dispatch task when the avatar is swapped (set_skin); consumed
-// by tick() to force a redraw. Atomic because it crosses tasks; g_rendered et al
-// stay tick-only.
-std::atomic<bool> g_force_redraw{false};
 
 // ---- LVGL helpers (each takes the lock; never call while already holding) --
 void draw_bubble(const char* text)
@@ -290,17 +289,52 @@ void start()
     buddy_nus_init(&on_line);
 }
 
+// The on/off switch lives in NVS so the brain can flip it at runtime; BLE
+// coexistence is decided at boot (the controller and Wi-Fi power save are set
+// up once), so a change takes effect through a reboot.
+namespace {
+constexpr const char* kNvsNamespace = "stackchan";
+constexpr const char* kNvsKey       = "buddy_ble";
+}  // namespace
+
+bool enabled()
+{
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) {
+        return false;  // namespace never written: default off
+    }
+    uint8_t v = 0;
+    nvs_get_u8(h, kNvsKey, &v);
+    nvs_close(h);
+    return v != 0;
+}
+
+void set_enabled(bool on)
+{
+    if (enabled() == on) {
+        mclog::tagInfo(TAG, "set_buddy {}: unchanged", on);
+        return;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, kNvsKey, on ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        // Rebooting would only come back up in the old mode.
+        mclog::tagError(TAG, "set_buddy {}: nvs write failed: {}", on, esp_err_to_name(err));
+        return;
+    }
+    mclog::tagWarn(TAG, "set_buddy {}: saved, restarting", on);
+    vTaskDelay(pdMS_TO_TICKS(300));  // let the log line reach the UART
+    esp_restart();
+}
+
 bool prompt_pending()
 {
     return g_has_prompt.load();
-}
-
-void notify_avatar_swapped()
-{
-    // Called from the set_skin handler (WS task) after attachAvatar. The new
-    // avatar starts blank, so invalidate our render state to redraw any
-    // pending prompt/bubble next tick.
-    g_force_redraw.store(true);
 }
 
 void approve_pending()
@@ -342,13 +376,6 @@ void tick()
         g_rendered = Desired::None;
     }
     g_last_face_off = face_off_now;
-
-    // A skin swap (set_skin) rebuilt the avatar, wiping any prompt/PIN bubble
-    // we had drawn. Force a redraw so it comes back on the next tick.
-    if (g_force_redraw.exchange(false)) {
-        g_rendered = Desired::None;
-        g_owns_screen = false;
-    }
 
     // On a brain-WS (re)connect, re-announce the buddy_prompt pending state:
     // our edge-trigger global survives a brain restart but the brain's view

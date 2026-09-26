@@ -1,5 +1,7 @@
 # Rocky avatar skin: activation and rendering architecture
 
+> **Status: superseded 2026-09-26.** The Rocky skin and persona have been removed (see docs/plan-responsiveness.md).
+
 ## Status
 
 accepted

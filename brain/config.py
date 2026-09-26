@@ -171,6 +171,13 @@ SPECS: dict[str, Spec] = {
         "sleep out from under an unanswered prompt. Never shortens "
         "SLEEP_TIMEOUT_S.",
     ),
+    "BUDDY_ENABLED": Spec(
+        0, "int", False, "behavior",
+        "BLE link for Claude Desktop permission prompts (shown on the face, "
+        "approved with a head tap). Changing it reboots the robot (~15 s). "
+        "Off frees the radio for Wi-Fi audio. 0 = off, 1 = on.",
+        minimum=0, maximum=1,
+    ),
 
     # --- MCP / tools (hot) ----------------------------------------------
     "HA_FAST_PATH": Spec(
