@@ -19,12 +19,14 @@ console knob: the token rides along to whatever URL that names.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 
 import httpx
+from websockets.asyncio.client import connect as ws_connect
 
 from config import get_config
 from mcp_client import _http_headers
@@ -120,3 +122,79 @@ async def try_handle(text: str) -> FastPathResult | None:
         return FastPathResult(None, rtype, latency_ms)
     log.info("ha fast path: %s in %d ms → %r", rtype, latency_ms, speech)
     return FastPathResult(speech, rtype, latency_ms)
+
+
+# Names Whisper should expect: without them it hears a quiet "office light"
+# as "office air". Taken from what HA exposes to Assist, since those are the
+# names the fast path can act on.
+VOCAB_DOMAINS = ("light", "switch", "fan", "cover", "climate", "media_player", "lock")
+MAX_VOCAB = 60
+
+
+async def fetch_vocabulary() -> list[str]:
+    """Entity names and aliases exposed to Assist, plus area names and
+    aliases, deduplicated. Empty on any failure — the hint is an optimisation,
+    never a dependency."""
+    token = (os.environ.get("HA_TOKEN") or "").strip()
+    if not token:
+        return []
+    ws_url = _base_url().replace("http", "ws", 1) + "/api/websocket"
+    try:
+        async with asyncio.timeout(10):
+            async with ws_connect(ws_url, max_size=None) as ws:
+                await ws.recv()
+                await ws.send(json.dumps({"type": "auth", "access_token": token}))
+                if json.loads(await ws.recv()).get("type") != "auth_ok":
+                    log.warning("ha vocabulary: auth failed")
+                    return []
+                ids = iter(range(1, 100))
+
+                async def call(**cmd):
+                    i = next(ids)
+                    await ws.send(json.dumps({"id": i, **cmd}))
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("id") == i and msg.get("type") == "result":
+                            return msg.get("result") if msg.get("success") else None
+
+                exposed = (await call(type="homeassistant/expose_entity/list") or {}).get(
+                    "exposed_entities", {})
+                wanted = [eid for eid, opts in exposed.items()
+                          if opts.get("conversation") and eid.split(".")[0] in VOCAB_DOMAINS]
+                # The registry list omits aliases; get_entries returns full entries.
+                entries = await call(type="config/entity_registry/get_entries",
+                                     entity_ids=wanted) if wanted else {}
+                areas = await call(type="config/area_registry/list") or []
+                devices = await call(type="config/device_registry/list") or []
+    except Exception as e:
+        log.warning("ha vocabulary unavailable (%r)", e)
+        return []
+    entities = [v for v in (entries or {}).values() if v]
+    return _vocabulary(entities, exposed, areas, devices)
+
+
+def _vocabulary(entities: list, exposed: dict, areas: list, devices: list) -> list[str]:
+    device_names = {d.get("id"): d.get("name_by_user") or d.get("name") for d in devices}
+    words: list[str] = []
+    for e in entities:
+        eid = e.get("entity_id", "")
+        if eid.split(".")[0] not in VOCAB_DOMAINS:
+            continue
+        if not exposed.get(eid, {}).get("conversation"):
+            continue
+        words += e.get("aliases") or []
+        words.append(e.get("name") or e.get("original_name") or device_names.get(e.get("device_id")) or "")
+    for a in areas:
+        words.append(a.get("name") or "")
+        words += a.get("aliases") or []
+    seen: set[str] = set()
+    out = []
+    for w in words:
+        # Recent HA puts null in an alias list to mean "the entity's own name".
+        if not isinstance(w, str):
+            continue
+        w = w.replace("’", "'").strip()
+        if w and w.lower() not in seen:
+            seen.add(w.lower())
+            out.append(w)
+    return out[:MAX_VOCAB]

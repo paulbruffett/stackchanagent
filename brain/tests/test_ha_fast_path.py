@@ -108,3 +108,23 @@ async def test_record_exchange_persists_the_fast_path_turn(mem, make_agent):
     assert [t.role for t in turns] == ["user", "assistant"]
     assert turns[0].content == "turn off the light"
     assert sess.messages[-1]["content"] == [{"type": "text", "text": "Turned off the light"}]
+
+
+def test_vocabulary_takes_exposed_names_aliases_and_areas():
+    entities = [
+        {"entity_id": "light.office_office", "name": None, "original_name": None,
+         "device_id": "d1", "aliases": [None, "office light", "office lights"]},
+        {"entity_id": "light.hidden", "name": "Secret lamp", "aliases": ["nope"]},
+        {"entity_id": "switch.hue_automation", "name": "Automation: Nightlight", "aliases": []},
+        {"entity_id": "sensor.sun_next_dawn", "name": "Sun next dawn", "aliases": []},
+    ]
+    exposed = {"light.office_office": {"conversation": True},
+               "light.hidden": {"conversation": False},
+               "sensor.sun_next_dawn": {"conversation": True}}
+    areas = [{"name": "Mary’s room", "aliases": ["Mary's room"]}, {"name": "Office", "aliases": []}]
+    devices = [{"id": "d1", "name": "Office", "name_by_user": None}]
+
+    words = ha_fast_path._vocabulary(entities, exposed, areas, devices)
+
+    # Curly apostrophes normalised and deduplicated case-insensitively.
+    assert words == ["office light", "office lights", "Office", "Mary's room"]
