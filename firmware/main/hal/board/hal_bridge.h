@@ -49,6 +49,13 @@ i2c_master_bus_handle_t board_get_i2c_bus();
 StackChanCamera* board_get_camera();
 int board_get_battery_level();
 bool board_is_battery_charging();
+// Battery % + charging straight from the PMIC, without GetBatteryLevel()'s
+// power-save-timer toggle. Non-aborting: false if the I2C read fails.
+bool board_read_battery(int& level, bool& charging);
+bool board_read_charging(bool& charging);
+// Re-sync the blink modifier after eye weights were changed outside
+// SetEmotion (e.g. by a dance). Caller holds the LVGL lock.
+void display_resync_blink();
 void board_set_backlight_brightness(uint8_t brightness, bool permanent = false);
 uint8_t board_get_backlight_brightness();
 void board_set_speaker_volume(uint8_t volume, bool permanent = false);

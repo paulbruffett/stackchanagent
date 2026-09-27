@@ -185,6 +185,8 @@ extern "C" void app_main(void)
     });
     agent::wakeword::start();
     agent::mic_pump::start();
+    // Battery/charging/volume reports to the brain, on their own task.
+    agent::commands::start_status_reporter();
 
     // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
     // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so

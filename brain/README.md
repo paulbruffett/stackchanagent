@@ -35,7 +35,7 @@ Read from `.env` at the repo root (one level above `brain/`):
 Most behaviour is tuned at runtime in the console's Config tab
 (`config.py` lists every knob, its default and whether it needs a restart):
 `MODEL` / `SUMMARY_MODEL` / `REASONING_EFFORT`, `STT_MODEL`, `SPEECH_RMS`,
-`FOLLOW_UP_WINDOW_S`, `HA_FAST_PATH`, `BUDDY_ENABLED`, `SYSTEM_PROMPT`, and so
+`FOLLOW_UP_WINDOW_S`, `HA_FAST_PATH`, `BUDDY_ENABLED`, `SPEAKER_VOLUME`, `SYSTEM_PROMPT`, and so
 on. Overrides persist in `~/.stackchan/memory.db` alongside the conversation,
 summaries, facts and MCP registry.
 
@@ -50,7 +50,7 @@ First-run downloads (cached afterwards): the Piper voice
 | `stt.py` | faster-whisper wrapper, wake-word stripping, the follow-up noise gate. |
 | `ha_fast_path.py` | Home Assistant intent fast path and the STT vocabulary fetch. |
 | `claude_agent.py` | The LLM loop over OpenRouter (the name predates the move): streaming, tool rounds, the single-round device-command exit, history repair, summarizer. |
-| `tools.py`, `mcp_client.py` | Native tools (face, head, memory, goodbye) and MCP servers (`mcp_servers/weather.py` bundled; Home Assistant over http). |
+| `tools.py`, `mcp_client.py` | Native tools (face, head, dance, volume, battery status, memory, goodbye) and MCP servers (`mcp_servers/weather.py` bundled; Home Assistant over http). |
 | `memory.py`, `config.py` | SQLite persistence and the knob registry. |
 | `webui/` | The console. |
 

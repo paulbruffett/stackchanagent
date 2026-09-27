@@ -14,6 +14,7 @@
 #include <web_socket.h>
 
 #include "buddy_ble.h"
+#include "commands.h"
 #include "state.h"
 
 namespace agent::transport {
@@ -153,10 +154,11 @@ void connection_task(void*)
         const TickType_t session_start = xTaskGetTickCount();
         mclog::tagInfo(TAG, "connected");
         // Report the BLE-buddy mode this boot is running in, so the brain
-        // only sends set_buddy (which reboots us) when it actually differs.
-        send_event_json(buddy_ble::enabled()
-                            ? "{\"event\":\"boot\",\"buddy\":true}"
-                            : "{\"event\":\"boot\",\"buddy\":false}");
+        // only sends set_buddy (which reboots us) when it actually differs,
+        // plus battery/volume (the brain syncs SPEAKER_VOLUME off this).
+        send_event_json(std::string("{\"event\":\"boot\",\"buddy\":")
+                        + (buddy_ble::enabled() ? "true," : "false,")
+                        + commands::status_fields() + "}");
 
         // Run until disconnect / error fires.
         while (!closed->load()) {

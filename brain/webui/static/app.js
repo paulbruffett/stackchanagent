@@ -522,6 +522,29 @@ function connectFeed(path, onItem) {
   };
 }
 
+// ---- device status (header) ----
+// Battery / charging / volume from the robot's last report (every 60 s, or on
+// a charging flip). Low battery shows in the warning colour; the robot itself
+// never says so unprompted.
+async function loadDevice() {
+  const d = $("#device");
+  let j;
+  try {
+    // A background poll: window.fetch, not the wrapper above, so a 401 here
+    // never pops the token prompt — user-initiated loads do that.
+    const r = await window.fetch("/api/device", { headers: { "x-stackchan-token": TOKEN } });
+    if (!r.ok) return;
+    j = await r.json();
+  } catch { return; }
+  if (!j.connected) { d.textContent = "robot offline"; d.className = "muted"; return; }
+  const bat = j.battery == null ? "🔋 ?" : `🔋 ${j.battery}%${j.charging ? " ⚡" : ""}`;
+  const vol = j.volume == null ? "🔊 ?" : `🔊 ${j.volume}`;
+  d.textContent = `${bat}${j.low_battery ? " low" : ""} · ${vol}`;
+  d.className = j.low_battery ? "lvl-WARNING" : "muted";
+}
+
 loadConfig();
+loadDevice();
+setInterval(loadDevice, 30000);
 connectFeed("/ws/logs", appendLog);
 connectFeed("/ws/turns", appendTurn);

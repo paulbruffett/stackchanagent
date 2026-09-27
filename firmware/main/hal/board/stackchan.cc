@@ -25,6 +25,23 @@
 
 class Pmic : public Axp2101 {
 public:
+    // Non-aborting versions of Axp2101::IsCharging / GetBatteryLevel (those go
+    // through I2cDevice::ReadReg, which ESP_ERROR_CHECKs the transfer).
+    bool TryReadCharging(bool& charging)
+    {
+        uint8_t v = 0;
+        if (TryReadRegs(0x01, &v, 1) != ESP_OK) return false;
+        charging = ((v & 0b01100000) >> 5) == 1;  // current direction: 1 = charging
+        return true;
+    }
+    bool TryReadLevel(int& level)
+    {
+        uint8_t v = 0;
+        if (TryReadRegs(0xA4, &v, 1) != ESP_OK) return false;
+        level = v;
+        return true;
+    }
+
     /**
      * @brief axp2101 charge currnet voltage parameters.
      */
@@ -523,6 +540,17 @@ public:
         return camera_;
     }
 
+    // Battery reads without GetBatteryLevel()'s power-save-timer side effect,
+    // and without its abort on a failed I2C transfer.
+    bool ReadCharging(bool& charging)
+    {
+        return pmic_ && pmic_->TryReadCharging(charging);
+    }
+    bool ReadBattery(int& level, bool& charging)
+    {
+        return pmic_ && pmic_->TryReadCharging(charging) && pmic_->TryReadLevel(level);
+    }
+
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override
     {
         static bool last_discharging = false;
@@ -583,6 +611,18 @@ int hal_bridge::board_get_battery_level()
     } else {
         return 100;
     }
+}
+
+bool hal_bridge::board_read_battery(int& level, bool& charging)
+{
+    auto& board = (M5StackCoreS3Board&)Board::GetInstance();
+    return board.ReadBattery(level, charging);
+}
+
+bool hal_bridge::board_read_charging(bool& charging)
+{
+    auto& board = (M5StackCoreS3Board&)Board::GetInstance();
+    return board.ReadCharging(charging);
 }
 
 bool hal_bridge::board_is_battery_charging()

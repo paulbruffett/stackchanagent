@@ -15,7 +15,9 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection
 
+from config import get_config
 from memory import Memory
+from policy import DeviceStatus, describe_device_status, step_volume
 
 log = logging.getLogger("brain.tools")
 
@@ -34,6 +36,9 @@ class ToolContext:
     # to hold the mic open purely on "the reply was non-empty", and a goodbye
     # is non-empty, so the follow-up window opened anyway.
     conversation_ended: bool = False
+    # The firmware's last battery/charging/volume report (the connection's
+    # ConnState.device). None when the session was built without one (tests).
+    device: DeviceStatus | None = None
 
 
 # Schemas exposed to the model. Keep tight — descriptions are what drive
@@ -111,6 +116,49 @@ TOOL_DEFS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "set_volume",
+        "description": (
+            "Change YOUR OWN speaker volume (the robot's voice) — for requests "
+            "like 'turn your volume down', 'speak louder', 'you're too loud' or "
+            "'set your volume to 40'. Not for TVs, speakers or media players in "
+            "the house: those are Home Assistant devices. Give either level "
+            "(0-100) or change 'up'/'down' (a step of 15). Say a short "
+            "confirmation in the same message."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "minimum": 0, "maximum": 100},
+                "change": {"type": "string", "enum": ["up", "down"]},
+            },
+        },
+    },
+    {
+        "name": "get_device_status",
+        "description": (
+            "Read your own battery level, whether you're charging, and your "
+            "speaker volume. Use when asked about your battery, charge or "
+            "volume."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "dance",
+        "description": (
+            "Do a short dance with your head and face (a few seconds). Use "
+            "when asked to dance, or for a real celebration. Styles: 'happy' "
+            "(swaying), 'robot' (stiff and angular), 'panic' (a nervous "
+            "shake). Not on every turn."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "style": {"type": "string", "enum": ["happy", "robot", "panic"]},
+            },
+            "required": ["style"],
+        },
+    },
+    {
         "name": "end_conversation",
         "description": (
             "End the conversation gracefully. Use when the user says goodbye or "
@@ -148,7 +196,16 @@ NOTHING_SAVED = "Empty fact — nothing saved."
 # WebSocket command to the firmware or a local DB write, done in well under a
 # second. The agent loop derives both "no busy bubble / ack" and "may ride
 # along with a single-round device command" from this one set.
-NATIVE_EFFECT_TOOLS = frozenset({"set_expression", "look_at", "remember_fact"})
+NATIVE_EFFECT_TOOLS = frozenset(
+    {"set_expression", "look_at", "remember_fact", "dance", "set_volume"}
+)
+
+# Of those, the ones that are a device action the user asked for — like a Home
+# Assistant action they may END a turn alongside the spoken confirmation. The
+# rest are expressive and only ride along.
+NATIVE_ACTION_TOOLS = frozenset({"set_volume"})
+
+DANCE_STYLES = ("happy", "robot", "panic")
 
 
 def clean_mcp_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -212,6 +269,16 @@ async def _dispatch(
         ctx.memory.add_fact(fact)
         log.info("remembered: %r", fact)
         return f"Remembered: {fact}"
+    if name == "set_volume":
+        return await _set_volume(input_, ctx)
+    if name == "get_device_status":
+        return describe_device_status(ctx.device or DeviceStatus())
+    if name == "dance":
+        style = input_.get("style")
+        if style not in DANCE_STYLES:
+            return f"{TOOL_ERROR_PREFIX} Unknown dance style {style!r}"
+        await ctx.ws.send(json.dumps({"cmd": "dance", "style": style}))
+        return f"Dancing ({style})."
     if name == "end_conversation":
         # No firmware-side cmd needed; the agent's reply is the goodbye. The
         # flag is what actually ends the conversation — the caller reads it
@@ -220,3 +287,35 @@ async def _dispatch(
         return "Conversation ended."
     log.warning("unknown tool: %s", name)
     return f"{TOOL_ERROR_PREFIX} Unknown tool {name}"
+
+
+async def _set_volume(input_: dict[str, Any], ctx: ToolContext) -> str:
+    """Write SPEAKER_VOLUME (so the console and the voice agree) and send
+    set_volume at once — the user asked, so mid-turn is fine. The sent value
+    becomes the device's volume straight away, so the idle ticker's sync has
+    nothing to repeat and a later call in the same turn starts from it."""
+    dev = ctx.device
+    if dev is None or dev.volume is None:
+        # Firmware without set_volume never reports a volume.
+        return (f"{TOOL_ERROR_PREFIX} The robot's firmware doesn't support "
+                "volume control yet.")
+    current = dev.volume
+    level = input_.get("level")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        level = None
+    change = input_.get("change")
+    try:
+        new = step_volume(current, level, change if change in ("up", "down") else None)
+    except ValueError as e:
+        return f"{TOOL_ERROR_PREFIX} {e}"
+    if new == current and level is None:
+        # "up" at 100 / "down" at 0: nothing changes, and the confirmation the
+        # model already spoke is wrong — a failure gets it a round to say so.
+        edge = "maximum" if new == 100 else "minimum"
+        return f"{TOOL_ERROR_PREFIX} Volume is already at the {edge} ({new})."
+    get_config().set("SPEAKER_VOLUME", new)
+    await ctx.ws.send(json.dumps({"cmd": "set_volume", "value": new}))
+    dev.volume = new
+    if new == current:
+        return f"Volume is already at {new}."
+    return f"Volume set to {new} (was {current})."

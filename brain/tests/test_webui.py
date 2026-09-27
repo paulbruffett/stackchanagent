@@ -206,3 +206,14 @@ def test_stale_stored_model_is_ignored_on_reload(mem):
     cfg.reload()
     assert cfg.get("MODEL") == SPECS["MODEL"].default
     assert cfg.get("REASONING_EFFORT") == "low"
+
+
+async def test_device_endpoint(mem):
+    status = {"connected": True, "battery": 12, "charging": False, "volume": 70,
+              "low_battery": True, "updated_at": 1.0}
+    app = create_app(mem, get_config(), token=TOKEN, device_status=lambda: status)
+    async with _client(app) as c:
+        assert (await c.get("/api/device")).status_code == 401
+        assert (await c.get("/api/device", headers=AUTH)).json() == status
+    async with _client(create_app(mem, get_config(), token=TOKEN)) as c:
+        assert (await c.get("/api/device", headers=AUTH)).json() == {"connected": False}
