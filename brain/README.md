@@ -1,85 +1,67 @@
 # stackchan brain
 
-Jetson-side Python agent. The ESP32 firmware connects to this over a single
-WebSocket on the LAN; the brain runs STT, the LLM tool-call loop (OpenRouter, with
-MCP tools), and TTS.
+The Python agent that runs on the Jetson. The ESP32 firmware connects to it
+over one WebSocket on the LAN (:8765); the brain does end-of-speech
+detection, STT, the Home Assistant fast path, the LLM tool loop, TTS and
+conversation memory, and serves the web console (:8080).
+
+In production it runs as a systemd user service — see
+[`../deploy/README.md`](../deploy/README.md). This file covers the code.
 
 ## Install
 
-All runtime deps (websockets, openai, faster-whisper, piper-tts, numpy)
-are required and live in the base dependency list — there are no optional
-groups to opt into.
-
-With `uv` (recommended on the Jetson):
-
 ```bash
 cd brain
-uv sync   # auto-fetches CPython 3.12 if the system Python is older
+uv sync --extra dev   # fetches CPython 3.12 if the system Python is older
 ```
 
-Python 3.12 is required — `onnxruntime` (pulled in by `piper-tts`) dropped
-3.10 wheels, and the locally-built CUDA `ctranslate2` wheel is cp312-only.
-On Jetson Ubuntu 22.04 the system Python is 3.10, so `uv` downloads a
-managed `python-build-standalone` aarch64 build — the system Python is
-left untouched.
+Python 3.12 exactly: `onnxruntime` (via `piper-tts`) dropped 3.10 wheels, and
+`ctranslate2` is pinned to a locally built CUDA aarch64 wheel in `wheels/`
+that is cp312-only. So `uv.lock` can only be resolved **on the Jetson** —
+re-lock there, never on the Mac (a Mac-resolved lock silently guts the venv).
 
-`uv.lock` is resolved **on the Jetson**, since the `ctranslate2` pin is an
-aarch64 path wheel. Re-lock there, not on the Mac.
+## Environment
 
-Or with plain pip:
+Read from `.env` at the repo root (one level above `brain/`):
 
-```bash
-cd brain
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-```
+| Variable | Needed for |
+|---|---|
+| `OPENROUTER_API_KEY` | The LLM (all models go through OpenRouter). |
+| `HA_TOKEN` | Home Assistant: the fast path, STT device-name hints, and the `homeassistant` MCP server (registered with `env_ref: HA_TOKEN`). |
+| `HA_URL` | Optional; defaults to `http://localhost:8123`. Deliberately not a console knob — the token goes wherever it points. |
+| `CONSOLE_TOKEN` | Web console auth. If unset, one is generated and printed at startup. |
+| `CONSOLE_BIND` | Optional console bind address. |
 
-`OPENROUTER_API_KEY` is loaded from a `.env` at the repo root (one level
-above `brain/`). Create it once:
+Most behaviour is tuned at runtime in the console's Config tab
+(`config.py` lists every knob, its default and whether it needs a restart):
+`MODEL` / `SUMMARY_MODEL` / `REASONING_EFFORT`, `STT_MODEL`, `SPEECH_RMS`,
+`FOLLOW_UP_WINDOW_S`, `HA_FAST_PATH`, `BUDDY_ENABLED`, `SYSTEM_PROMPT`, and so
+on. Overrides persist in `~/.stackchan/memory.db` alongside the conversation,
+summaries, facts and MCP registry.
 
-```bash
-echo 'OPENROUTER_API_KEY=sk-or-...' > ../.env
-```
+First-run downloads (cached afterwards): the Piper voice
+(`~/.cache/piper-voices/`) and the Whisper model (`~/.cache/huggingface/`).
 
-First-run downloads (cached afterwards):
-- Piper voice (`en_US-amy-medium`) → `~/.cache/piper-voices/`
-- Whisper model (`small.en` int8) → `~/.cache/huggingface/`
+## Layout
 
-## Run
-
-```bash
-uv run agent_server.py
-# or, in the venv: python agent_server.py
-```
-
-Listens on `0.0.0.0:8765`. Also attempts to advertise
-`stackchan-brain.local` via mDNS — non-fatal if it fails (the firmware
-can be pointed at a literal IP via `idf.py menuconfig` → Stackchan
-Brain → Brain host).
+| Module | Role |
+|---|---|
+| `agent_server.py` | WebSocket server: VAD, turn orchestration, follow-up window, sleep, the idle ticker (summaries, buddy sync), TTS playback. |
+| `stt.py` | faster-whisper wrapper, wake-word stripping, the follow-up noise gate. |
+| `ha_fast_path.py` | Home Assistant intent fast path and the STT vocabulary fetch. |
+| `claude_agent.py` | The LLM loop over OpenRouter (the name predates the move): streaming, tool rounds, the single-round device-command exit, history repair, summarizer. |
+| `tools.py`, `mcp_client.py` | Native tools (face, head, memory, goodbye) and MCP servers (`mcp_servers/weather.py` bundled; Home Assistant over http). |
+| `memory.py`, `config.py` | SQLite persistence and the knob registry. |
+| `webui/` | The console. |
 
 ## Test
 
 ```bash
-uv run --extra dev pytest        # or, in the venv: python -m pytest
+uv run --extra dev pytest
 ```
 
-`tests/` covers the conversation-state hardening (M6): atomic exchange
-persistence, tool-dispatch recovery, the message-thread contract
-(`validate_thread`) + read-time sanitizer, the startup integrity pass
-(`repair_memory`), and the follow-up false-trigger gate. The suite uses a
-scripted fake Anthropic client, so it runs offline with no API key or model
-download.
-
-## Phase 1 verification
-
-1. Start `agent_server.py` on the Jetson.
-2. Flash phase-1 firmware on the CoreS3 (next firmware iteration; current
-   firmware is phase 0 hardware bring-up only).
-3. Speak — audio is echoed back through the StackChan's speaker with a
-   small LAN latency. Confirms the wire protocol + clocking.
-
-Once that passes we layer in `faster-whisper` and `piper-tts` in phase 2.
-
-## Env
-
-`OPENROUTER_API_KEY` is required from phase 3 onward.
+The suite fakes the OpenAI streaming client and Home Assistant, so it runs
+offline with no key or model download. `agent_server` itself isn't imported
+by the tests (it opens the live DB and loads models at import), so logic
+worth testing lives in small pure functions (`policy.py`, `stt.py`,
+`ha_fast_path.py`).

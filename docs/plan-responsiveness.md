@@ -1,5 +1,39 @@
 # Plan: make Stack-chan respond fast and every time
 
+## Status (2026-09-26): done
+
+Everything below was built, merged and deployed on 2026-09-25/26 (PRs #36–#42).
+"computer, turn off the office light" now completes in ~0.7–1 s from the end
+of speech via the Home Assistant fast path, with no LLM call.
+
+What shipped, and where it differed from this plan:
+
+| Step | PR | Notes |
+|---|---|---|
+| Mic uplink fix | #36 | **Not in the plan — the real cause of the misses.** ~85–95% of mic frames were being lost: the mic task sent inline with only ~90 ms of I2S buffer, behind camera JPEGs and modem sleep. Fixed with a 1 s queue + sender task, camera removed, bigger TCP window, 500 ms wake-word pre-roll. |
+| Prune (Option A) | #37 | As planned, except **kept**: sleep, automatic memory (summaries now run between conversations, LLM calls outside the turn lock), and the follow-up window (4.5 s, no extended thinking). |
+| HA fast path | #38 | As planned. Needed HA to own the lights first: the Hue bridge was paired into HA and given spoken aliases. |
+| Answer quality | #39 | Whisper hotwords from HA's exposed names; weather forecasts; a prompt line about mishearings. `STT_MODEL` moved from `medium.en` to `small.en` (~2× faster, no accuracy loss seen). |
+| Configurable LLM | #40 | OpenRouter (`openai/gpt-5.6-luna` default, console-selectable). Single-round device commands implemented as planned. Old Anthropic-format turns dropped once. |
+| Fix | #41 | Blank optional MCP args broke HA intents; "computer, …" inside the follow-up window is a direct request. |
+| Firmware | #42 | Rocky removed; BLE buddy is a console knob (`BUDDY_ENABLED`, default off) instead of cut; LISTENING (15 s) and SPEAKING (60 s) watchdogs. |
+
+Not done, by decision: Silero VAD (the `SPEECH_RMS=400` threshold turned out
+sufficient), pull-on-demand deploys (restart cost was the Whisper load, not
+git), and Option B (HA as the whole pipeline).
+
+Open items:
+- `BUDDY_ENABLED` toggle not yet exercised on hardware.
+- Relative device commands the fast path can't match ("a bit dimmer") take
+  ~7 s: the model reads state first (`GetLiveContext`) and then acts.
+- GPU memory: a second Whisper instance next to the brain OOMs even with
+  RAM free; `vm.min_free_kbytes=262144` is set, but watch for CUDA OOMs.
+- `claude_agent.py` should be renamed now that it isn't Claude-specific.
+
+The rest of this document is the original analysis, kept as written.
+
+---
+
 Written 2026-09-24 against `origin/main` (decc3ca). The local `main` checkout is
 117 commits behind that and still shows the phase-0 servo sweep, so everything
 below refers to what is actually deployed on the Jetson.

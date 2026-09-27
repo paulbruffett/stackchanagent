@@ -1,4 +1,4 @@
-# Local MCP servers (Phase 9b)
+# Local MCP servers
 
 Small FastMCP servers the brain launches as stdio MCP servers. Register
 them in the web console's **MCP** tab, then click **Reload**.

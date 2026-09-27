@@ -1,5 +1,10 @@
 # Session context, 2026-09-24
 
+> **Historical.** These notes describe the system before the 2026-09-25/26
+> refactor; see the Status section of `plan-responsiveness.md` for what
+> changed. Paths and components named here (Rocky, camera, A2A, Hue MCP,
+> Anthropic SDK) no longer exist.
+
 Notes from the review session that produced `plan-responsiveness.md`. Read
 this before touching the voice path; it records what was found and where.
 
