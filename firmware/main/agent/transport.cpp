@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include <ArduinoJson.h>
 #include <board.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -15,6 +16,7 @@
 
 #include "buddy_ble.h"
 #include "commands.h"
+#include "ota.h"
 #include "state.h"
 
 namespace agent::transport {
@@ -155,10 +157,21 @@ void connection_task(void*)
         mclog::tagInfo(TAG, "connected");
         // Report the BLE-buddy mode this boot is running in, so the brain
         // only sends set_buddy (which reboots us) when it actually differs,
-        // plus battery/volume (the brain syncs SPEAKER_VOLUME off this).
-        send_event_json(std::string("{\"event\":\"boot\",\"buddy\":")
-                        + (buddy_ble::enabled() ? "true," : "false,")
-                        + commands::status_fields() + "}");
+        // plus battery/volume (the brain syncs SPEAKER_VOLUME off this) and
+        // the running firmware, so the console can show it.
+        {
+            JsonDocument boot;
+            boot["event"] = "boot";
+            boot["buddy"] = buddy_ble::enabled();
+            boot["fw"] = ota::running_version();
+            boot["fw_built"] = ota::running_build();
+            std::string json;
+            serializeJson(boot, json);
+            // status_fields() is a ready-made `"battery":…,"volume":…`
+            // fragment; splice it in before the closing brace.
+            json.insert(json.size() - 1, "," + commands::status_fields());
+            send_event_json(json);
+        }
 
         // Run until disconnect / error fires.
         while (!closed->load()) {

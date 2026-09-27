@@ -57,3 +57,15 @@ idf.py -p /dev/cu.usbmodem21101 flash monitor
 
 Replace the port with whatever your CoreS3 enumerates as (`ls
 /dev/cu.usbmodem*`). Exit the serial monitor with `Ctrl+]`.
+
+### Over-the-air updates
+
+Once the robot runs a build with the `ota` command (the first such build
+has to go over USB), later builds can go through the brain console:
+**Firmware** tab → upload `build/stack-chan.bin` → **Send to robot**. The
+brain sends it between conversations; the robot downloads it from the
+console port on its own task, checks size + SHA-256, flashes the spare OTA
+slot and reboots. The new image is marked valid once it reaches the brain;
+if it can't within 60 s of boot (or crashes first) the bootloader rolls back
+to the previous one. Only the app is updated — bootloader, partition table
+and the assets partition still need USB.

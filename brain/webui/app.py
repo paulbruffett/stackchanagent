@@ -14,6 +14,7 @@ sends it as a header, the log/turn WebSockets as a query param.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import secrets
@@ -23,7 +24,15 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
@@ -38,6 +47,7 @@ from claude_agent import (
     summary_model,
 )
 from config import SPECS, Config
+from firmware_ota import OTA_PARTITION_SIZE, ImageError, OtaManager
 from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
 
@@ -144,6 +154,7 @@ def create_app(
     token: str | None = None,
     resync_sessions: Callable[[], Awaitable[int]] | None = None,
     device_status: Callable[[], dict[str, Any]] | None = None,
+    ota: OtaManager | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
@@ -181,12 +192,17 @@ def create_app(
         before it can present a token. Everything else needs the header (or
         `?token=` for clients that can't set one), because the mutating half
         of this API runs processes as the brain's user and the read half
-        streams every transcript."""
+        streams every transcript.
+
+        /firmware/<token>.bin is the exception: the robot fetches its update
+        there and can't present the console token, so the one-time, expiring
+        path is the credential (firmware_ota.OtaManager.claim)."""
         if not _host_allowed(request.headers.get("host", "")):
             return JSONResponse({"detail": "unrecognised Host header"},
                                 status_code=403)
         path = request.url.path
-        public = path == "/" or path.startswith("/static")
+        public = (path == "/" or path.startswith("/static")
+                  or path.startswith("/firmware/"))
         if token and not public:
             presented = (request.headers.get(TOKEN_HEADER)
                          or request.query_params.get("token"))
@@ -505,6 +521,60 @@ def create_app(
             raise HTTPException(503, "MCP client not available")
         await mcp.reload()
         return {"servers": mcp.status()}
+
+    # --- firmware (OTA) -------------------------------------------------
+    def need_ota() -> OtaManager:
+        if ota is None:
+            raise HTTPException(503, "firmware updates not available")
+        return ota
+
+    @app.get("/api/firmware")
+    async def firmware_status() -> dict[str, Any]:
+        return need_ota().status()
+
+    @app.post("/api/firmware")
+    async def firmware_upload(file: UploadFile) -> dict[str, Any]:
+        """Store a build/stack-chan.bin for the next send. Validated (ESP
+        image magic, chip, app description, partition size) before it
+        replaces the previous upload."""
+        mgr = need_ota()
+        if mgr.in_progress:
+            raise HTTPException(409, f"an update is {mgr.state}; wait for it to finish")
+        data = await file.read(OTA_PARTITION_SIZE + 1)
+        try:
+            info = await asyncio.to_thread(mgr.store.save, data)
+        except ImageError as exc:
+            raise HTTPException(400, str(exc))
+        log.info("firmware uploaded: %s %s (%s, %d bytes)",
+                 info.project, info.version, info.built, info.size)
+        return mgr.status()
+
+    @app.post("/api/firmware/send")
+    async def firmware_send() -> dict[str, Any]:
+        """Queue the stored image; the brain sends it to the robot at the
+        next moment it isn't in a conversation."""
+        mgr = need_ota()
+        try:
+            mgr.request_send()
+        except LookupError as exc:
+            raise HTTPException(404, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        return mgr.status()
+
+    @app.get("/firmware/{name}")
+    async def firmware_download(name: str, request: Request) -> Response:
+        """The robot's one-shot download. Unauthenticated by design — see
+        authenticate() — so every miss is the same bare 404."""
+        mgr = need_ota()
+        if not name.endswith(".bin") or not mgr.claim(name[:-4]):
+            raise HTTPException(404)
+        data = await asyncio.to_thread(mgr.store.read)
+        if data is None:
+            raise HTTPException(404)
+        log.info("firmware download started by %s (%d bytes)",
+                 request.client.host if request.client else "?", len(data))
+        return Response(data, media_type="application/octet-stream")
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")

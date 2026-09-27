@@ -22,6 +22,8 @@
  *   {"cmd":"dance","style":"happy"|"robot"|"panic"}   one bounded (< 6 s) run of
  *       the stock DanceModifier keyframes, then back to the rest pose; ignored
  *       while a dance is already running
+ * Firmware update (agent/ota.h):
+ *   {"cmd":"ota","url":"http://…/firmware/<token>.bin","size":N,"sha256":"<hex>"}
  *
  * The screen is also relit automatically by any activity command
  * (set_expression / look_at / set_busy / dance / start_speaking), so the device

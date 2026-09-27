@@ -8,13 +8,15 @@ Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot" (+ "buddy": bool, + status fields)|
+      from ESP32: {"event": "boot" (+ "buddy": bool, "fw"/"fw_built": str,
+                   + status fields)|
                    "status" ("battery": 0-100|null, "charging": bool|null,
                    "volume": 0-100)|"wakeword"|"tap"|"buddy_prompt"|
-                   "listen_timeout"|"speak_timeout", ...}
+                   "listen_timeout"|"speak_timeout"|
+                   "ota" (+ "state", "pct"/"error"), ...}
       to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
                           "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
-                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"}
+                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"|"ota"}
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
+from firmware_ota import OtaManager  # stdlib-only; needs nothing from .env
+
 # Load OPENROUTER_API_KEY (and any other env) from the project root .env
 # before importing the agent module (which constructs the OpenRouter client).
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -54,6 +58,7 @@ from policy import (
     capture_is_stale,
     effective_sleep_timeout,
     low_battery_check,
+    ota_send_ready,
     volume_sync_action,
 )
 from memory import Memory
@@ -100,6 +105,13 @@ live_sessions: set[AgentSession] = set()
 # Connected firmware links (normally one), newest last, for the console's
 # device panel.
 live_conns: list["ConnState"] = []
+
+# Firmware updates: the console uploads and queues an image, the idle ticker
+# sends it between conversations, the firmware's ota/boot events report back.
+ota = OtaManager()
+# Where the console is bound (set in main()); the robot downloads firmware
+# images from the same server.
+_web_host = HOST
 
 # A session busy with a turn holds its turn lock for the whole exchange
 # (model round trips + tool calls). Bound the console's wait on it rather than
@@ -592,6 +604,8 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
         if state.boot_seen:
             await _sync_buddy(ws, state)
             await _sync_volume(ws, state)
+            await _maybe_send_ota(ws, state)
+        ota.check_stall()
 
 
 def _conversation_busy(state: ConnState) -> bool:
@@ -684,6 +698,40 @@ def _on_device_report(state: ConnState, payload: dict[str, Any]) -> None:
         memory.set_runtime_state("low_battery_warned", warned)
     if warn:
         log.warning("robot battery low: %d%% and not charging", dev.battery)
+
+
+def _firmware_base_url() -> str:
+    """The console's address as the robot must use it. A wildcard or loopback
+    CONSOLE_BIND is no use to the robot, so fall back to the LAN address."""
+    host = _web_host
+    if host in ("0.0.0.0", "::", "") or host.startswith("127.") or host == "localhost":
+        host = lan_ip()
+    return f"http://{host}:{WEB_PORT}"
+
+
+async def _maybe_send_ota(ws: ServerConnection, state: ConnState) -> None:
+    """Send a queued firmware update, between conversations only. The
+    firmware downloads it on its own task, reports progress as ota events and
+    reboots into it; the reconnect's boot event closes the update out."""
+    if not ota_send_ready(ota.requested, state.boot_seen, _conversation_busy(state)):
+        return
+    try:
+        ota.base_url = _firmware_base_url()
+    except OSError as exc:
+        log.warning("ota: no LAN address to serve the image from (%s)", exc)
+        return
+    cmd = ota.build_command()
+    if cmd is None:
+        return
+    try:
+        await ws.send(json.dumps(cmd))
+    except Exception:
+        # Still requested: the next tick (or connection) tries again.
+        log.exception("ota send failed")
+        return
+    ota.mark_sent()
+    log.info("ota: sent %d-byte image to the robot (download from %s)",
+             cmd["size"], ota.base_url)
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -842,10 +890,15 @@ async def handle(ws: ServerConnection) -> None:
                              "unknown" if state.buddy_reported is None
                              else state.buddy_reported)
                     _on_device_report(state, payload)
+                    fw, built = payload.get("fw"), payload.get("fw_built")
+                    ota.on_boot(fw if isinstance(fw, str) else None,
+                                built if isinstance(built, str) else None)
                     await _sync_buddy(ws, state)
                     await _sync_volume(ws, state)
                 elif event == "status":
                     _on_device_report(state, payload)
+                elif event == "ota":
+                    ota.on_event(payload)
                 elif event == "listen_timeout":
                     # The firmware's 15 s watchdog gave up on the capture and
                     # is back in IDLE (wakeword armed). Drop ours to match.
@@ -1051,7 +1104,7 @@ def _seed_default_mcp_servers() -> None:
 
 
 async def main() -> None:
-    global stt, tts
+    global stt, tts, _web_host
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -1095,12 +1148,14 @@ async def main() -> None:
     logging.getLogger("brain").addHandler(WebUILogHandler())
     console_token, console_generated = _console_token()
     web_host = _console_bind()
+    _web_host = web_host
     web = uvicorn.Server(
         uvicorn.Config(
             create_app(memory, cfg, mcp_client,
                        token=console_token,
                        resync_sessions=resync_live_sessions,
-                       device_status=device_status),
+                       device_status=device_status,
+                       ota=ota),
             host=web_host, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
