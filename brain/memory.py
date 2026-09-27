@@ -614,6 +614,16 @@ class Memory:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def restore_timer(self, t: Timer) -> None:
+        """Put a claimed timer back under its own id (its alert never reached
+        the robot), so it fires on the reconnect."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO timers(id, label, fire_ts, created_ts, duration_s, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (t.id, t.label, t.fire_ts, t.created_ts, t.duration_s, t.kind),
+        )
+        self._conn.commit()
+
     # --- MCP server registry (Phase 9b) -------------------------------
 
     def list_mcp_servers(self) -> list[McpServer]:

@@ -642,18 +642,24 @@ ANNOUNCE_WAIT_POLL_S = 0.25
 
 
 async def _timer_loop(ws: ServerConnection, state: ConnState) -> None:
-    """Fire due timers on this connection, one at a time. Runs only while
-    the robot is connected, so a timer that came due during an outage (or a
-    brain restart) is picked up on the reconnect: fired if at most
-    timers.LATE_GRACE_S late, dropped with a log line otherwise. Cancelled by
+    """Fire due timers on this connection, oldest first. Runs only while the
+    robot is connected. A timer that came due during an outage (or a brain
+    restart) is fired on the reconnect if at most timers.LATE_GRACE_S late,
+    dropped with a log line otherwise; one that comes due while connected is
+    always announced, waiting for any conversation to end first. Detection
+    never waits: while a conversation runs, due timers just stay in the DB
+    and the next idle tick announces them all in order. Cancelled by
     handle() on disconnect."""
+    connected_ts = time.time()
     while True:
         await asyncio.sleep(TIMER_CHECK_INTERVAL_S)
-        due, missed = timers.partition_due(memory.list_timers(), time.time())
+        due, missed = timers.partition_due(memory.list_timers(), time.time(), connected_ts)
         for t in missed:
             if memory.delete_timer(t.id):
                 log.warning("timer %d (%s) missed by %.0fs while offline — dropped",
                             t.id, t.label or t.kind, time.time() - t.fire_ts)
+        if not due or _conversation_busy(state):
+            continue
         for t in due:
             try:
                 await _fire_timer(ws, state, t)
@@ -672,15 +678,19 @@ async def _wait_until_idle(state: ConnState) -> None:
 
 async def _fire_timer(ws: ServerConnection, state: ConnState, t: timers.Timer) -> None:
     """Chime (the firmware's alert), then say what went off and record it in
-    the conversation. The row is deleted only once the alert has reached the
-    socket, so a link that dies first leaves the timer to fire on the
-    reconnect; one cancelled while we waited is skipped."""
+    the conversation. The row is claimed (deleted) first, so a timer
+    cancelled meanwhile — from the console or a turn — is never announced;
+    if the alert then can't be sent (the link died), the row is put back so
+    the reconnect fires it."""
     await _wait_until_idle(state)
-    if not any(x.id == t.id for x in memory.list_timers()):
-        return
-    await ws.send(json.dumps({"cmd": "alert", "style": "timer"}))
     if not memory.delete_timer(t.id):
         return
+    try:
+        await ws.send(json.dumps({"cmd": "alert", "style": "timer"}))
+    except Exception:
+        memory.restore_timer(t)
+        log.warning("timer %d: alert not sent — kept for the reconnect", t.id)
+        raise
     text = timers.announcement(t)
     log.info("timer %d fired: %r (%.1fs late)", t.id, text, time.time() - t.fire_ts)
     # The firmware relit the screen for the alert; our sleep flag follows,

@@ -75,14 +75,15 @@ def parse_at(text: str, now: datetime) -> datetime:
         hour = hour % 12 + (12 if ampm == "p" else 0)
     if hour > 23 or minute > 59:
         raise TimerError(f"{text!r} isn't a valid time.")
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-        # astimezone() hands back a fixed UTC offset, so re-derive it for
-        # tomorrow's date: across a DST change the stated clock time still
-        # holds. (Only when `now` is in the system zone — tests may not be.)
-        if now.utcoffset() == now.astimezone().utcoffset():
-            target = target.replace(tzinfo=None).astimezone()
+    # Resolve the wall-clock time in the system zone for that date, not with
+    # `now`'s UTC offset: astimezone() on a naive datetime asks the zone
+    # rules (mktime) about that date, so 9:00 the morning after "fall back"
+    # is 9:00 PST, not 9:00 at yesterday's PDT offset.
+    today = now.astimezone().date()
+    for day in (today, today + timedelta(days=1)):
+        target = datetime(day.year, day.month, day.day, hour, minute).astimezone()
+        if target > now:
+            return target
     return target
 
 
@@ -124,45 +125,70 @@ def new_timer(
 
 
 def partition_due(
-    timers: list[Timer], now_ts: float, grace_s: float = LATE_GRACE_S
+    timers: list[Timer], now_ts: float, connected_ts: float,
+    grace_s: float = LATE_GRACE_S,
 ) -> tuple[list[Timer], list[Timer]]:
-    """(due, missed): timers whose fire time has come and are at most
-    `grace_s` late — oldest first — and those later than that, which are
-    dropped instead of fired (the robot was offline when they came due)."""
+    """(due, missed), oldest first. `missed` are timers that came due more
+    than `grace_s` before this connection started — the robot was offline —
+    and are dropped instead of fired. Every other timer whose time has come
+    is due, however late: one that waited behind a long conversation is
+    still announced once it ends."""
     due: list[Timer] = []
     missed: list[Timer] = []
     for t in sorted(timers, key=lambda t: t.fire_ts):
         if t.fire_ts > now_ts:
             continue
-        (missed if now_ts - t.fire_ts > grace_s else due).append(t)
+        (missed if t.fire_ts < connected_ts - grace_s else due).append(t)
     return due, missed
 
 
-_GENERIC = {"", "timer", "the timer", "my timer", "reminder", "the reminder",
-            "my reminder", "it", "that"}
+_GENERIC = {"", "timer", "the timer", "my timer", "this timer", "that timer",
+            "reminder", "the reminder", "my reminder", "it", "that", "this"}
+_ALL = {"all": None, "everything": None, "all of them": None,
+        "all timers": "timer", "all the timers": "timer", "all my timers": "timer",
+        "all reminders": "reminder", "all the reminders": "reminder",
+        "all my reminders": "reminder"}
+
+
+def _ambiguous(hits: list[Timer], target: object) -> TimerError:
+    return TimerError(
+        f"{target!r} could mean more than one; ask which. "
+        + format_list(hits, _now(), with_ids=True))
+
+
+def _whole_words(needle: str, hay: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(needle)}\b", hay))
 
 
 def match_cancel(timers: list[Timer], target: object) -> list[Timer]:
-    """The timers cancel_timer(target) means: "all"; an id; a label (case-
-    insensitive, either containing the other — "pasta" matches "pasta
-    timer"); or, with exactly one timer set, a generic "the timer". Raises
-    TimerError, listing what is set, when nothing matches."""
-    text = str(target if target is not None else "").strip().lower()
-    if text in ("all", "all timers", "everything", "all reminders"):
-        return list(timers)
+    """The timers cancel_timer(target) means, in order: "all" (everything),
+    "all timers" / "all reminders" (that kind only); an id; a generic "the
+    timer" / "it" (the only one set); a label, case-insensitive — exact
+    first, else as whole words either way round ("pasta" ~ "pasta timer",
+    never "pa"). A request that fits several timers, or none, raises
+    TimerError listing what is set (with ids) so the model can ask."""
+    text = str(target if target is not None else "").strip().lower().rstrip(".!?")
+    if text in _ALL:
+        kind = _ALL[text]
+        return [t for t in timers if kind is None or t.kind == kind]
+    if not timers:
+        raise TimerError("No timers are set.")
     if text.isdigit():
         hit = [t for t in timers if t.id == int(text)]
         if hit:
             return hit
-    if text:
-        hit = [t for t in timers
-               if t.label and (text in t.label.lower() or t.label.lower() in text)]
-        if hit:
-            return hit
-    if text in _GENERIC and len(timers) == 1:
-        return list(timers)
-    if not timers:
-        raise TimerError("No timers are set.")
+    if text in _GENERIC:
+        if len(timers) == 1:
+            return list(timers)
+        raise _ambiguous(timers, target)
+    labelled = [t for t in timers if t.label]
+    exact = [t for t in labelled if t.label.lower() == text]
+    hits = exact or [t for t in labelled
+                     if _whole_words(t.label.lower(), text) or _whole_words(text, t.label.lower())]
+    if len(hits) == 1:
+        return hits
+    if hits:
+        raise _ambiguous(hits, target)
     raise TimerError(f"No timer matches {target!r}. " + format_list(timers, _now(), with_ids=True))
 
 

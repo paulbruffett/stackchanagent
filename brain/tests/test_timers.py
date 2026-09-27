@@ -111,10 +111,21 @@ def test_partition_due_and_the_late_reconnect_rule():
     just_due = _t(2, now)
     late_ok = _t(3, now - timers.LATE_GRACE_S)          # exactly at the limit
     too_late = _t(4, now - timers.LATE_GRACE_S - 1)
-    due, missed = timers.partition_due([future, just_due, too_late, late_ok], now)
+    # Connected just now: the two old ones came due while we were offline.
+    due, missed = timers.partition_due([future, just_due, too_late, late_ok], now, now)
     assert due == [late_ok, just_due]                     # oldest first
     assert missed == [too_late]
-    assert timers.partition_due([], now) == ([], [])
+    assert timers.partition_due([], now, now) == ([], [])
+
+
+def test_a_timer_that_waited_behind_a_conversation_is_never_missed():
+    # Connected an hour ago; this came due 30 minutes ago, while a long
+    # conversation held the announcement. Late, but not offline: announce it.
+    now = NOW.timestamp()
+    waited = _t(1, now - 1800)
+    offline = _t(2, now - 3600 - timers.LATE_GRACE_S - 1)
+    due, missed = timers.partition_due([waited, offline], now, now - 3600)
+    assert due == [waited] and missed == [offline]
 
 
 # --- sentences -----------------------------------------------------------------
@@ -148,20 +159,89 @@ def test_history_note_keeps_the_thread_valid():
                             {"role": "assistant", "content": "Your pasta timer is done."}]) == []
 
 
-def test_match_cancel():
-    pasta = Timer(1, "pasta", 0, 0, 600)
-    mom = Timer(2, "call mom", 0, 0, None, "reminder")
-    both = [pasta, mom]
-    assert timers.match_cancel(both, "all") == both
-    assert timers.match_cancel(both, "2") == [mom]
-    assert timers.match_cancel(both, "Pasta timer") == [pasta]
-    assert timers.match_cancel(both, "mom") == [mom]
-    assert timers.match_cancel([pasta], "the timer") == [pasta]
-    with pytest.raises(TimerError, match=r"pasta in .*\[id 1\]"):
-        timers.match_cancel(both, "the timer")          # ambiguous: lists them
+PASTA = Timer(1, "pasta", 0, 0, 600)
+MOM = Timer(2, "call mom", 0, 0, None, "reminder")
+TEA = Timer(3, "tea", 0, 0, 300)
+
+
+def test_match_cancel_by_id_label_and_generic():
+    both = [PASTA, MOM]
+    assert timers.match_cancel(both, "2") == [MOM]
+    assert timers.match_cancel(both, "Pasta") == [PASTA]           # exact, any case
+    assert timers.match_cancel(both, "the pasta timer") == [PASTA]  # whole words
+    assert timers.match_cancel(both, "mom") == [MOM]
+    for generic in ("the timer", "it", "timer", "that"):
+        assert timers.match_cancel([PASTA], generic) == [PASTA]
     with pytest.raises(TimerError, match="No timers"):
         timers.match_cancel([], "pasta")
+
+
+@pytest.mark.parametrize("target", ["pa", "past", "om", "call m"])
+def test_match_cancel_never_matches_a_fragment(target):
+    with pytest.raises(TimerError, match="No timer matches"):
+        timers.match_cancel([PASTA, MOM], target)
+
+
+def test_match_cancel_generic_words_come_before_labels():
+    # A timer labelled "timer" must not turn "the timer" into a pick when
+    # several are set: the generic word asks which.
+    odd = Timer(4, "timer", 0, 0, 60)
+    with pytest.raises(TimerError, match=r"ask which.*\[id 1\].*\[id 4\]"):
+        timers.match_cancel([PASTA, odd], "the timer")
+
+
+def test_match_cancel_ambiguous_label_lists_the_candidates():
+    red, blue = Timer(5, "red pasta", 0, 0, 60), Timer(6, "blue pasta", 0, 0, 60)
+    with pytest.raises(TimerError, match=r"ask which.*red pasta.*\[id 5\].*blue pasta.*\[id 6\]"):
+        timers.match_cancel([red, blue, MOM], "pasta")
+    assert timers.match_cancel([red, blue], "red pasta") == [red]     # exact wins
+
+
+def test_match_cancel_all_variants():
+    every = [PASTA, MOM, TEA]
+    assert timers.match_cancel(every, "all") == every
+    assert timers.match_cancel(every, "All.") == every
+    assert timers.match_cancel(every, "all timers") == [PASTA, TEA]
+    assert timers.match_cancel(every, "all reminders") == [MOM]
     assert timers.match_cancel([], "all") == []
+
+
+# --- DST ---------------------------------------------------------------------------
+
+@pytest.fixture
+def los_angeles(monkeypatch):
+    """Run in America/Los_Angeles whatever the host's zone is."""
+    import time
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def _la(*args) -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime(*args, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
+@pytest.mark.parametrize("now, at, expected", [
+    # Fall back (Sun Nov 1 2026, 2:00 PDT -> 1:00 PST).
+    (_la(2026, 10, 31, 23, 0), "9:00", _la(2026, 11, 1, 9, 0)),    # tomorrow, 11 h away
+    (_la(2026, 11, 1, 0, 30), "9:00", _la(2026, 11, 1, 9, 0)),     # today, across the change
+    (_la(2026, 11, 1, 10, 0), "9:00", _la(2026, 11, 2, 9, 0)),
+    # Spring forward (Sun Mar 8 2026, 2:00 PST -> 3:00 PDT).
+    (_la(2026, 3, 7, 23, 0), "9:00", _la(2026, 3, 8, 9, 0)),       # tomorrow, 9 h away
+    (_la(2026, 3, 8, 0, 30), "17:00", _la(2026, 3, 8, 17, 0)),     # today, across the change
+])
+def test_parse_at_uses_the_zone_rules_for_that_date(los_angeles, now, at, expected):
+    got = timers.parse_at(at, now.astimezone())   # a fixed-offset "now", as the brain has
+    assert got.timestamp() == expected.timestamp()
+    assert (got.hour, got.minute) == (expected.hour, expected.minute)
+
+
+def test_the_fall_back_morning_is_eleven_hours_after_11pm(los_angeles):
+    now = _la(2026, 10, 31, 23, 0).astimezone()
+    assert timers.parse_at("9:00", now).timestamp() - now.timestamp() == 11 * 3600
 
 
 # --- tools ---------------------------------------------------------------------
@@ -226,6 +306,33 @@ async def test_list_timers_gets_a_second_round(mem, make_agent, speaker):
     assert len(model_calls(sess)) == 2
     tool_msg = [m for m in model_calls(sess)[1]["messages"] if m.get("role") == "tool"]
     assert tool_msg[0]["content"].startswith("1 timer: pasta in")
+
+
+def test_home_assistants_timer_intents_are_never_offered(mem, make_agent):
+    import claude_agent
+
+    class FakeMcp:
+        def tool_defs(self):
+            names = ["HassTurnOn", "HassStartTimer", "HassCancelTimer",
+                     "HassCancelAllTimers", "HassIncreaseTimer", "HassDecreaseTimer",
+                     "HassPauseTimer", "HassUnpauseTimer", "HassTimerStatus"]
+            return [{"name": f"mcp__homeassistant__{n}", "description": "",
+                     "input_schema": {"type": "object", "properties": {}}} for n in names]
+
+    sess = make_agent([])
+    sess._tool_ctx.mcp = FakeMcp()
+    offered = {d["function"]["name"] for d in sess._tool_defs()}
+    assert "mcp__homeassistant__HassTurnOn" in offered
+    assert not any("Timer" in n for n in offered if n.startswith("mcp__"))
+    assert {"set_timer", "list_timers", "cancel_timer"} <= offered
+    assert not claude_agent._is_ha_action("mcp__homeassistant__HassCancelAllTimers")
+
+
+def test_restore_timer_puts_a_claimed_timer_back(mem):
+    t = mem.add_timer("pasta", NOW.timestamp(), 600, "timer")
+    assert mem.delete_timer(t.id)
+    mem.restore_timer(t)
+    assert mem.list_timers() == [t]
 
 
 def test_ends_turn_with_timer_tools():

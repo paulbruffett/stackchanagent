@@ -213,8 +213,21 @@ HA_ACTION_INTENTS = frozenset({
     "HassSetVolume", "HassSetVolumeRelative", "HassMediaPlayerMute",
     "HassMediaPlayerUnmute", "HassVacuumStart", "HassVacuumReturnToBase",
     "HassBroadcast", "HassListAddItem", "HassListCompleteItem",
-    "HassListRemoveItem", "HassCancelAllTimers",
+    "HassListRemoveItem",
 })
+
+# Home Assistant's own timer intents. Timers are the brain's (timers.py, the
+# set_timer / list_timers / cancel_timer tools); HA's need an Assist satellite
+# and would act on a different timer list, so the model is never offered them.
+HA_TIMER_INTENTS = frozenset({
+    "HassStartTimer", "HassCancelTimer", "HassCancelAllTimers",
+    "HassIncreaseTimer", "HassDecreaseTimer", "HassPauseTimer",
+    "HassUnpauseTimer", "HassTimerStatus",
+})
+
+
+def _is_ha_timer_intent(name: str) -> bool:
+    return name.startswith("mcp__") and name.rsplit("__", 1)[-1] in HA_TIMER_INTENTS
 
 
 def _is_ha_action(name: str) -> bool:
@@ -734,7 +747,8 @@ class AgentSession:
         """Native tools plus any tools the MCP servers currently expose."""
         defs = list(tools.TOOL_DEFS)
         if self._tool_ctx.mcp is not None:
-            defs += self._tool_ctx.mcp.tool_defs()
+            defs += [d for d in self._tool_ctx.mcp.tool_defs()
+                     if not _is_ha_timer_intent(d.get("name", ""))]
         return [_openai_tool(d) for d in defs]
 
     async def _set_busy(self, on: bool) -> None:
