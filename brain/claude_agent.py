@@ -187,12 +187,13 @@ def _pick_filler() -> str:
 _RIDE_ALONG_TOOLS = tools.NATIVE_EFFECT_TOOLS | {"end_conversation"}
 
 # Native tools fast enough that no "working…" feedback is warranted: the above
-# plus get_device_status, which answers from a cache (but has a result the
+# plus get_device_status, which answers from a cache, and the timer tools
+# (local SQLite) (but has a result the
 # model must read, so it never rides along). Everything else — any MCP tool
 # (`mcp__…`, e.g. weather or Home Assistant, which round-trips an external
 # server) — is treated as slow, so we show the busy indicator and speak a
 # canned ack while it runs.
-_FAST_TOOLS = _RIDE_ALONG_TOOLS | {"get_device_status"}
+_FAST_TOOLS = _RIDE_ALONG_TOOLS | {"get_device_status"} | tools.TIMER_TOOLS
 
 
 def _has_slow_tool(names: list[str]) -> bool:
@@ -222,21 +223,25 @@ def _is_ha_action(name: str) -> bool:
     return name.startswith("mcp__") and name.rsplit("__", 1)[-1] in HA_ACTION_INTENTS
 
 
-def _is_device_action(name: str) -> bool:
+def _is_action(name: str) -> bool:
     """A tool call that changes something the user asked to change, with
-    nothing to read back: an HA action, or the robot's own set_volume."""
-    return _is_ha_action(name) or name in tools.NATIVE_ACTION_TOOLS
+    nothing to read back: an allowlisted HA intent, the robot's own
+    set_volume, or setting / cancelling a timer."""
+    return (_is_ha_action(name) or name in tools.NATIVE_ACTION_TOOLS
+            or name in tools.TIMER_ACTION_TOOLS)
 
 
 def _ends_turn(names: list[str]) -> bool:
     """Whether a round of these tool calls (with spoken text, none failed)
-    may end the turn without a second model round. Needs a device action —
-    or the goodbye — to be the point of the round; the expressive native
-    tools may ride along but never end a turn on their own, since a preamble
-    beside a look_at is usually the lead-in to an answer still to come."""
-    if not all(_is_ha_action(n) or n in _RIDE_ALONG_TOOLS for n in names):
+    may end the turn without a second model round. Needs an action (a device
+    command, a timer set or cancelled) — or the goodbye — to be the point of
+    the round; the expressive native tools may ride along but never end a
+    turn on their own, since a preamble beside a look_at is usually the
+    lead-in to an answer still to come. Any query (list_timers, an MCP read)
+    means the answer is still to come."""
+    if not all(_is_action(n) or n in _RIDE_ALONG_TOOLS for n in names):
         return False
-    return any(_is_device_action(n) for n in names) or "end_conversation" in names
+    return any(_is_action(n) for n in names) or "end_conversation" in names
 
 
 def _result_failed(name: str, text: str) -> bool:
@@ -277,9 +282,9 @@ DEFAULT_SYSTEM_PROMPT = """You are Stack-Chan, a small desktop robot with a scre
 - No markdown, lists, code blocks, or special characters that don't read well aloud.
 - Don't say "I am an AI" or apologize for your nature.
 
-You have tools to change your facial expression, point your head, dance, set your own speaker volume, check your battery and volume, remember a fact about the user, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
+You have tools to change your facial expression, point your head, dance, set your own speaker volume, check your battery and volume, remember a fact about the user, set, list and cancel timers and reminders, and end the conversation. Use them naturally to be expressive, not on every turn. When the user tells you something worth remembering across conversations ("my name is X", "I prefer coffee"), call remember_fact.
 
-When the user's whole request is a device command (turning something on or off, dimming a light, changing your volume, and so on), say a short confirmation as text in the SAME message as the tool call (for example "Turning on the office light."). If they asked for anything more (an answer, a joke, some information), don't speak alongside the tool call: call the tool, then answer once you have its result.
+When the user's whole request is a device command (turning something on or off, dimming a light, changing your volume, setting or cancelling a timer, and so on), say a short confirmation as text in the SAME message as the tool call (for example "Turning on the office light."). If they asked for anything more (an answer, a joke, some information), don't speak alongside the tool call: call the tool, then answer once you have its result.
 
 What the user says reaches you through speech recognition, which sometimes mishears — especially names. If a word doesn't make sense, act on the closest plausible request rather than taking it literally ("turn on office air" almost certainly means the office light), and only ask if it is genuinely ambiguous.
 

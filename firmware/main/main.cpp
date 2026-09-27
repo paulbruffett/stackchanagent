@@ -27,6 +27,7 @@
 #include <board.h>
 #include <display/display.h>
 
+#include "agent/alert.h"
 #include "agent/buddy_ble.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
@@ -210,6 +211,11 @@ extern "C" void app_main(void)
             mclog::tagInfo(TAG, "head tap → approve buddy prompt");
             return;
         }
+        // A chiming timer: tap = dismiss, not a listening turn.
+        if (agent::alert::dismiss()) {
+            mclog::tagInfo(TAG, "head tap → dismiss timer alert");
+            return;
+        }
         if (agent::state::current() != agent::state::Mode::Idle) return;
         if (agent::ota::in_progress()) return;
         agent::commands::wake_face();
@@ -272,6 +278,7 @@ extern "C" void app_main(void)
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
         agent::commands::check_turn_watchdog();
+        agent::alert::tick();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();

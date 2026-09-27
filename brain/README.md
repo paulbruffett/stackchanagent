@@ -50,7 +50,8 @@ First-run downloads (cached afterwards): the Piper voice
 | `stt.py` | faster-whisper wrapper, wake-word stripping, the follow-up noise gate. |
 | `ha_fast_path.py` | Home Assistant intent fast path and the STT vocabulary fetch. |
 | `claude_agent.py` | The LLM loop over OpenRouter (the name predates the move): streaming, tool rounds, the single-round device-command exit, history repair, summarizer. |
-| `tools.py`, `mcp_client.py` | Native tools (face, head, dance, volume, battery status, memory, goodbye) and MCP servers (`mcp_servers/weather.py` bundled; Home Assistant over http). |
+| `timers.py` | Voice timers and reminders: argument parsing, due selection, what gets said. Persisted in memory.db; `agent_server._timer_loop` fires them (firmware `alert` chime, then a spoken line). |
+| `tools.py`, `mcp_client.py` | Native tools (face, head, dance, volume, battery status, memory, timers, goodbye) and MCP servers (`mcp_servers/weather.py` bundled; Home Assistant over http). |
 | `memory.py`, `config.py` | SQLite persistence and the knob registry. |
 | `webui/` | The console. |
 

@@ -11,6 +11,9 @@
  *   {"cmd":"sleep"}            screen off + sleepy face (wake word/tap wakes)
  *   {"cmd":"wake"}             restore screen (also done locally on input)
  *
+ * Timers (the brain owns them; see alert.h):
+ *   {"cmd":"alert","style":"timer"}   chime + attention face, wakes the screen
+ *
  * BLE buddy (follows the brain's BUDDY_ENABLED; emitted on connect + change):
  *   {"cmd":"set_buddy","enabled":true|false}   persist to NVS; reboot if changed
  *

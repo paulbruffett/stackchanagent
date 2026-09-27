@@ -217,3 +217,17 @@ async def test_device_endpoint(mem):
         assert (await c.get("/api/device", headers=AUTH)).json() == status
     async with _client(create_app(mem, get_config(), token=TOKEN)) as c:
         assert (await c.get("/api/device", headers=AUTH)).json() == {"connected": False}
+
+
+async def test_timers_are_listed_and_cancellable(client, mem):
+    import time
+    t = mem.add_timer("pasta", time.time() + 240, 600, "timer")
+    r = await client.get("/api/timers", headers=AUTH)
+    assert r.status_code == 200
+    (row,) = r.json()["timers"]
+    assert row["id"] == t.id and row["label"] == "pasta"
+    assert row["describe"].startswith("pasta in 4 minutes")
+    assert (await client.delete(f"/api/timers/{t.id}", headers=AUTH)).status_code == 200
+    assert mem.list_timers() == []
+    assert (await client.delete(f"/api/timers/{t.id}", headers=AUTH)).status_code == 404
+    assert (await client.get("/api/timers")).status_code == 401

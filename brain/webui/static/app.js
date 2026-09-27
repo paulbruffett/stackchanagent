@@ -177,14 +177,59 @@ async function savePersona(prompt) {
 }
 
 // ---- memories ----
+// ---- timers ----
+// Active voice timers/reminders with a live countdown and a cancel button.
+// The countdown runs off the brain's clock (offset from its "now"), and stops
+// ticking once the list is no longer on the page.
+const fmtLeft = (s) => {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mmss = `${String(m).padStart(h ? 2 : 1, "0")}:${String(sec).padStart(2, "0")}`;
+  return h ? `${h}:${mmss}` : mmss;
+};
+
+function renderTimers({ now, timers }) {
+  const skew = now - Date.now() / 1000;
+  const sec = el("div", { className: "group" }, el("h2", { textContent: `Timers (${timers.length})` }));
+  if (!timers.length) sec.append(el("div", { className: "muted", textContent: "No timers or reminders set." }));
+  const clocks = [];
+  for (const t of timers) {
+    const left = el("span", { className: "muted" });
+    clocks.push([left, t.fire_ts]);
+    const cancel = el("button", { className: "ghost", textContent: "cancel" });
+    cancel.addEventListener("click", async () => {
+      const r = await fetch(`/api/timers/${t.id}`, { method: "DELETE" });
+      setStatus(r.ok ? "timer cancelled" : "cancel failed", r.ok ? "ok" : "err");
+      loadMemories();
+    });
+    const name = t.label || (t.kind === "reminder" ? "reminder" : "timer");
+    sec.append(el("div", { className: "card fact" },
+      el("span", { className: "pill", textContent: t.kind }),
+      el("span", { textContent: `${name} · ${t.describe}`, style: "flex:1" }),
+      left, cancel));
+  }
+  const paint = () => {
+    for (const [node, fire] of clocks) node.textContent = fmtLeft(fire - (Date.now() / 1000 + skew));
+  };
+  paint();
+  if (clocks.length) {
+    const iv = setInterval(() => (sec.isConnected ? paint() : clearInterval(iv)), 1000);
+  }
+  return sec;
+}
+
 async function loadMemories() {
   const root = $("#memories");
   root.innerHTML = "";
-  const [facts, summaries, turns] = await Promise.all([
+  const [facts, summaries, turns, tmr] = await Promise.all([
     (await fetch("/api/memories/facts")).json(),
     (await fetch("/api/memories/summaries")).json(),
     (await fetch("/api/memories/turns?limit=40")).json(),
+    (await fetch("/api/timers")).json(),
   ]);
+
+  // --- timers ---
+  root.append(renderTimers(tmr));
 
   // --- facts ---
   const fsec = el("div", { className: "group" }, el("h2", { textContent: `Permanent knowledge (${facts.facts.length})` }));
@@ -569,7 +614,7 @@ function renderFirmware(st) {
 function appendTurn(t) {
   const list = $("#tx-list");
   const card = el("div", { className: "card tx" });
-  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") + (t.path === "ha" ? " · home assistant" : "") }));
+  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") + (t.path === "ha" ? " · home assistant" : "") + (t.path === "timer" ? " · timer" : "") }));
   card.append(el("div", {}, el("span", { className: "t", textContent: "“" + (t.transcript || "") + "”" })));
   if (t.tools && t.tools.length)
     card.append(el("div", { innerHTML: t.tools.map((x) => `<span class="pill">${esc(x.name)} ${esc(JSON.stringify(x.input))}</span>`).join("") }));

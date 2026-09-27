@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -40,6 +41,21 @@ log = logging.getLogger("brain.ha")
 TIMEOUT_S = 2.0
 
 TRUSTED = ("action_done", "query_answer")
+
+
+# Timers and reminders are the brain's own (timers.py), and HA's built-in timer
+# intents must not answer for them. Its matcher does recognise the phrases
+# (HassStartTimer, HassCancelTimer, HassTimerStatus, HassCancelAllTimers, …),
+# and with no Assist satellite behind the request some of them "succeed":
+# "cancel all timers" comes back action_done ("cancelled 0 timers") and a
+# status question as an answer about HA's timers, while ours keep running;
+# "set a timer for 5 minutes to turn off the light" would start a real HA
+# delayed-command timer. So timer wording skips the fast path entirely.
+_TIMER_WORDS = re.compile(r"\b(timers?|remind(?:ers?)?|alarms?|countdown)\b", re.IGNORECASE)
+
+
+def is_timer_request(text: str) -> bool:
+    return bool(_TIMER_WORDS.search(text))
 
 
 @dataclass
@@ -104,6 +120,9 @@ async def try_handle(text: str) -> FastPathResult | None:
     if not get_config().get("HA_FAST_PATH") or not text.strip():
         return None
     if not (os.environ.get("HA_TOKEN") or "").strip():
+        return None
+    if is_timer_request(text):
+        log.info("ha fast path: timer wording — to LLM")
         return None
     t0 = time.monotonic()
     try:
