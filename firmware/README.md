@@ -58,14 +58,57 @@ idf.py -p /dev/cu.usbmodem21101 flash monitor
 Replace the port with whatever your CoreS3 enumerates as (`ls
 /dev/cu.usbmodem*`). Exit the serial monitor with `Ctrl+]`.
 
+### Signing key
+
+Every app image is signed (RSA-3072, the secure-boot-v2 signature format,
+but **without** hardware secure boot — no eFuses are burned, USB flashing
+works as always). An OTA image is only accepted if it is signed with the
+same key as the firmware already running, so a rogue update can't be pushed
+over the network.
+
+The private key lives **outside the repo**, at
+`~/.stackchan-keys/firmware_signing_key.pem` (override with the
+`STACKCHAN_SIGNING_KEY` environment variable; `firmware/CMakeLists.txt`
+feeds the absolute path to `CONFIG_SECURE_BOOT_SIGNING_KEY`). Create it once
+if it is missing:
+
+```bash
+mkdir -m 700 -p ~/.stackchan-keys
+espsecure.py generate_signing_key --version 2 --scheme rsa3072 \
+    ~/.stackchan-keys/firmware_signing_key.pem
+chmod 600 ~/.stackchan-keys/firmware_signing_key.pem
+```
+
+**Back it up** (password manager / offline copy). Losing it means the robot
+refuses every future OTA image, and the only fix is a USB flash of a build
+signed with a new key (the same USB flash is how you rotate the key).
+
+An existing `sdkconfig` predates signing and pins
+`# CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT is not set`, which beats
+`sdkconfig.defaults`. Delete that one line (or turn on *Security features →
+Require signed app images* in `idf.py menuconfig`) and rebuild; the build log
+then shows "Generating signed binary image". A defaulted key path is only
+seeded once — to move the key later, edit `CONFIG_SECURE_BOOT_SIGNING_KEY`
+in `sdkconfig`.
+
 ### Over-the-air updates
 
-Once the robot runs a build with the `ota` command (the first such build
-has to go over USB), later builds can go through the brain console:
-**Firmware** tab → upload `build/stack-chan.bin` → **Send to robot**. The
-brain sends it between conversations; the robot downloads it from the
-console port on its own task, checks size + SHA-256, flashes the spare OTA
-slot and reboots. The new image is marked valid once it reaches the brain;
-if it can't within 60 s of boot (or crashes first) the bootloader rolls back
-to the previous one. Only the app is updated — bootloader, partition table
-and the assets partition still need USB.
+The first build with OTA support and signing has to go over USB (the
+firmware before it has no `ota` command and no signing key to check
+against). After that, builds can go through the brain console:
+**Firmware** tab → upload `build/stack-chan.bin` → **Send to robot**.
+
+- The brain checks the upload (ESP32-S3 app image, fits the 0x4f0000 slot,
+  has a signature block) and identifies it by its ELF SHA-256.
+- It sends the update only while the robot is free (no conversation), as a
+  one-time download URL on the console port. The robot only downloads from
+  the brain it is connected to, on its own task, verifies size, SHA-256 and
+  the signature, flashes the spare OTA slot and reboots.
+- The new image is on probation: marked valid after 30 s of unbroken brain
+  link, rolled back automatically if that hasn't happened within 5 min of
+  boot, or if it crashes / is reset first. The console shows *done* or
+  *rolled back?*.
+- A queued update can be cancelled and expires after an hour.
+
+Only the app is updated — bootloader, partition table and the assets
+partition still need USB.

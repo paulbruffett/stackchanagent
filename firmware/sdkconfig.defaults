@@ -3,6 +3,14 @@
 #
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Signed app images without hardware secure boot (no eFuses burned): every
+# build is signed (RSA-3072, secure boot v2 format) and an OTA image must
+# carry a signature from the same key as the running app or esp_ota_end
+# rejects it. The key path comes from firmware/CMakeLists.txt.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

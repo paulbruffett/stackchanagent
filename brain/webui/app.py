@@ -535,8 +535,8 @@ def create_app(
     @app.post("/api/firmware")
     async def firmware_upload(file: UploadFile) -> dict[str, Any]:
         """Store a build/stack-chan.bin for the next send. Validated (ESP
-        image magic, chip, app description, partition size) before it
-        replaces the previous upload."""
+        image magic, chip, app description, partition size, signature block)
+        before it replaces the previous upload."""
         mgr = need_ota()
         if mgr.in_progress:
             raise HTTPException(409, f"an update is {mgr.state}; wait for it to finish")
@@ -545,8 +545,8 @@ def create_app(
             info = await asyncio.to_thread(mgr.store.save, data)
         except ImageError as exc:
             raise HTTPException(400, str(exc))
-        log.info("firmware uploaded: %s %s (%s, %d bytes)",
-                 info.project, info.version, info.built, info.size)
+        log.info("firmware uploaded: %s %s (%s, elf %s, %d bytes)",
+                 info.project, info.version, info.built, info.elf_sha256[:12], info.size)
         return mgr.status()
 
     @app.post("/api/firmware/send")
@@ -558,6 +558,18 @@ def create_app(
             mgr.request_send()
         except LookupError as exc:
             raise HTTPException(404, str(exc))
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(409, str(exc))
+        except OSError as exc:
+            raise HTTPException(503, f"no LAN address to serve the image from: {exc}")
+        return mgr.status()
+
+    @app.post("/api/firmware/cancel")
+    async def firmware_cancel() -> dict[str, Any]:
+        """Drop a queued update that hasn't been sent to the robot yet."""
+        mgr = need_ota()
+        try:
+            mgr.cancel()
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))
         return mgr.status()

@@ -28,10 +28,11 @@ namespace {
 
 constexpr const char* TAG = "agent.ota";
 
-// A new image that hasn't reached the brain by this long after boot is
-// treated as broken and rolled back. Covers Wi-Fi association (bring-up
-// sweep ~7 s, then DHCP) and a few rungs of transport's reconnect backoff.
-constexpr int64_t kConfirmDeadlineMs = 60000;
+// Probation for a freshly updated image (see confirm_tick): valid after this
+// long of unbroken brain link, rolled back if that hasn't happened by the
+// deadline. A brain restart/deploy is ~30 s, so the deadline allows several.
+constexpr int64_t kConfirmLinkMs = 30000;
+constexpr int64_t kConfirmDeadlineMs = 5 * 60 * 1000;
 
 // Per-read HTTP timeout; a stalled transfer fails after this.
 constexpr int kHttpTimeoutMs = 15000;
@@ -43,11 +44,15 @@ struct Job {
     std::string url;
     size_t size;
     std::string sha256_hex;
+    int id;
 };
 
-void send_state(const char* state, int pct = -1, const std::string& error = {})
+// `id` is the brain's attempt number, echoed so a late event from an earlier
+// attempt can't be mistaken for the current one.
+void send_state(int id, const char* state, int pct = -1, const std::string& error = {})
 {
-    std::string json = std::string("{\"event\":\"ota\",\"state\":\"") + state + "\"";
+    std::string json = "{\"event\":\"ota\",\"id\":" + std::to_string(id)
+                       + ",\"state\":\"" + state + "\"";
     if (pct >= 0) json += ",\"pct\":" + std::to_string(pct);
     if (!error.empty()) {
         // Errors are our own fixed strings plus esp_err names / numbers: no
@@ -144,7 +149,7 @@ std::string run(const Job& job)
         int pct = static_cast<int>(total * 100 / job.size);
         if (pct / 10 > reported / 10) {
             reported = pct;
-            send_state("downloading", pct);
+            send_state(job.id, "downloading", pct);
             show("Updating " + std::to_string(pct) + "%");
         }
     }
@@ -165,7 +170,9 @@ std::string run(const Job& job)
         esp_ota_abort(handle);
         return fail;
     }
-    // Validates the image (header, segments, appended hash, chip).
+    // Validates the image: header, segments, appended hash, chip, and the
+    // RSA signature against the running app's key
+    // (CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT).
     err = esp_ota_end(handle);
     if (err != ESP_OK) return std::string("image check: ") + esp_err_to_name(err);
     err = esp_ota_set_boot_partition(part);
@@ -179,13 +186,13 @@ void ota_task(void* arg)
     std::string err = run(*job);
     if (err.empty()) {
         mclog::tagInfo(TAG, "update written; rebooting");
-        send_state("rebooting");
+        send_state(job->id, "rebooting");
         show("Rebooting...");
         vTaskDelay(pdMS_TO_TICKS(1000));  // let the event and the log get out
         esp_restart();
     }
     mclog::tagError(TAG, "update failed: {}", err);
-    send_state("failed", -1, err);
+    send_state(job->id, "failed", -1, err);
     show("Update failed");
     vTaskDelay(pdMS_TO_TICKS(4000));
     show({});
@@ -203,37 +210,82 @@ bool valid_sha256_hex(std::string_view s)
     return true;
 }
 
+// "http://HOST[:port]/…" → HOST ("" if not that shape).
+std::string_view url_host(std::string_view url)
+{
+    constexpr std::string_view kScheme = "http://";
+    if (url.substr(0, kScheme.size()) != kScheme) return {};
+    url.remove_prefix(kScheme.size());
+    size_t end = url.find_first_of(":/");
+    return end == std::string_view::npos ? url : url.substr(0, end);
+}
+
+// Image state of the running partition, read once (it's in flash): 1 while
+// a fresh OTA image is on probation, 0 otherwise, -1 not read yet. Cleared
+// by confirm_tick once it marks the image valid.
+std::atomic<int> g_pending{-1};
+
+bool read_pending()
+{
+    int v = g_pending.load();
+    if (v < 0) {
+        const esp_partition_t* running = esp_ota_get_running_partition();
+        esp_ota_img_states_t img_state;
+        // A USB-flashed image has no OTA state (or a valid one).
+        v = running != nullptr && esp_ota_get_state_partition(running, &img_state) == ESP_OK
+            && img_state == ESP_OTA_IMG_PENDING_VERIFY;
+        int expected = -1;
+        g_pending.compare_exchange_strong(expected, v);
+        v = g_pending.load();
+    }
+    return v == 1;
+}
+
 }  // namespace
 
-void start(std::string_view url, size_t size, std::string_view sha256_hex)
+void start(std::string_view url, size_t size, std::string_view sha256_hex, int id)
 {
-    if (url.substr(0, 7) != "http://" || size == 0 || !valid_sha256_hex(sha256_hex)) {
+    if (url_host(url).empty() || size == 0 || !valid_sha256_hex(sha256_hex)) {
         mclog::tagWarn(TAG, "ota: bad arguments");
-        send_state("failed", -1, "bad ota command");
+        send_state(id, "failed", -1, "bad ota command");
+        return;
+    }
+    // Defense in depth on top of the image signature: only ever download
+    // from the brain we're talking to, never a host a command names.
+    std::string brain = transport::brain_ip();
+    if (brain.empty() || url_host(url) != brain) {
+        mclog::tagWarn(TAG, "ota: url host is not the brain ({})", brain);
+        send_state(id, "failed", -1, "url host is not the brain this robot is connected to");
+        return;
+    }
+    if (read_pending()) {
+        // esp_ota_begin refuses anyway (ESP_ERR_OTA_ROLLBACK_INVALID_STATE);
+        // say why in words.
+        send_state(id, "failed", -1, "running image not confirmed yet; retry in a minute");
         return;
     }
     if (state::current() != state::Mode::Idle) {
-        send_state("failed", -1, "robot busy (not idle)");
+        send_state(id, "failed", -1, "robot busy (not idle)");
         return;
     }
     bool expected = false;
     if (!g_in_progress.compare_exchange_strong(expected, true)) {
-        send_state("failed", -1, "update already running");
+        send_state(id, "failed", -1, "update already running");
         return;
     }
-    mclog::tagInfo(TAG, "update requested: {} bytes", size);
+    mclog::tagInfo(TAG, "update #{} requested: {} bytes", id, size);
     // Detection off for the duration: nothing may start a turn, and the AFE
     // is CPU we'd rather spend on the download. The wakeword/tap handlers
     // also check in_progress().
     wakeword::pause();
     show("Updating...");
-    auto* job = new Job{std::string(url), size, std::string(sha256_hex)};
+    auto* job = new Job{std::string(url), size, std::string(sha256_hex), id};
     if (xTaskCreate(ota_task, "agent_ota", 8192, job, 3, nullptr) != pdPASS) {
         delete job;
         show({});
         g_in_progress = false;
         wakeword::resume();
-        send_state("failed", -1, "could not start update task");
+        send_state(id, "failed", -1, "could not start update task");
     }
 }
 
@@ -242,35 +294,58 @@ bool in_progress()
     return g_in_progress.load();
 }
 
+bool pending_verify()
+{
+    return read_pending();
+}
+
+// A new image is on probation until it proves it can do the one thing that
+// matters: hold a brain link. It is marked valid once the WebSocket has been
+// up for kConfirmLinkMs without a break; if that hasn't happened by
+// kConfirmDeadlineMs after boot it rolls back and restarts into the previous
+// image. Edge cases:
+//  - It crashes, hangs into the task watchdog or is power-cycled before
+//    confirming: the bootloader sees PENDING_VERIFY on the next boot and
+//    boots the previous image instead (that is the rollback feature itself).
+//  - The brain restarts/deploys during the window (~30 s outage): the link
+//    clock starts over when it reconnects; the 5 min deadline leaves room
+//    for that several times over.
+//  - The brain is down for all of the first 5 min: we roll back even though
+//    the new image may be fine. The old image is known good, and the console
+//    shows "rolled back?" so the update can simply be sent again.
+//  - Wi-Fi never comes up at all: same as above.
+// While on probation, ota::start refuses further updates (the OTA API would
+// too) and the brain holds off anything that could reboot us.
 void confirm_tick()
 {
-    // Read the image state once (it's in flash); after that only the
-    // pending case keeps polling, and only until it resolves.
-    static const esp_partition_t* running = nullptr;
-    static bool checked = false;
     static bool settled = false;
+    static int64_t link_since_ms = 0;
     if (settled) return;
-    if (!checked) {
-        checked = true;
-        running = esp_ota_get_running_partition();
-        esp_ota_img_states_t img_state;
-        // A USB-flashed image has no OTA state (or a valid one): nothing to do.
-        if (running == nullptr || esp_ota_get_state_partition(running, &img_state) != ESP_OK
-            || img_state != ESP_OTA_IMG_PENDING_VERIFY) {
-            settled = true;
-            return;
-        }
-        mclog::tagInfo(TAG, "{} is a new image pending verification", running->label);
-    }
-    if (transport::is_connected()) {
-        mclog::tagInfo(TAG, "new image reached the brain; marking {} valid", running->label);
-        esp_ota_mark_app_valid_cancel_rollback();
+    if (!read_pending()) {
         settled = true;
         return;
     }
-    if (state::now_ms() > kConfirmDeadlineMs) {
-        mclog::tagError(TAG, "new image on {} never reached the brain in {} s; rolling back",
-                        running->label, kConfirmDeadlineMs / 1000);
+    int64_t now = state::now_ms();
+    if (!transport::is_connected()) {
+        link_since_ms = 0;
+    } else if (link_since_ms == 0) {
+        link_since_ms = now;
+        mclog::tagInfo(TAG, "new image reached the brain; confirming after {} s of link",
+                       kConfirmLinkMs / 1000);
+    } else if (now - link_since_ms >= kConfirmLinkMs) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        mclog::tagInfo(TAG, "new image marked valid: {}", esp_err_to_name(err));
+        if (err == ESP_OK) {
+            g_pending = 0;
+            settled = true;
+            transport::send_event_json("{\"event\":\"ota\",\"state\":\"confirmed\",\"fw_sha\":\""
+                                       + running_elf_sha256() + "\"}");
+        }
+        return;
+    }
+    if (now > kConfirmDeadlineMs) {
+        mclog::tagError(TAG, "new image never held a brain link for {} s within {} s; rolling back",
+                        kConfirmLinkMs / 1000, kConfirmDeadlineMs / 1000);
         // Does not return when a previous valid image exists.
         esp_ota_mark_app_invalid_rollback_and_reboot();
         settled = true;
@@ -286,6 +361,13 @@ std::string running_build()
 {
     const esp_app_desc_t* d = esp_app_get_description();
     return std::string(d->date) + " " + d->time;
+}
+
+std::string running_elf_sha256()
+{
+    char hex[65] = {};
+    esp_app_get_elf_sha256(hex, sizeof hex);
+    return hex;
 }
 
 }  // namespace agent::ota

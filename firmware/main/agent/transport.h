@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <string_view>
 
 namespace agent::transport {
@@ -34,6 +35,10 @@ bool send_audio(const int16_t* samples, size_t sample_count);
 
 // Send a JSON text frame. Pass a complete JSON string.
 bool send_event_json(std::string_view json);
+
+// IPv4 address (dotted quad) of the brain on the current connection; "" when
+// disconnected or unresolved. ota::start only downloads from this host.
+std::string brain_ip();
 
 // state::now_ms() when the last frame (audio or JSON) arrived from the brain;
 // 0 if none yet.

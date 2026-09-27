@@ -298,8 +298,8 @@ extern "C" void app_main(void)
             }
         }
         // A freshly-OTA'd image boots PENDING_VERIFY
-        // (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE): valid once the brain link
-        // is up, rolled back if it isn't within a minute of boot.
+        // (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE): valid after 30 s of
+        // unbroken brain link, rolled back if not within 5 min of boot.
         agent::ota::confirm_tick();
         // Self-rate-limited to 10 s.
         GetHAL().updateHeapStatusLog();
