@@ -12,6 +12,7 @@ from policy import (
     describe_device_status,
     effective_sleep_timeout,
     low_battery_check,
+    percent_or_none,
     step_volume,
     volume_sync_action,
 )
@@ -79,25 +80,22 @@ class TestCaptureIsStale:
 
 
 class TestVolumeSyncAction:
-    def test_matching_report_sends_nothing(self):
-        assert volume_sync_action(70, 70, None, busy=False) is None
+    def test_matching_volume_sends_nothing(self):
+        assert volume_sync_action(70, 70, busy=False) is None
 
-    def test_differing_report_sends_the_knob(self):
-        assert volume_sync_action(40, 70, None, busy=False) == 40
-
-    def test_already_sent_waits_for_the_report(self):
-        # The tool (or an earlier tick) sent it; the status event will catch up.
-        assert volume_sync_action(40, 70, 40, busy=False) is None
-
-    def test_knob_changed_again_after_a_send(self):
-        assert volume_sync_action(55, 40, 40, busy=False) == 55
+    def test_differing_volume_sends_the_knob(self):
+        assert volume_sync_action(40, 70, busy=False) == 40
 
     def test_busy_defers(self):
-        assert volume_sync_action(40, 70, None, busy=True) is None
+        assert volume_sync_action(40, 70, busy=True) is None
 
     def test_no_report_never_sends(self):
         # Firmware without set_volume never reports a volume.
-        assert volume_sync_action(40, None, None, busy=False) is None
+        assert volume_sync_action(40, None, busy=False) is None
+
+    def test_unset_knob_leaves_the_robot_alone(self):
+        assert volume_sync_action(70, 35, busy=False, knob_set=False) is None
+        assert volume_sync_action(70, 35, busy=False, knob_set=True) == 70
 
 
 class TestStepVolume:
@@ -136,6 +134,10 @@ class TestDeviceStatus:
         d.update({"charging": False}, now=2.0)
         assert "not charging" in describe_device_status(d)
 
+    def test_percent_validation(self):
+        assert [percent_or_none(v) for v in (0, 100, 55)] == [0, 100, 55]
+        assert [percent_or_none(v) for v in (-1, 101, True, 5.0, "5", None)] == [None] * 6
+
     def test_garbage_fields_read_as_unknown(self):
         d = DeviceStatus()
         d.update({"battery": 255, "charging": "yes", "volume": True}, now=1.0)
@@ -168,9 +170,3 @@ class TestLowBatteryCheck:
         assert low_battery_check(None, False, True) == (False, True)
         assert low_battery_check(None, None, False) == (False, False)
 
-
-def test_volume_sync_leaves_the_robot_alone_while_the_knob_is_default():
-    from policy import volume_sync_action
-
-    assert volume_sync_action(70, 35, None, busy=False, knob_set=False) is None
-    assert volume_sync_action(70, 35, None, busy=False, knob_set=True) == 70

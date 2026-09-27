@@ -530,7 +530,9 @@ async function loadDevice() {
   const d = $("#device");
   let j;
   try {
-    const r = await fetch("/api/device");
+    // A background poll: window.fetch, not the wrapper above, so a 401 here
+    // never pops the token prompt — user-initiated loads do that.
+    const r = await window.fetch("/api/device", { headers: { "x-stackchan-token": TOKEN } });
     if (!r.ok) return;
     j = await r.json();
   } catch { return; }

@@ -59,9 +59,10 @@ void check_turn_watchdog();
 // Reads the PMIC over I2C; safe from any task.
 std::string status_fields();
 
-// Send {"event":"status",...} every 60 s and at once when the charging state
-// flips (polled every 2 s). Call from the main idle loop.
-void check_device_status();
+// Start the status reporter task: {"event":"status",...} every 60 s, at once
+// when the charging state flips (polled every 2 s), and after set_volume. Runs
+// off the main loop so PMIC reads and WebSocket sends never stall it.
+void start_status_reporter();
 
 // Relight the screen if it was turned off for sleep; no-op otherwise.
 // Called locally from the wake word / head-tap handlers so waking is

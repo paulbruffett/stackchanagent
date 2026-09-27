@@ -185,6 +185,8 @@ extern "C" void app_main(void)
     });
     agent::wakeword::start();
     agent::mic_pump::start();
+    // Battery/charging/volume reports to the brain, on their own task.
+    agent::commands::start_status_reporter();
 
     // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
     // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so
@@ -265,9 +267,6 @@ extern "C" void app_main(void)
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
         agent::commands::check_turn_watchdog();
-        // Battery/charging/volume report to the brain (60 s, or on a
-        // charging flip; polls the PMIC every 2 s).
-        agent::commands::check_device_status();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();

@@ -272,9 +272,7 @@ async def _dispatch(
     if name == "set_volume":
         return await _set_volume(input_, ctx)
     if name == "get_device_status":
-        if ctx.device is None:
-            return "No status from the robot's body yet."
-        return describe_device_status(ctx.device)
+        return describe_device_status(ctx.device or DeviceStatus())
     if name == "dance":
         style = input_.get("style")
         if style not in DANCE_STYLES:
@@ -293,16 +291,21 @@ async def _dispatch(
 
 async def _set_volume(input_: dict[str, Any], ctx: ToolContext) -> str:
     """Write SPEAKER_VOLUME (so the console and the voice agree) and send
-    set_volume at once — the user asked, so mid-turn is fine. Recording it as
-    sent keeps the idle ticker's sync from sending it again."""
-    cfg = get_config()
-    current = ctx.device.volume if ctx.device and ctx.device.volume is not None \
-        else int(cfg.get("SPEAKER_VOLUME"))
+    set_volume at once — the user asked, so mid-turn is fine. The sent value
+    becomes the device's volume straight away, so the idle ticker's sync has
+    nothing to repeat and a later call in the same turn starts from it."""
+    dev = ctx.device
+    if dev is None or dev.volume is None:
+        # Firmware without set_volume never reports a volume.
+        return (f"{TOOL_ERROR_PREFIX} The robot's firmware doesn't support "
+                "volume control yet.")
+    current = dev.volume
     level = input_.get("level")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        level = None
     change = input_.get("change")
     try:
-        new = step_volume(current, level if isinstance(level, (int, float)) else None,
-                          change if change in ("up", "down") else None)
+        new = step_volume(current, level, change if change in ("up", "down") else None)
     except ValueError as e:
         return f"{TOOL_ERROR_PREFIX} {e}"
     if new == current and level is None:
@@ -310,10 +313,9 @@ async def _set_volume(input_: dict[str, Any], ctx: ToolContext) -> str:
         # model already spoke is wrong — a failure gets it a round to say so.
         edge = "maximum" if new == 100 else "minimum"
         return f"{TOOL_ERROR_PREFIX} Volume is already at the {edge} ({new})."
-    cfg.set("SPEAKER_VOLUME", new)
+    get_config().set("SPEAKER_VOLUME", new)
     await ctx.ws.send(json.dumps({"cmd": "set_volume", "value": new}))
-    if ctx.device is not None:
-        ctx.device.volume_sent = new
+    dev.volume = new
     if new == current:
         return f"Volume is already at {new}."
     return f"Volume set to {new} (was {current})."

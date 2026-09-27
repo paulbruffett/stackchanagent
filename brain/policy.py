@@ -84,6 +84,13 @@ LOW_BATTERY_PCT = 15
 VOLUME_STEP = 15
 
 
+def percent_or_none(value: object) -> int | None:
+    """An int 0..100 (not a bool, which is an int subclass), else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100:
+        return value
+    return None
+
+
 @dataclass
 class DeviceStatus:
     """What the firmware last reported about itself (boot and status events),
@@ -91,11 +98,10 @@ class DeviceStatus:
     (older firmware, or no battery reading)."""
     battery: int | None = None
     charging: bool | None = None
+    # The firmware's volume: as reported, or as last sent with set_volume (the
+    # next status event confirms or corrects it), so a second set_volume or a
+    # get_device_status in the same turn sees the new value.
     volume: int | None = None
-    # Last volume sent as set_volume on this connection (the sync or the tool).
-    volume_sent: int | None = None
-    # A low-battery warning was logged this discharge cycle.
-    low_warned: bool = False
     # time.time() of the last report; None until the first one.
     updated_at: float | None = None
 
@@ -103,16 +109,12 @@ class DeviceStatus:
         """Fold a boot/status event's fields in. Absent fields leave the
         cached value alone; a field sent as null (or garbage) clears it."""
         if "battery" in payload:
-            b = payload["battery"]
-            ok = isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 100
-            self.battery = b if ok else None
+            self.battery = percent_or_none(payload["battery"])
         if "charging" in payload:
             c = payload["charging"]
             self.charging = c if isinstance(c, bool) else None
         if "volume" in payload:
-            v = payload["volume"]
-            ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100
-            self.volume = v if ok else None
+            self.volume = percent_or_none(payload["volume"])
         self.updated_at = now
 
     @property
@@ -122,26 +124,23 @@ class DeviceStatus:
 
 
 def volume_sync_action(
-    knob: object, reported: int | None, last_sent: int | None, busy: bool,
-    knob_set: bool = True,
+    knob: object, volume: int | None, busy: bool, knob_set: bool = True,
 ) -> int | None:
     """The volume to send as set_volume for the SPEAKER_VOLUME knob, or None.
 
     Like buddy_sync_action but nothing reboots: only between conversations,
-    only once the firmware has reported its volume (older firmware without
-    set_volume never does, so it is never sent a command it would reject), and
-    not again for a value already sent on this connection — the firmware
-    answers set_volume with a status event, which updates ``reported``.
+    and only once the firmware has reported its volume (older firmware without
+    set_volume never does, so it is never sent a command it would reject).
+    ``volume`` is DeviceStatus.volume, which a send updates at once, so a value
+    already sent is not sent again.
     """
-    # A knob nobody has set is just the default: the volume the robot
-    # already holds (set by voice, or from before this knob existed) wins,
-    # rather than every fresh brain resetting it to the default.
-    if busy or reported is None or not knob_set:
+    # A knob nobody has set is just the default: the volume the robot already
+    # holds wins (the brain adopts it into the knob on the first report),
+    # rather than a fresh brain resetting it to the default.
+    if busy or volume is None or not knob_set:
         return None
     target = int(knob)  # type: ignore[call-overload]
-    if target == reported or target == last_sent:
-        return None
-    return target
+    return None if target == volume else target
 
 
 def step_volume(current: int, level: int | None, change: str | None) -> int:
@@ -182,8 +181,8 @@ def low_battery_check(
     battery: int | None, charging: bool | None, warned: bool,
 ) -> tuple[bool, bool]:
     """(warn now, warned afterwards) for the once-per-discharge-cycle
-    low-battery warning. Charging re-arms it; an unknown reading changes
-    nothing."""
+    low-battery warning. Only charging re-arms it — not a reconnect, and not a
+    reading back above the threshold; an unknown reading changes nothing."""
     if charging is True:
         return False, False
     if battery is None or battery > LOW_BATTERY_PCT or warned:

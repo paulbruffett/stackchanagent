@@ -185,9 +185,10 @@ SPECS: dict[str, Spec] = {
     ),
     "SPEAKER_VOLUME": Spec(
         70, "int", False, "behavior",
-        "Robot speaker volume, 0-100 (the firmware's default is 70). Pushed "
+        "Robot speaker volume, 0-100. Until set, the robot's own volume is "
+        "adopted on first report (a fresh brain never overrides it). Pushed "
         "to the robot between conversations; the set_volume voice tool "
-        "writes it too, so this shows the current setting.",
+        "writes it too.",
         minimum=0, maximum=100,
     ),
 

@@ -194,8 +194,10 @@ public:
     // Side-effect-free read for periodic polling: getBatteryLevel() goes
     // through the xiaozhi board's GetBatteryLevel(), which also arms the
     // power-save timer (screen off / shutdown) when it sees discharging.
-    // pct is the PMIC fuel gauge, 0..100; false if it could not be read.
+    // It also aborts on a failed I2C read; these return false instead.
+    // pct is the PMIC fuel gauge, 0..100.
     bool readBatteryStatus(int& pct, bool& charging);
+    bool readBatteryCharging(bool& charging);
     void factoryReset();
 
     /* --------------------------------- Display -------------------------------- */

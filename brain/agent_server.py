@@ -638,9 +638,10 @@ async def _sync_volume(ws: ServerConnection, state: ConnState) -> None:
     what the firmware reports, between conversations only. No reboot, so the
     link stays up; the firmware answers with a status event."""
     cfg = get_config()
+    reported = state.device.volume
     value = volume_sync_action(
-        cfg.get("SPEAKER_VOLUME"), state.device.volume, state.device.volume_sent,
-        _conversation_busy(state), knob_set=cfg.is_set("SPEAKER_VOLUME"),
+        cfg.get("SPEAKER_VOLUME"), reported, _conversation_busy(state),
+        knob_set=cfg.is_set("SPEAKER_VOLUME"),
     )
     if value is None:
         return
@@ -649,17 +650,38 @@ async def _sync_volume(ws: ServerConnection, state: ConnState) -> None:
     except Exception:
         log.exception("set_volume send failed")
         return
-    state.device.volume_sent = value
-    log.info("set_volume %d (firmware reports %s)", value, state.device.volume)
+    # The firmware's status event confirms (or corrects) it.
+    state.device.volume = value
+    log.info("set_volume %d (firmware reported %s)", value, reported)
+
+
+# Whether the low-battery warning was already logged this discharge cycle.
+# Process-wide (not per connection) and persisted, so a reconnect or brain
+# restart mid-cycle doesn't warn again; only seeing the robot charge clears it.
+# None until first read from runtime state.
+_low_battery_warned: bool | None = None
 
 
 def _on_device_report(state: ConnState, payload: dict[str, Any]) -> None:
-    """Fold a boot/status event into state.device and log a low battery once
-    per discharge cycle. Never spoken: the robot doesn't nag unprompted; the
-    console shows it."""
+    """Fold a boot/status event into state.device, adopt the robot's volume
+    into an unset SPEAKER_VOLUME, and log a low battery once per discharge
+    cycle. Never spoken: the robot doesn't nag unprompted; the console shows
+    it."""
+    global _low_battery_warned
     dev = state.device
     dev.update(payload, time.time())
-    warn, dev.low_warned = low_battery_check(dev.battery, dev.charging, dev.low_warned)
+    cfg = get_config()
+    if dev.volume is not None and not cfg.is_set("SPEAKER_VOLUME"):
+        # A fresh brain never overrides the robot's volume: it takes the
+        # robot's as the setting, so the console shows the truth and later
+        # console edits push from there.
+        cfg.set("SPEAKER_VOLUME", dev.volume)
+    if _low_battery_warned is None:
+        _low_battery_warned = bool(memory.get_runtime_state("low_battery_warned", False))
+    warn, warned = low_battery_check(dev.battery, dev.charging, _low_battery_warned)
+    if warned != _low_battery_warned:
+        _low_battery_warned = warned
+        memory.set_runtime_state("low_battery_warned", warned)
     if warn:
         log.warning("robot battery low: %d%% and not charging", dev.battery)
 
