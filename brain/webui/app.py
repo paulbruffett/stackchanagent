@@ -20,6 +20,7 @@ import logging
 import secrets
 import socket
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -46,6 +47,7 @@ from claude_agent import (
     summarize_backlog,
     summary_model,
 )
+import timers
 from config import SPECS, Config
 from firmware_ota import OTA_PARTITION_SIZE, ImageError, OtaManager
 from memory import Memory
@@ -342,6 +344,26 @@ def create_app(
     async def delete_fact(fact_id: int) -> dict[str, Any]:
         if not memory.delete_fact(fact_id):
             raise HTTPException(404, "no such fact")
+        return {"ok": True}
+
+    # --- timers (timers.py) -------------------------------------------
+    @app.get("/api/timers")
+    async def list_timers() -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        return {
+            "now": now.timestamp(),
+            "timers": [
+                {"id": t.id, "label": t.label, "kind": t.kind,
+                 "fire_ts": t.fire_ts, "duration_s": t.duration_s,
+                 "describe": timers.describe(t, now)}
+                for t in memory.list_timers()
+            ],
+        }
+
+    @app.delete("/api/timers/{timer_id}")
+    async def cancel_timer(timer_id: int) -> dict[str, Any]:
+        if not memory.delete_timer(timer_id):
+            raise HTTPException(404, "no such timer")
         return {"ok": True}
 
     # LLM fact compaction: propose a consolidated list (no write), then the

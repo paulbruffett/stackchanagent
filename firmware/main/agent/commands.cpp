@@ -21,6 +21,7 @@
 #include <stackchan/modifiers/dance.h>
 #include <stackchan/stackchan.h>
 
+#include "alert.h"
 #include "buddy_ble.h"
 #include "ota.h"
 #include "state.h"
@@ -553,6 +554,9 @@ void dispatch(std::string_view json)
         sleep_face();
     } else if (c == "wake") {
         wake_face();
+    } else if (c == "alert") {
+        // Timer/reminder chime + attention face; wakes the screen itself.
+        alert::start(doc["style"] | "timer");
     } else {
         mclog::tagWarn(TAG, "unknown cmd: {}", c);
     }

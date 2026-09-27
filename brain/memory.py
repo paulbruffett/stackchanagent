@@ -35,6 +35,13 @@ One DB per device at ~/.stackchan/memory.db. Three tables:
       value is a JSON-encoded scalar; absent keys fall back to the
       code defaults in config.py.
 
+  timers(id, label, fire_ts, created_ts, duration_s, kind)
+      Voice timers and reminders (timers.py). fire_ts is wall-clock Unix
+      time, so a brain restart neither loses nor drifts one; a row is
+      deleted when it fires or is cancelled. A table rather than a
+      runtime_state JSON blob: add / cancel / fire are single-row writes
+      that can't clobber each other, and ids come from AUTOINCREMENT.
+
   mcp_servers(id, name, transport, command, args_json, url, env_ref, enabled)
       MCP servers the agent can pull tools from (Phase 9b). NO secret
       values are stored here — env_ref names an environment variable
@@ -55,6 +62,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from timers import Timer
 
 log = logging.getLogger("brain.memory")
 
@@ -97,6 +106,15 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_ts REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS timers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT,
+    fire_ts REAL NOT NULL,
+    created_ts REAL NOT NULL,
+    duration_s INTEGER,
+    kind TEXT NOT NULL DEFAULT 'timer'
 );
 
 CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -563,6 +581,46 @@ class Memory:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
             "updated_ts = excluded.updated_ts",
             (key, json.dumps(value), time.time()),
+        )
+        self._conn.commit()
+
+    # --- timers (timers.py) -------------------------------------------
+
+    def add_timer(
+        self, label: str | None, fire_ts: float, duration_s: int | None, kind: str
+    ) -> Timer:
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO timers(label, fire_ts, created_ts, duration_s, kind) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (label, fire_ts, now, duration_s, kind),
+        )
+        self._conn.commit()
+        return Timer(cur.lastrowid, label, fire_ts, now, duration_s, kind)
+
+    def list_timers(self) -> list[Timer]:
+        """Active timers, soonest first."""
+        rows = self._conn.execute(
+            "SELECT id, label, fire_ts, created_ts, duration_s, kind FROM timers "
+            "ORDER BY fire_ts, id"
+        ).fetchall()
+        return [Timer(r["id"], r["label"], r["fire_ts"], r["created_ts"],
+                      r["duration_s"], r["kind"]) for r in rows]
+
+    def delete_timer(self, timer_id: int) -> bool:
+        """True if the timer existed — how the scheduler claims a due timer, so
+        one cancelled meanwhile is never announced."""
+        cur = self._conn.execute("DELETE FROM timers WHERE id = ?", (timer_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def restore_timer(self, t: Timer) -> None:
+        """Put a claimed timer back under its own id (its alert never reached
+        the robot), so it fires on the reconnect."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO timers(id, label, fire_ts, created_ts, duration_s, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (t.id, t.label, t.fire_ts, t.created_ts, t.duration_s, t.kind),
         )
         self._conn.commit()
 

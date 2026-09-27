@@ -12,11 +12,12 @@ Wire protocol:
                    "fw_valid": bool, + status fields)|
                    "status" ("battery": 0-100|null, "charging": bool|null,
                    "volume": 0-100)|"wakeword"|"tap"|"buddy_prompt"|
-                   "listen_timeout"|"speak_timeout"|
+                   "listen_timeout"|"speak_timeout"|"alert_dismissed"|
                    "ota" (+ "id", "state", "pct"/"error"/"fw_sha"), ...}
       to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
                           "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
-                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"|"ota"}
+                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"|"ota"|
+                          "alert"}
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
 from firmware_ota import OtaManager, firmware_base_url  # stdlib-only; no .env needed
+import timers  # pure (no env or model deps), so it can sit above load_dotenv
 
 # Load OPENROUTER_API_KEY (and any other env) from the project root .env
 # before importing the agent module (which constructs the OpenRouter client).
@@ -631,6 +633,93 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
         ota.check_stall()
 
 
+# How often the timer loop looks for due timers, and how long the firmware's
+# first chime gets before the announcement is spoken over it.
+TIMER_CHECK_INTERVAL_S = 1.0
+ALERT_CHIME_S = 1.2
+# Poll interval while an announcement waits for a conversation to finish.
+ANNOUNCE_WAIT_POLL_S = 0.25
+
+
+async def _timer_loop(ws: ServerConnection, state: ConnState) -> None:
+    """Fire due timers on this connection, oldest first. Runs only while the
+    robot is connected. A timer that came due during an outage (or a brain
+    restart) is fired on the reconnect if at most timers.LATE_GRACE_S late,
+    dropped with a log line otherwise; one that comes due while connected is
+    always announced, waiting for any conversation to end first. Detection
+    never waits: while a conversation runs, due timers just stay in the DB
+    and the next idle tick announces them all in order. Cancelled by
+    handle() on disconnect."""
+    connected_ts = time.time()
+    while True:
+        await asyncio.sleep(TIMER_CHECK_INTERVAL_S)
+        due, missed = timers.partition_due(memory.list_timers(), time.time(), connected_ts)
+        for t in missed:
+            if memory.delete_timer(t.id):
+                log.warning("timer %d (%s) missed by %.0fs while offline — dropped",
+                            t.id, t.label or t.kind, time.time() - t.fire_ts)
+        if not due or _device_busy(state):
+            continue
+        for t in due:
+            try:
+                await _fire_timer(ws, state, t)
+            except Exception:
+                # A dead socket ends up cancelled by handle(); anything else
+                # (TTS) must not stop the loop for the rest of the connection.
+                log.exception("firing timer %d failed", t.id)
+
+
+async def _wait_until_idle(state: ConnState) -> None:
+    """Hold an announcement until no conversation is in progress and no
+    firmware update is in flight, rather than talk over a turn, into an open
+    mic, or across a flash."""
+    while _device_busy(state):
+        await asyncio.sleep(ANNOUNCE_WAIT_POLL_S)
+
+
+async def _fire_timer(ws: ServerConnection, state: ConnState, t: timers.Timer) -> None:
+    """Chime (the firmware's alert), then say what went off and record it in
+    the conversation. The row is claimed (deleted) first, so a timer
+    cancelled meanwhile — from the console or a turn — is never announced;
+    if the alert then can't be sent (the link died), the row is put back so
+    the reconnect fires it."""
+    await _wait_until_idle(state)
+    if not memory.delete_timer(t.id):
+        return
+    try:
+        await ws.send(json.dumps({"cmd": "alert", "style": "timer"}))
+    except Exception:
+        memory.restore_timer(t)
+        log.warning("timer %d: alert not sent — kept for the reconnect", t.id)
+        raise
+    text = timers.announcement(t)
+    log.info("timer %d fired: %r (%.1fs late)", t.id, text, time.time() - t.fire_ts)
+    # The firmware relit the screen for the alert; our sleep flag follows,
+    # and the idle clock restarts so the robot doesn't doze straight off.
+    wake_up(state)
+    state.last_activity_s = time.monotonic()
+    await asyncio.sleep(ALERT_CHIME_S)
+    await _wait_until_idle(state)
+    # No await between that idle check and run_speaker setting
+    # state.speaking (the queue is pre-filled), so a turn can't slip in.
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue.put_nowait(text)
+    queue.put_nowait(None)
+    await run_speaker(ws, state, queue)
+    state.last_activity_s = time.monotonic()
+    # Recorded as a bracketed system-context opening plus the spoken line:
+    # the same user/assistant shape as any exchange, so the thread contract
+    # holds and the model knows what it just announced. No follow-up window:
+    # this wasn't a conversation.
+    note = timers.history_note(t)
+    await ensure_agent(ws, state).record_exchange(note, text, follow_up=False)
+    publish_turn({
+        "ts": time.time(), "transcript": note, "follow_up": False,
+        "path": "timer", "tools": [], "reply": text,
+        "stt_ms": None, "ha_ms": None, "total_ms": 0,
+    })
+
+
 def _conversation_busy(state: ConnState) -> bool:
     """A conversation is in progress: mic open, speaking, a turn running, or
     the session's turn lock held (a turn or a fold committing)."""
@@ -841,6 +930,7 @@ async def handle(ws: ServerConnection) -> None:
             spawn(old.ws.close(code=1012, reason="superseded"), "supersede_close")
     idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
     live_conns.append(state)
+    timer_loop = spawn(_timer_loop(ws, state), "timer_loop")
     try:
         async for msg in ws:
             state.last_rx_s = time.monotonic()
@@ -951,6 +1041,10 @@ async def handle(ws: ServerConnection) -> None:
                     # gone back to IDLE on its own. Nothing to undo here.
                     log.warning("firmware speak_timeout — it saw no frames "
                                 "for 60 s while speaking")
+                elif event == "alert_dismissed":
+                    # Head tap or wake word during a timer chime (logged
+                    # above). The spoken announcement still follows.
+                    pass
                 elif event == "buddy_prompt":
                     # The firmware's BLE buddy reports whether a permission
                     # prompt is waiting on the device, so _should_sleep can
@@ -984,6 +1078,7 @@ async def handle(ws: ServerConnection) -> None:
         # how the M6.1 half-written tool_use corruption happens.
         _cancel_follow_up_timeout(state)
         idle_ticker.cancel()
+        timer_loop.cancel()
         log.info("esp32 disconnected")
 
 

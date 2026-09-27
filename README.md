@@ -29,8 +29,8 @@ mDNS as `stackchan-brain.local`).
    matcher. A definite hit (a device action or a state answer) is spoken
    straight back — no LLM call, ~0.1 s.
 4. Anything else goes to the LLM with its tools: Home Assistant (over MCP),
-   weather, and the robot's own face, head, dance, speaker volume, battery
-   status, memory and goodbye. A device
+   weather, timers and reminders, and the robot's own face, head, dance,
+   speaker volume, battery status, memory and goodbye. A device
    command the model handles takes one model round: it confirms in the same
    message as the tool call.
 5. Replies stream sentence by sentence into Piper and back to the speaker.
