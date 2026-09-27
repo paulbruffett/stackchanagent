@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+superseded (2026-09-26): the Rocky skin and persona have been removed (see docs/plan-responsiveness.md).
 
 ## Context & Decision
 
