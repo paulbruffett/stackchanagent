@@ -658,7 +658,7 @@ async def _timer_loop(ws: ServerConnection, state: ConnState) -> None:
             if memory.delete_timer(t.id):
                 log.warning("timer %d (%s) missed by %.0fs while offline — dropped",
                             t.id, t.label or t.kind, time.time() - t.fire_ts)
-        if not due or _conversation_busy(state):
+        if not due or _device_busy(state):
             continue
         for t in due:
             try:
@@ -670,9 +670,10 @@ async def _timer_loop(ws: ServerConnection, state: ConnState) -> None:
 
 
 async def _wait_until_idle(state: ConnState) -> None:
-    """Hold an announcement until no conversation is in progress, rather
-    than talk over a turn or into an open mic."""
-    while _conversation_busy(state):
+    """Hold an announcement until no conversation is in progress and no
+    firmware update is in flight, rather than talk over a turn, into an open
+    mic, or across a flash."""
+    while _device_busy(state):
         await asyncio.sleep(ANNOUNCE_WAIT_POLL_S)
 
 
