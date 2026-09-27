@@ -179,6 +179,11 @@ bool Hal::isBatteryCharging()
     return hal_bridge::board_is_battery_charging();
 }
 
+bool Hal::readBatteryStatus(int& pct, bool& charging)
+{
+    return hal_bridge::board_read_battery(pct, charging);
+}
+
 void Hal::factoryReset()
 {
     mclog::tagInfo(_tag, "start factory reset");

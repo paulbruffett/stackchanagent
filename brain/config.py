@@ -183,6 +183,13 @@ SPECS: dict[str, Spec] = {
         "Off frees the radio for Wi-Fi audio. 0 = off, 1 = on.",
         minimum=0, maximum=1,
     ),
+    "SPEAKER_VOLUME": Spec(
+        70, "int", False, "behavior",
+        "Robot speaker volume, 0-100 (the firmware's default is 70). Pushed "
+        "to the robot between conversations; the set_volume voice tool "
+        "writes it too, so this shows the current setting.",
+        minimum=0, maximum=100,
+    ),
 
     # --- MCP / tools (hot) ----------------------------------------------
     "HA_FAST_PATH": Spec(
@@ -359,6 +366,10 @@ class Config:
         if spec is None:
             raise KeyError(f"unknown config key: {key}")
         return self._overrides.get(key, spec.default)
+
+    def is_set(self, key: str) -> bool:
+        """True if `key` has a stored override (vs. running on its default)."""
+        return key in self._overrides
 
     def set(self, key: str, value: Any) -> Any:
         spec = SPECS.get(key)

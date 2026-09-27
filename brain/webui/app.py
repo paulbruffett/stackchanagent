@@ -143,6 +143,7 @@ def create_app(
     *,
     token: str | None = None,
     resync_sessions: Callable[[], Awaitable[int]] | None = None,
+    device_status: Callable[[], dict[str, Any]] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
@@ -223,6 +224,11 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     # --- config -------------------------------------------------------
+    @app.get("/api/device")
+    async def get_device() -> dict[str, Any]:
+        """The robot's last battery / charging / volume report."""
+        return device_status() if device_status else {"connected": False}
+
     @app.get("/api/config")
     async def get_config_api() -> dict[str, Any]:
         return {"items": config.describe()}

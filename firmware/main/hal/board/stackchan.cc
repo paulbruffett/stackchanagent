@@ -523,6 +523,15 @@ public:
         return camera_;
     }
 
+    // Battery read without GetBatteryLevel()'s power-save-timer side effect.
+    bool ReadBattery(int& level, bool& charging)
+    {
+        if (!pmic_) return false;
+        charging = pmic_->IsCharging();
+        level    = pmic_->GetBatteryLevel();
+        return true;
+    }
+
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override
     {
         static bool last_discharging = false;
@@ -583,6 +592,12 @@ int hal_bridge::board_get_battery_level()
     } else {
         return 100;
     }
+}
+
+bool hal_bridge::board_read_battery(int& level, bool& charging)
+{
+    auto& board = (M5StackCoreS3Board&)Board::GetInstance();
+    return board.ReadBattery(level, charging);
 }
 
 bool hal_bridge::board_is_battery_charging()

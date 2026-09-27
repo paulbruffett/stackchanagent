@@ -191,6 +191,11 @@ public:
     void updateHeapStatusLog();
     uint8_t getBatteryLevel();
     bool isBatteryCharging();
+    // Side-effect-free read for periodic polling: getBatteryLevel() goes
+    // through the xiaozhi board's GetBatteryLevel(), which also arms the
+    // power-save timer (screen off / shutdown) when it sees discharging.
+    // pct is the PMIC fuel gauge, 0..100; false if it could not be read.
+    bool readBatteryStatus(int& pct, bool& charging);
     void factoryReset();
 
     /* --------------------------------- Display -------------------------------- */

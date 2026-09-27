@@ -265,6 +265,9 @@ extern "C" void app_main(void)
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
         agent::commands::check_turn_watchdog();
+        // Battery/charging/volume report to the brain (60 s, or on a
+        // charging flip; polls the PMIC every 2 s).
+        agent::commands::check_device_status();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();

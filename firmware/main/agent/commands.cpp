@@ -1,5 +1,6 @@
 #include "commands.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -11,7 +12,9 @@
 #include <ArduinoJson.h>
 #include <hal/hal.h>
 #include <mooncake_log.h>
+#include <stackchan/animation/animation.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
+#include <stackchan/modifiers/dance.h>
 #include <stackchan/stackchan.h>
 
 #include "buddy_ble.h"
@@ -155,7 +158,165 @@ void apply_set_buddy(JsonDocument& doc)
     buddy_ble::set_enabled(doc["enabled"].as<bool>());
 }
 
+// Speaker volume as last applied, 0..100; -1 until first read. Tracked here
+// rather than re-read with getSpeakerVolume(): that one maps a stored 0 to 10
+// (xiaozhi's boot floor), so a brain that set 0 would see 10 reported and keep
+// re-sending. Written on the main task, read from the transport task (boot).
+std::atomic<int> g_volume{-1};
+
+int current_volume()
+{
+    int v = g_volume.load();
+    if (v < 0) {
+        v = GetHAL().getSpeakerVolume();
+        g_volume.store(v);
+    }
+    return v;
+}
+
+void send_status()
+{
+    transport::send_event_json("{\"event\":\"status\"," + status_fields() + "}");
+}
+
+void apply_set_volume(JsonDocument& doc)
+{
+    if (!doc["value"].is<int>()) {
+        mclog::tagWarn(TAG, "set_volume: missing/non-int value");
+        return;
+    }
+    int v = std::clamp(doc["value"].as<int>(), 0, 100);
+    // permanent: AudioCodec::SetOutputVolume writes NVS "audio"/"output_volume",
+    // which the codec reads back at boot.
+    GetHAL().setSpeakerVolume(static_cast<uint8_t>(v), true);
+    g_volume.store(v);
+    mclog::tagInfo(TAG, "volume: {}", v);
+    // Confirm at once, so the brain's reported value matches before its next
+    // sync check instead of 60 s later.
+    send_status();
+}
+
+// --- dance ------------------------------------------------------------------
+//
+// Plays one of DanceModifier's stock keyframe sequences, adapted to this
+// build's servo conventions, with our own bounded modifier instead of
+// DanceModifier itself: that one destroys itself when its timeline ends, and a
+// modifier id is reused as soon as it is freed, so the caller could never tell
+// "still dancing" from "some other modifier now has that id".
+//
+// The adaptations:
+//  - Pitch is offset by the rest pose. The stock sequences were written around
+//    M5's home (0, 0); here pitch 0 is 3° (chin on the desk, clamped) and the
+//    rest pose is 20°, so e.g. Happy's -10° nod would pin the head down.
+//  - Spring speed is capped at kDanceMaxSpeed. Robot (800) and Panic (1000,
+//    reversing every 100 ms) otherwise command the snap moves 7d761aa/d976ad9
+//    worked to get rid of; capped, Panic reads as a fast wobble, not a jerk.
+constexpr int kRestYaw        = 0;
+constexpr int kRestPitch      = 200;  // tenths of a degree; matches main.cpp's resting pose
+constexpr int kDanceMaxSpeed  = 400;  // k ≈ 112, vs 200 (k ≈ 36) for look_at
+constexpr uint32_t kDanceMaxMs = 6000;
+
+bool g_dancing = false;  // main task only (dispatch + StackChan::update)
+
+class BoundedDance : public stackchan::Modifier {
+public:
+    explicit BoundedDance(stackchan::animation::KeyframeSequence seq)
+        : _timeline(std::move(seq), false), _deadline(GetHAL().millis() + kDanceMaxMs)
+    {
+        _timeline.start();  // applies the first keyframe; caller holds the LVGL lock
+    }
+
+    void _update(stackchan::Modifiable& sc) override
+    {
+        if (isDestroyRequested()) return;
+        _timeline.update();
+        if (!_timeline.isFinished()
+            && static_cast<int32_t>(GetHAL().millis() - _deadline) < 0) {
+            return;
+        }
+        // Home at the gentle look_at speed, and put the face back to whatever
+        // emotion was set (the keyframes wrote eye weights/rotations directly).
+        sc.motion().moveWithSpeed(kRestYaw, kRestPitch, kLookAtSpeed);
+        if (sc.hasAvatar()) sc.avatar().setEmotion(sc.avatar().getEmotion());
+        g_dancing = false;
+        requestDestroy();
+        mclog::tagInfo(TAG, "dance: done");
+    }
+
+private:
+    stackchan::animation::Timeline _timeline;
+    uint32_t _deadline;
+};
+
+void apply_dance(JsonDocument& doc)
+{
+    std::string_view style = doc["style"] | "happy";
+    if (g_dancing) {
+        mclog::tagInfo(TAG, "dance: {} ignored, already dancing", style);
+        return;
+    }
+    const stackchan::animation::KeyframeSequence* src = &stackchan::DanceModifier::Happy;
+    if (style == "robot") {
+        src = &stackchan::DanceModifier::Robot;
+    } else if (style == "panic") {
+        src = &stackchan::DanceModifier::Panic;
+    } else if (style != "happy") {
+        mclog::tagWarn(TAG, "dance: unknown style {}, dancing happy", style);
+        style = "happy";
+    }
+    stackchan::animation::KeyframeSequence seq = *src;
+    for (auto& kf : seq) {
+        kf.pitchServo.angle += kRestPitch;
+        kf.yawServo.speed   = std::min(kf.yawServo.speed, kDanceMaxSpeed);
+        kf.pitchServo.speed = std::min(kf.pitchServo.speed, kDanceMaxSpeed);
+    }
+    LvglLockGuard lock;
+    GetStackChan().addModifier(std::make_unique<BoundedDance>(std::move(seq)));
+    g_dancing = true;
+    mclog::tagInfo(TAG, "dance: {}", style);
+}
+
 }  // namespace
+
+std::string status_fields()
+{
+    int pct       = 0;
+    bool charging = false;
+    std::string out = "\"battery\":";
+    // The AXP2101 fuel gauge reads 0..100; anything else means no usable
+    // reading (no battery, gauge not ready), reported as unknown.
+    if (GetHAL().readBatteryStatus(pct, charging) && pct >= 0 && pct <= 100) {
+        out += std::to_string(pct);
+        out += charging ? ",\"charging\":true" : ",\"charging\":false";
+    } else {
+        out += "null,\"charging\":null";
+    }
+    out += ",\"volume\":" + std::to_string(current_volume());
+    return out;
+}
+
+void check_device_status()
+{
+    constexpr int64_t kPollMs   = 2000;
+    constexpr int64_t kReportMs = 60000;
+    static int64_t next_poll_ms   = 0;
+    static int64_t next_report_ms = 0;
+    static int last_charging      = -1;  // -1 unknown, else 0/1
+    int64_t now = state::now_ms();
+    if (now < next_poll_ms) return;
+    next_poll_ms = now + kPollMs;
+
+    int pct       = 0;
+    bool charging = false;
+    int ch = GetHAL().readBatteryStatus(pct, charging) ? (charging ? 1 : 0) : -1;
+    bool flipped = last_charging != -1 && ch != -1 && ch != last_charging;
+    last_charging = ch;
+    if (!flipped && now < next_report_ms) return;
+    if (!transport::is_connected()) return;  // boot event carries it on connect
+    next_report_ms = now + kReportMs;
+    if (flipped) mclog::tagInfo(TAG, "charging: {}", ch == 1);
+    send_status();
+}
 
 void wake_face()
 {
@@ -272,6 +433,11 @@ void dispatch(std::string_view json)
         apply_set_busy(doc);
     } else if (c == "set_buddy") {
         apply_set_buddy(doc);
+    } else if (c == "set_volume") {
+        apply_set_volume(doc);
+    } else if (c == "dance") {
+        wake_face();
+        apply_dance(doc);
     } else if (c == "sleep") {
         sleep_face();
     } else if (c == "wake") {

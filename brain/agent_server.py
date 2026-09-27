@@ -8,11 +8,13 @@ Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot" (+ "buddy": bool)|"wakeword"|"tap"|
-                   "buddy_prompt"|"listen_timeout"|"speak_timeout", ...}
+      from ESP32: {"event": "boot" (+ "buddy": bool, + status fields)|
+                   "status" ("battery": 0-100|null, "charging": bool|null,
+                   "volume": 0-100)|"wakeword"|"tap"|"buddy_prompt"|
+                   "listen_timeout"|"speak_timeout", ...}
       to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
                           "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
-                          "sleep"|"wake"|"set_buddy"}
+                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"}
 """
 
 from __future__ import annotations
@@ -46,7 +48,14 @@ from claude_agent import AgentSession, maybe_summarize, migrate_turn_format, rep
 from config import get_config, init_config
 import ha_fast_path
 from mcp_client import McpClient
-from policy import buddy_sync_action, capture_is_stale, effective_sleep_timeout
+from policy import (
+    DeviceStatus,
+    buddy_sync_action,
+    capture_is_stale,
+    effective_sleep_timeout,
+    low_battery_check,
+    volume_sync_action,
+)
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up, starts_with_wake_word, strip_wake_word
 from tasks import spawn
@@ -88,6 +97,9 @@ mcp_client = McpClient(memory)
 # once at construction, so the console needs a way to reach the in-memory copy
 # — see resync_live_sessions.
 live_sessions: set[AgentSession] = set()
+# Connected firmware links (normally one), newest last, for the console's
+# device panel.
+live_conns: list["ConnState"] = []
 
 # A session busy with a turn holds its turn lock for the whole exchange
 # (model round trips + tool calls). Bound the console's wait on it rather than
@@ -143,6 +155,9 @@ class ConnState:
     # Last BUDDY_ENABLED value sent to the firmware as set_buddy on this
     # connection (None: nothing sent yet).
     buddy_sent: bool | None = None
+    # Battery / charging / volume from the boot and status events, plus the
+    # volume sync and low-battery bookkeeping. Shared with the agent's tools.
+    device: DeviceStatus = field(default_factory=DeviceStatus)
     # True while handle() is inside respond() (STT → agent → TTS). The message
     # loop awaits it inline, but the idle ticker runs alongside.
     turn_active: bool = False
@@ -173,7 +188,8 @@ async def send_pcm_stream(ws: ServerConnection, pcm: bytes) -> None:
 
 def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
     if state.agent is None:
-        state.agent = AgentSession(ws, memory=memory, mcp=mcp_client)
+        state.agent = AgentSession(ws, memory=memory, mcp=mcp_client,
+                                   device=state.device)
         live_sessions.add(state.agent)
     return state.agent
 
@@ -575,6 +591,7 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
             await go_to_sleep(ws, state)
         if state.boot_seen:
             await _sync_buddy(ws, state)
+            await _sync_volume(ws, state)
 
 
 def _conversation_busy(state: ConnState) -> bool:
@@ -614,6 +631,37 @@ async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
         spawn(ws.close(code=1012, reason="buddy mode change"), "buddy_close")
     else:
         log.info("set_buddy enabled=%s (firmware did not report its mode)", enabled)
+
+
+async def _sync_volume(ws: ServerConnection, state: ConnState) -> None:
+    """Push SPEAKER_VOLUME to the firmware as set_volume when it differs from
+    what the firmware reports, between conversations only. No reboot, so the
+    link stays up; the firmware answers with a status event."""
+    cfg = get_config()
+    value = volume_sync_action(
+        cfg.get("SPEAKER_VOLUME"), state.device.volume, state.device.volume_sent,
+        _conversation_busy(state), knob_set=cfg.is_set("SPEAKER_VOLUME"),
+    )
+    if value is None:
+        return
+    try:
+        await ws.send(json.dumps({"cmd": "set_volume", "value": value}))
+    except Exception:
+        log.exception("set_volume send failed")
+        return
+    state.device.volume_sent = value
+    log.info("set_volume %d (firmware reports %s)", value, state.device.volume)
+
+
+def _on_device_report(state: ConnState, payload: dict[str, Any]) -> None:
+    """Fold a boot/status event into state.device and log a low battery once
+    per discharge cycle. Never spoken: the robot doesn't nag unprompted; the
+    console shows it."""
+    dev = state.device
+    dev.update(payload, time.time())
+    warn, dev.low_warned = low_battery_check(dev.battery, dev.charging, dev.low_warned)
+    if warn:
+        log.warning("robot battery low: %d%% and not charging", dev.battery)
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -686,6 +734,7 @@ async def handle(ws: ServerConnection) -> None:
         log.info("restored sleep state on connect: asleep")
         await ws.send(json.dumps({"cmd": "sleep"}))
     idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
+    live_conns.append(state)
     try:
         async for msg in ws:
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
@@ -752,7 +801,10 @@ async def handle(ws: ServerConnection) -> None:
                 except json.JSONDecodeError:
                     log.warning("bad json from esp32: %r", msg[:120])
                     continue
-                log.info("event: %s", payload)
+                # Status reports arrive every 60 s; keep them out of the
+                # info log unless something in them needs attention.
+                (log.debug if payload.get("event") == "status" else log.info)(
+                    "event: %s", payload)
                 event = payload.get("event")
                 if event in ("wakeword", "tap"):
                     # Wake word or head tap: wake (if asleep) and start a
@@ -767,7 +819,11 @@ async def handle(ws: ServerConnection) -> None:
                     log.info("firmware reports buddy=%s",
                              "unknown" if state.buddy_reported is None
                              else state.buddy_reported)
+                    _on_device_report(state, payload)
                     await _sync_buddy(ws, state)
+                    await _sync_volume(ws, state)
+                elif event == "status":
+                    _on_device_report(state, payload)
                 elif event == "listen_timeout":
                     # The firmware's 15 s watchdog gave up on the capture and
                     # is back in IDLE (wakeword armed). Drop ours to match.
@@ -802,6 +858,8 @@ async def handle(ws: ServerConnection) -> None:
     finally:
         if state.agent is not None:
             live_sessions.discard(state.agent)
+        # By identity: ConnState is a dataclass, so == compares fields.
+        live_conns[:] = [c for c in live_conns if c is not state]
         # The follow-up timer outlives the socket otherwise: it wakes up to
         # FOLLOW_UP_WINDOW_S later, mutates a ConnState nothing owns any more
         # (pinning its AgentSession and speech buffer alive with it) and then
@@ -811,6 +869,21 @@ async def handle(ws: ServerConnection) -> None:
         _cancel_follow_up_timeout(state)
         idle_ticker.cancel()
         log.info("esp32 disconnected")
+
+
+def device_status() -> dict[str, Any]:
+    """The console's view of the robot: the newest connection's last report."""
+    if not live_conns:
+        return {"connected": False}
+    dev = live_conns[-1].device
+    return {
+        "connected": True,
+        "battery": dev.battery,
+        "charging": dev.charging,
+        "volume": dev.volume,
+        "low_battery": dev.low_battery,
+        "updated_at": dev.updated_at,
+    }
 
 
 STT_VOCAB_REFRESH_S = 600.0
@@ -1004,7 +1077,8 @@ async def main() -> None:
         uvicorn.Config(
             create_app(memory, cfg, mcp_client,
                        token=console_token,
-                       resync_sessions=resync_live_sessions),
+                       resync_sessions=resync_live_sessions,
+                       device_status=device_status),
             host=web_host, port=WEB_PORT, loop="none", log_level="warning",
         )
     )

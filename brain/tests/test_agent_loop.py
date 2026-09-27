@@ -561,6 +561,12 @@ def test_ha_action_allowlist_and_ends_turn():
     assert ends([HASS_ON]) and ends(["look_at", HASS_ON]) and ends(["end_conversation"])
     assert not ends(["look_at"]) and not ends(["set_expression", "remember_fact"])
     assert not ends([HASS_ON, "mcp__homeassistant__GetLiveContext"])
+    # The robot's own volume is a device action; dance is expressive (rides
+    # along, never ends a turn alone); a status read must reach a second round.
+    assert ends(["set_volume"]) and ends(["set_expression", "set_volume"])
+    assert ends(["dance", HASS_ON]) and not ends(["dance"])
+    assert not ends(["get_device_status"]) and not ends(["set_volume", "get_device_status"])
+    assert not claude_agent._has_slow_tool(["get_device_status", "dance", "set_volume"])
 
 
 @pytest.mark.parametrize("name, text, failed", [
