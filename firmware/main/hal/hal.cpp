@@ -47,7 +47,6 @@ void Hal::init()
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <system_info.h>
-#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_mac.h>
@@ -86,38 +85,10 @@ void Hal::reboot()
     esp_restart();
 }
 
-static void _confirm_ota_image_if_stable()
-{
-    constexpr uint32_t ota_confirm_delay_ms = 20000;
-    static bool ota_confirm_checked         = false;
-    if (ota_confirm_checked || GetHAL().millis() < ota_confirm_delay_ms) {
-        return;
-    }
-    ota_confirm_checked = true;
-
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (running == nullptr) {
-        mclog::tagError(_tag, "failed to get running partition for ota confirmation");
-        return;
-    }
-
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) != ESP_OK) {
-        mclog::tagError(_tag, "failed to get ota state for partition: {}", running->label);
-        return;
-    }
-
-    mclog::tagInfo(_tag, "ota confirm check: partition={}, state={}", running->label, static_cast<int>(ota_state));
-    if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-        mclog::tagInfo(_tag, "ota image is stable, marking current app valid");
-        esp_ota_mark_app_valid_cancel_rollback();
-    }
-}
-
 void Hal::updateHeapStatusLog()
 {
-    _confirm_ota_image_if_stable();
-
+    // The M5 "mark the OTA image valid after 20 s uptime" check that lived
+    // here is agent::ota::confirm_tick() now, which waits for the brain link.
     static uint32_t last_log_tick = 0;
     if (millis() - last_log_tick < 10000) {
         return;

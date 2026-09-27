@@ -288,6 +288,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_ppa
                         esp_app_format
                         app_update
+                        mbedtls
                         spi_flash
                         console
                         efuse

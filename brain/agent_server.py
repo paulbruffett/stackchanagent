@@ -8,13 +8,15 @@ Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot" (+ "buddy": bool, + status fields)|
+      from ESP32: {"event": "boot" (+ "buddy": bool, "fw"/"fw_built"/"fw_sha": str,
+                   "fw_valid": bool, + status fields)|
                    "status" ("battery": 0-100|null, "charging": bool|null,
                    "volume": 0-100)|"wakeword"|"tap"|"buddy_prompt"|
-                   "listen_timeout"|"speak_timeout", ...}
+                   "listen_timeout"|"speak_timeout"|
+                   "ota" (+ "id", "state", "pct"/"error"/"fw_sha"), ...}
       to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
                           "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
-                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"}
+                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"|"ota"}
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
+from firmware_ota import OtaManager, firmware_base_url  # stdlib-only; no .env needed
+
 # Load OPENROUTER_API_KEY (and any other env) from the project root .env
 # before importing the agent module (which constructs the OpenRouter client).
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -54,6 +58,7 @@ from policy import (
     capture_is_stale,
     effective_sleep_timeout,
     low_battery_check,
+    ota_send_ready,
     volume_sync_action,
 )
 from memory import Memory
@@ -101,6 +106,13 @@ live_sessions: set[AgentSession] = set()
 # device panel.
 live_conns: list["ConnState"] = []
 
+# Firmware updates: the console uploads and queues an image, the idle ticker
+# sends it between conversations, the firmware's ota/boot events report back.
+ota = OtaManager(base_url=lambda: firmware_base_url(_web_host, WEB_PORT, lan_ip))
+# Where the console is bound (set in main()); the robot downloads firmware
+# images from the same server.
+_web_host = HOST
+
 # A session busy with a turn holds its turn lock for the whole exchange
 # (model round trips + tool calls). Bound the console's wait on it rather than
 # hanging the HTTP request behind a wedged turn — which is exactly the state
@@ -108,8 +120,24 @@ live_conns: list["ConnState"] = []
 RESYNC_TIMEOUT_S = 15.0
 
 
+# The firmware reports status every 60 s (agent/commands.cpp), so a link that
+# has sent nothing for three periods is dead even if TCP hasn't noticed — a
+# robot that lost power mid-session leaves a half-open socket that would
+# otherwise sit in live_conns (and receive brain-initiated commands) until
+# the kernel gives up on it. Checked only between turns: the message loop
+# doesn't read while respond() runs, so a long turn would look like silence.
+LINK_SILENCE_S = 180.0
+
+
 @dataclass
 class ConnState:
+    # This connection's socket, so a newer connection can supersede it.
+    ws: Any = field(default=None, repr=False, compare=False)
+    # monotonic time of the last frame of any kind from the firmware, and
+    # whether it has sent a periodic status event (older firmware doesn't,
+    # and must not be judged by LINK_SILENCE_S).
+    last_rx_s: float = 0.0
+    status_seen: bool = False
     listening: bool = False
     speaking: bool = False
     # True when listening was opened by the brain (post-reply window) rather
@@ -510,7 +538,7 @@ def _cancel_follow_up_timeout(state: ConnState) -> None:
 def _should_sleep(state: ConnState) -> bool:
     """True when the inactivity timeout has elapsed and we're idle. A
     SLEEP_TIMEOUT_S of 0 disables sleeping entirely."""
-    if state.asleep or state.listening or state.speaking:
+    if state.asleep or _device_busy(state):
         return False
     timeout = get_config().get("SLEEP_TIMEOUT_S")
     if not timeout or timeout <= 0:
@@ -560,6 +588,13 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
     handle() on disconnect."""
     while True:
         await asyncio.sleep(IDLE_CHECK_INTERVAL_S)
+        if (state.status_seen and not _conversation_busy(state)
+                and time.monotonic() - state.last_rx_s > LINK_SILENCE_S):
+            log.warning("no frame from the firmware for %.0fs — closing the dead link",
+                        time.monotonic() - state.last_rx_s)
+            # Spawned: handle()'s teardown cancels this ticker once it lands.
+            spawn(ws.close(code=1011, reason="link silent"), "silent_close")
+            return
         if _should_summarize(state):
             state.summarized_for_activity_s = state.last_activity_s
             state.last_summarize_s = time.monotonic()
@@ -592,6 +627,8 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
         if state.boot_seen:
             await _sync_buddy(ws, state)
             await _sync_volume(ws, state)
+            await _maybe_send_ota(ws, state)
+        ota.check_stall()
 
 
 def _conversation_busy(state: ConnState) -> bool:
@@ -602,6 +639,15 @@ def _conversation_busy(state: ConnState) -> bool:
     return state.agent is not None and state.agent._turn_lock.locked()
 
 
+def _device_busy(state: ConnState) -> bool:
+    """The robot must not be disturbed by anything the brain starts on its
+    own (sleep, set_buddy, set_volume, an update, a timer going off): a
+    conversation is in progress, or a firmware update is being downloaded,
+    flashed, or is still on probation after its reboot — a set_buddy reboot
+    then would roll it back."""
+    return _conversation_busy(state) or ota.device_busy
+
+
 async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
     """Push BUDDY_ENABLED to the firmware as set_buddy, between conversations
     only. When the firmware's reported mode differs it saves the new value and
@@ -610,7 +656,7 @@ async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
     reconnect's boot report then matches."""
     knob = get_config().get("BUDDY_ENABLED")
     action = buddy_sync_action(
-        knob, state.buddy_reported, state.buddy_sent, _conversation_busy(state)
+        knob, state.buddy_reported, state.buddy_sent, _device_busy(state)
     )
     if action is None:
         return
@@ -640,7 +686,7 @@ async def _sync_volume(ws: ServerConnection, state: ConnState) -> None:
     cfg = get_config()
     reported = state.device.volume
     value = volume_sync_action(
-        cfg.get("SPEAKER_VOLUME"), reported, _conversation_busy(state),
+        cfg.get("SPEAKER_VOLUME"), reported, _device_busy(state),
         knob_set=cfg.is_set("SPEAKER_VOLUME"),
     )
     if value is None:
@@ -684,6 +730,34 @@ def _on_device_report(state: ConnState, payload: dict[str, Any]) -> None:
         memory.set_runtime_state("low_battery_warned", warned)
     if warn:
         log.warning("robot battery low: %d%% and not charging", dev.battery)
+
+
+async def _maybe_send_ota(ws: ServerConnection, state: ConnState) -> None:
+    """Send a queued firmware update, between conversations only. The
+    firmware downloads it on its own task, reports progress as ota events and
+    reboots into it; the reconnect's boot event closes the update out."""
+    if not ota_send_ready(ota.requested, state.boot_seen, _device_busy(state)):
+        return
+    try:
+        cmd = ota.build_command()
+    except OSError as exc:
+        # No LAN address yet (DHCP); stays queued for the next tick.
+        log.warning("ota: no LAN address to serve the image from (%s)", exc)
+        return
+    except ValueError as exc:
+        ota.fail(str(exc))
+        return
+    if cmd is None:
+        return
+    try:
+        await ws.send(json.dumps(cmd))
+    except Exception:
+        # Still requested: the next tick (or connection) tries again.
+        log.exception("ota send failed")
+        return
+    ota.mark_sent()
+    log.info("ota #%d: sent %d-byte image to the robot (download from %s)",
+             cmd["id"], cmd["size"], cmd["url"].rsplit("/", 1)[0])
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -755,10 +829,21 @@ async def handle(ws: ServerConnection) -> None:
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
         await ws.send(json.dumps({"cmd": "sleep"}))
+    state.ws = ws
+    state.last_rx_s = time.monotonic()
+    # There is one robot. A new connection from it means any older one is a
+    # leftover (it rebooted, or the link died without a FIN) — close it so
+    # its handler tears down and stops sending it brain-initiated commands.
+    for old in list(live_conns):
+        log.warning("superseding the previous firmware connection %s",
+                    getattr(old.ws, "remote_address", "?"))
+        if old.ws is not None:
+            spawn(old.ws.close(code=1012, reason="superseded"), "supersede_close")
     idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
     live_conns.append(state)
     try:
         async for msg in ws:
+            state.last_rx_s = time.monotonic()
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
                 if not state.listening:
                     continue
@@ -842,10 +927,19 @@ async def handle(ws: ServerConnection) -> None:
                              "unknown" if state.buddy_reported is None
                              else state.buddy_reported)
                     _on_device_report(state, payload)
+                    def _s(key: str) -> str | None:
+                        v = payload.get(key)
+                        return v if isinstance(v, str) else None
+                    valid = payload.get("fw_valid")
+                    ota.on_boot(_s("fw"), _s("fw_built"), _s("fw_sha"),
+                                valid if isinstance(valid, bool) else None)
                     await _sync_buddy(ws, state)
                     await _sync_volume(ws, state)
                 elif event == "status":
+                    state.status_seen = True
                     _on_device_report(state, payload)
+                elif event == "ota":
+                    ota.on_event(payload)
                 elif event == "listen_timeout":
                     # The firmware's 15 s watchdog gave up on the capture and
                     # is back in IDLE (wakeword armed). Drop ours to match.
@@ -1051,7 +1145,7 @@ def _seed_default_mcp_servers() -> None:
 
 
 async def main() -> None:
-    global stt, tts
+    global stt, tts, _web_host
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -1095,12 +1189,14 @@ async def main() -> None:
     logging.getLogger("brain").addHandler(WebUILogHandler())
     console_token, console_generated = _console_token()
     web_host = _console_bind()
+    _web_host = web_host
     web = uvicorn.Server(
         uvicorn.Config(
             create_app(memory, cfg, mcp_client,
                        token=console_token,
                        resync_sessions=resync_live_sessions,
-                       device_status=device_status),
+                       device_status=device_status,
+                       ota=ota),
             host=web_host, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
@@ -1108,9 +1204,13 @@ async def main() -> None:
 
     aiozc, info = await advertise_mdns()
     try:
-        # ping_interval=None: the 78/esp-ml307 WebSocket on the firmware
-        # doesn't reply to pings, so server-side keepalive trips the
-        # connection every ~50 s. We accept the lost dead-conn detection.
+        # ping_interval=None: server-side keepalive tripped the firmware's
+        # link every ~50 s when it was tried (Phase 4). esp-ml307 3.6.x does
+        # answer pings on paper (web_socket.cc echoes 0x9 as 0xA), but that
+        # isn't re-verified on the device, and a wrong guess drops the robot
+        # every minute. Dead links are caught instead by the firmware's
+        # 60 s status heartbeat (LINK_SILENCE_S) and by a reconnect
+        # superseding the old connection (handle()).
         async with serve(
             handle, HOST, PORT, max_size=2**20, ping_interval=None
         ):

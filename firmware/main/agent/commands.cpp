@@ -22,6 +22,7 @@
 #include <stackchan/stackchan.h>
 
 #include "buddy_ble.h"
+#include "ota.h"
 #include "state.h"
 #include "transport.h"
 
@@ -544,6 +545,10 @@ void dispatch(std::string_view json)
     } else if (c == "dance") {
         wake_face();
         apply_dance(doc);
+    } else if (c == "ota") {
+        // Only kicks off the download task; it never blocks this loop.
+        ota::start(doc["url"] | "", doc["size"] | static_cast<size_t>(0), doc["sha256"] | "",
+                   doc["id"] | 0);
     } else if (c == "sleep") {
         sleep_face();
     } else if (c == "wake") {

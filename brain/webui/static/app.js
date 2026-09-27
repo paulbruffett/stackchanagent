@@ -60,6 +60,7 @@ $$("nav button").forEach((b) =>
     if (b.dataset.tab === "config") loadConfig();
     if (b.dataset.tab === "persona") loadPersona();
     if (b.dataset.tab === "mcp") loadMcp();
+    if (b.dataset.tab === "firmware") loadFirmware();
   })
 );
 
@@ -478,6 +479,90 @@ function appendLog(item) {
   out.append(line);
   while (out.childElementCount > 1500) out.firstChild.remove();
   if (near) out.scrollTop = out.scrollHeight;
+}
+
+// ---- firmware (OTA) ----
+// Upload build/stack-chan.bin, then "Send to robot": the brain queues it,
+// sends it between conversations, and the robot downloads, flashes and
+// reboots. Progress comes back as the robot's ota events; poll while it runs.
+let fwPoll = null;
+// Builds are told apart by their ELF SHA-256 (the version string rarely
+// changes); a 12-hex prefix is enough to read, the brain compares all of it.
+const fwSha = (h) => (h ? h.slice(0, 12) : "?");
+const fwDesc = (i) => i ? `${i.project} ${i.version} · ${fwSha(i.elf_sha256)} · built ${i.built} · ${(i.size / 1048576).toFixed(2)} MB` : "—";
+const FW_BUSY = ["queued", "sent", "downloading", "rebooting", "confirming"];
+
+async function loadFirmware() {
+  const res = await fetch("/api/firmware");
+  if (!res.ok) { $("#firmware").textContent = "firmware updates unavailable"; return; }
+  renderFirmware(await res.json());
+}
+
+function fwRow(label, ...kids) {
+  return el("div", { className: "row" }, el("div", { className: "k", textContent: label }), ...kids);
+}
+
+function renderFirmware(st) {
+  const root = $("#firmware");
+  root.innerHTML = "";
+  const sec = el("div", { className: "group" }, el("h2", { textContent: "Update firmware" }));
+  const robot = st.robot ? `${st.robot.version} · ${fwSha(st.robot.elf_sha256)} · built ${st.robot.built}`
+    : "unknown (no boot report since the brain started)";
+  sec.append(fwRow("Robot is running", el("span", { textContent: robot })));
+  sec.append(fwRow("Uploaded image", el("span", { textContent: fwDesc(st.stored) })));
+  for (const w of (st.stored && st.stored.warnings) || [])
+    sec.append(el("div", { className: "err", textContent: "warning: " + w }));
+
+  const busy = FW_BUSY.includes(st.state);
+  const file = el("input", { type: "file", accept: ".bin" });
+  const up = el("button", { className: "ghost", textContent: "Upload", disabled: busy });
+  up.addEventListener("click", async () => {
+    if (!file.files.length) { setStatus("pick build/stack-chan.bin first", "err"); return; }
+    const body = new FormData();
+    body.append("file", file.files[0]);
+    setStatus("uploading…");
+    const r = await fetch("/api/firmware", { method: "POST", body });
+    const j = await r.json();
+    if (!r.ok) { setStatus(`upload refused: ${j.detail}`, "err"); return; }
+    setStatus("firmware uploaded", "ok");
+    renderFirmware(j);
+  });
+  const send = el("button", { className: "act", textContent: "Send to robot", disabled: busy || !st.stored });
+  send.addEventListener("click", async () => {
+    if (!confirm(`Flash ${fwDesc(st.stored)} to the robot? It reboots when done.`)) return;
+    const r = await fetch("/api/firmware/send", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { setStatus(`send refused: ${j.detail}`, "err"); return; }
+    setStatus("update queued — sent at the next quiet moment", "ok");
+    renderFirmware(j);
+  });
+  const row = el("div", { className: "row" }, file, up, el("span", { style: "flex:1" }));
+  if (st.state === "queued") {
+    const cancel = el("button", { className: "ghost", textContent: "Cancel update" });
+    cancel.addEventListener("click", async () => {
+      const r = await fetch("/api/firmware/cancel", { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) { setStatus(`cancel refused: ${j.detail}`, "err"); loadFirmware(); return; }
+      setStatus("update cancelled", "ok");
+      renderFirmware(j);
+    });
+    row.append(cancel);
+  }
+  row.append(send);
+  sec.append(row);
+
+  let line = st.state;
+  if (st.state === "downloading") line += ` ${st.pct}%`;
+  if (st.state === "queued") line += " (waiting for the robot to be idle)";
+  if (st.state === "confirming") line += " (new image up; waiting for it to confirm itself)";
+  if (st.state === "done") line += ` — robot is running ${fwDesc(st.target)}`;
+  if (st.error) line += ` — ${st.error}`;
+  const cls = st.state === "failed" ? "err" : st.state === "done" ? "ok" : "";
+  sec.append(fwRow("Update status", el("span", { className: cls, textContent: line })));
+  root.append(sec);
+
+  clearTimeout(fwPoll);
+  if (busy && root.classList.contains("active")) fwPoll = setTimeout(loadFirmware, 2000);
 }
 
 // ---- live transaction feed ----

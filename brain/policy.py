@@ -188,3 +188,12 @@ def low_battery_check(
     if battery is None or battery > LOW_BATTERY_PCT or warned:
         return False, warned
     return True, True
+
+def ota_send_ready(requested: bool, boot_seen: bool, busy: bool) -> bool:
+    """Whether to send a queued firmware update down this connection now.
+
+    Only between conversations (the robot stops listening to the user and
+    reboots at the end of it), and only once the firmware's boot event has
+    arrived — the link is fully up and we know what it is running.
+    """
+    return requested and boot_seen and not busy

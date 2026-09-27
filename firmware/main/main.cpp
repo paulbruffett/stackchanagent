@@ -30,6 +30,7 @@
 #include "agent/buddy_ble.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
+#include "agent/ota.h"
 #include "agent/speaker_play.h"
 #include "agent/state.h"
 #include "agent/transport.h"
@@ -165,6 +166,9 @@ extern "C" void app_main(void)
         [](std::string_view json) { agent::commands::enqueue(json); });
     agent::speaker_play::start();
     agent::wakeword::on_detected([](const std::string& w) {
+        // Mid-update: no turns. ota::start paused detection; a detection
+        // that raced it just drops (the OTA task resumes on failure).
+        if (agent::ota::in_progress()) return;
         // Relight the screen first if we were asleep (instant, local —
         // doesn't wait on the brain round-trip).
         agent::commands::wake_face();
@@ -207,6 +211,7 @@ extern "C" void app_main(void)
             return;
         }
         if (agent::state::current() != agent::state::Mode::Idle) return;
+        if (agent::ota::in_progress()) return;
         agent::commands::wake_face();
         // Same reasoning as the wakeword path: don't enter LISTENING unless
         // the brain heard the tap.
@@ -292,11 +297,11 @@ extern "C" void app_main(void)
                                offline ? "OFFLINE" : "online");
             }
         }
-        // Also marks a freshly-OTA'd image valid: sdkconfig keeps
-        // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y over a two-slot partition
-        // table, and this is the only caller of the confirmation path left
-        // after the M5 app-launcher loop was removed. Self-rate-limited to
-        // 10 s; the heap stats come along for free.
+        // A freshly-OTA'd image boots PENDING_VERIFY
+        // (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE): valid after 30 s of
+        // unbroken brain link, rolled back if not within 5 min of boot.
+        agent::ota::confirm_tick();
+        // Self-rate-limited to 10 s.
         GetHAL().updateHeapStatusLog();
         GetHAL().feedTheDog();
         GetHAL().delay(20);

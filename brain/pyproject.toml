@@ -30,6 +30,10 @@ dependencies = [
     # Jetson aarch64; the default asyncio loop is fine here.
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    # FastAPI's UploadFile/Form parsing (the console's firmware upload).
+    # mcp happens to pull it in too; declared so that stays true if mcp
+    # ever drops it.
+    "python-multipart>=0.0.9",
     # Phase 9b: MCP client (and FastMCP for our local weather server).
     # Pinned below 2.0: mcp 2.x dropped mcp.server.fastmcp (FastMCP moved to
     # the separate 'fastmcp' package), which mcp_servers/weather.py imports.
