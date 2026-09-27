@@ -9,7 +9,6 @@
 #include <string_view>
 
 #include <ArduinoJson.h>
-#include <esp_timer.h>
 #include <hal/hal.h>
 #include <mooncake_log.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
@@ -17,6 +16,7 @@
 
 #include "buddy_ble.h"
 #include "state.h"
+#include "transport.h"
 
 namespace agent::commands {
 
@@ -130,23 +130,20 @@ void apply_set_busy(JsonDocument& doc)
     mclog::tagInfo(TAG, "busy: {}", on);
 }
 
-// LISTENING watchdog. Nothing on-device ends a LISTENING turn: the brain
-// closes it (stop_listening / start_speaking), and the wakeword is paused and
-// the head tap gated to Idle meanwhile. transport already drops to Idle when
-// the link goes down, but a brain that is connected yet wedged would leave the
-// robot deaf. Its own longest capture is 10 s (+ a 4.5 s follow-up window it
-// opens with start_listening, itself a command), so 15 s without any command
-// is safely past anything legitimate.
+// Turn watchdog. Only the brain ends a LISTENING or SPEAKING turn, and the
+// wakeword is paused and the head tap gated to Idle meanwhile. transport
+// already drops to Idle when the link goes down, but a brain that is connected
+// yet wedged would leave the robot deaf. Both clocks run from the later of
+// entering the mode and the last inbound brain frame.
+//
+// LISTENING: the brain's captures are capped below this — MAX_UTTERANCE_MS
+// max 12000 and FOLLOW_UP_WINDOW_S max 10 (brain/config.py); the follow-up
+// window is opened by start_listening, itself a frame. Keep those caps below
+// this value if either changes.
 constexpr int64_t kListeningWatchdogMs = 15000;
-
-// Arrival time of the most recent brain frame. Written on tcp_receive, read
-// on the idle loop.
-std::atomic<int64_t> g_last_cmd_ms{0};
-
-int64_t now_ms()
-{
-    return esp_timer_get_time() / 1000;
-}
+// SPEAKING: a slow MCP tool (45 s dispatch timeout) can legitimately hold the
+// device in SPEAKING with no frames after the spoken ack filler.
+constexpr int64_t kSpeakingWatchdogMs = 60000;
 
 void apply_set_buddy(JsonDocument& doc)
 {
@@ -191,7 +188,6 @@ bool face_is_off()
 
 void enqueue(std::string_view json)
 {
-    g_last_cmd_ms.store(now_ms());
     std::lock_guard<std::mutex> lock(g_queue_mu);
     if (g_queue.size() >= kMaxQueuedCommands) {
         // The idle loop drains everything every ~20 ms, so this only fires if
@@ -217,18 +213,20 @@ void drain()
     }
 }
 
-void check_listening_watchdog()
+void check_turn_watchdog()
 {
-    if (state::current() != state::Mode::Listening) return;
-    int64_t now  = now_ms();
-    int64_t last = g_last_cmd_ms.load();
-    int64_t entered = state::entered_at_ms();
-    if (entered > last) last = entered;
-    if (now - last < kListeningWatchdogMs) return;
-    mclog::tagWarn(TAG, "LISTENING for {} ms with no brain command; back to idle",
-                   now - last);
-    // Same path as the brain's stop_listening.
-    state::transition(state::Mode::Idle);
+    // Same Idle transition as the brain's stop_listening / stop_speaking,
+    // then tell the brain so it drops its side of the turn too.
+    int64_t last_rx = transport::last_rx_ms();
+    if (state::expire_if_stale(state::Mode::Listening, last_rx, kListeningWatchdogMs)) {
+        mclog::tagWarn(TAG, "LISTENING > {} ms with no brain frame; back to idle",
+                       kListeningWatchdogMs);
+        transport::send_event_json("{\"event\":\"listen_timeout\"}");
+    } else if (state::expire_if_stale(state::Mode::Speaking, last_rx, kSpeakingWatchdogMs)) {
+        mclog::tagWarn(TAG, "SPEAKING > {} ms with no brain frame; back to idle",
+                       kSpeakingWatchdogMs);
+        transport::send_event_json("{\"event\":\"speak_timeout\"}");
+    }
 }
 
 void dispatch(std::string_view json)

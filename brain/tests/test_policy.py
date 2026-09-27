@@ -3,7 +3,7 @@
 These are kept dependency-free (no agent_server import) so they run offline on
 any machine, unlike the server module which pulls in Jetson-only deps.
 """
-from policy import buddy_sync_command, effective_sleep_timeout
+from policy import buddy_sync_action, capture_is_stale, effective_sleep_timeout
 
 
 class TestEffectiveSleepTimeout:
@@ -24,15 +24,44 @@ class TestEffectiveSleepTimeout:
         assert effective_sleep_timeout(0.0, 1800.0, True) == 1800.0
 
 
-class TestBuddySyncCommand:
-    def test_first_push_always_sends(self):
-        assert buddy_sync_command(0, None) == {"cmd": "set_buddy", "enabled": False}
-        assert buddy_sync_command(1, None) == {"cmd": "set_buddy", "enabled": True}
 
-    def test_unchanged_knob_sends_nothing(self):
-        assert buddy_sync_command(0, False) is None
-        assert buddy_sync_command(1, True) is None
+class TestBuddySyncAction:
+    def test_matching_report_sends_nothing(self):
+        assert buddy_sync_action(0, False, None, busy=False) is None
+        assert buddy_sync_action(1, True, None, busy=False) is None
 
-    def test_changed_knob_sends_new_value(self):
-        assert buddy_sync_command(1, False) == {"cmd": "set_buddy", "enabled": True}
-        assert buddy_sync_command(0, True) == {"cmd": "set_buddy", "enabled": False}
+    def test_differing_report_sends_and_closes(self):
+        assert buddy_sync_action(1, False, None, busy=False) == "send_close"
+        assert buddy_sync_action(0, True, None, busy=False) == "send_close"
+
+    def test_already_sent_waits_for_the_reboot(self):
+        assert buddy_sync_action(1, False, True, busy=False) is None
+
+    def test_busy_defers(self):
+        assert buddy_sync_action(1, False, None, busy=True) is None
+        assert buddy_sync_action(1, None, None, busy=True) is None
+
+    def test_no_report_sends_once_without_closing(self):
+        assert buddy_sync_action(0, None, None, busy=False) == "send"
+        assert buddy_sync_action(0, None, False, busy=False) is None
+
+    def test_no_report_resends_on_knob_change(self):
+        assert buddy_sync_action(1, None, False, busy=False) == "send"
+
+
+class TestCaptureIsStale:
+    def test_not_listening_is_never_stale(self):
+        assert not capture_is_stale(False, 0.0, 1000.0, 10000, False, 4.5)
+
+    def test_within_max_utterance_plus_grace(self):
+        assert not capture_is_stale(True, 100.0, 112.9, 10000, False, 4.5)
+
+    def test_past_max_utterance_plus_grace(self):
+        assert capture_is_stale(True, 100.0, 113.1, 10000, False, 4.5)
+
+    def test_follow_up_window_longer_than_max_utterance(self):
+        # MAX_UTTERANCE_MS set low: a follow-up window may stay open longer.
+        assert not capture_is_stale(True, 100.0, 110.0, 3000, True, 9.0)
+        assert capture_is_stale(True, 100.0, 112.1, 3000, True, 9.0)
+        # ...but a wakeword capture still uses the utterance cap.
+        assert capture_is_stale(True, 100.0, 106.1, 3000, False, 9.0)

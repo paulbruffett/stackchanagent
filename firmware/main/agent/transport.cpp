@@ -13,6 +13,7 @@
 #include <mooncake_log.h>
 #include <web_socket.h>
 
+#include "buddy_ble.h"
 #include "state.h"
 
 namespace agent::transport {
@@ -45,6 +46,9 @@ struct State {
     std::mutex mu;
     AudioFrameHandler on_audio;
     JsonFrameHandler on_json;
+    // state::now_ms() of the last inbound frame (audio or JSON). Feeds the
+    // turn watchdog in commands.cpp.
+    std::atomic<int64_t> last_rx_ms{0};
 };
 
 State& state()
@@ -56,6 +60,7 @@ State& state()
 void handle_data(const char* data, size_t len, bool binary)
 {
     auto& s = state();
+    s.last_rx_ms.store(state::now_ms());
     if (binary) {
         if (len < 1) return;
         uint8_t op = static_cast<uint8_t>(data[0]);
@@ -147,7 +152,11 @@ void connection_task(void*)
         s.connected = true;
         const TickType_t session_start = xTaskGetTickCount();
         mclog::tagInfo(TAG, "connected");
-        send_event_json("{\"event\":\"boot\"}");
+        // Report the BLE-buddy mode this boot is running in, so the brain
+        // only sends set_buddy (which reboots us) when it actually differs.
+        send_event_json(buddy_ble::enabled()
+                            ? "{\"event\":\"boot\",\"buddy\":true}"
+                            : "{\"event\":\"boot\",\"buddy\":false}");
 
         // Run until disconnect / error fires.
         while (!closed->load()) {
@@ -247,6 +256,11 @@ bool send_event_json(std::string_view json)
     }
     if (!ws) return false;
     return ws->Send(std::string(json));
+}
+
+int64_t last_rx_ms()
+{
+    return state().last_rx_ms.load();
 }
 
 void set_on_audio(AudioFrameHandler handler)

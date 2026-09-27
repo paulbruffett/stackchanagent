@@ -8,9 +8,11 @@ Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot"|"wakeword"|"vad_end", ...}
-      to   ESP32: {"cmd": "stop_listening"|"start_speaking"|"stop_speaking"|
-                          "set_expression"|"look_at"}
+      from ESP32: {"event": "boot" (+ "buddy": bool)|"wakeword"|"tap"|
+                   "buddy_prompt"|"listen_timeout"|"speak_timeout", ...}
+      to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
+                          "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
+                          "sleep"|"wake"|"set_buddy"}
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from claude_agent import AgentSession, maybe_summarize, migrate_turn_format, rep
 from config import get_config, init_config
 import ha_fast_path
 from mcp_client import McpClient
-from policy import buddy_sync_command, effective_sleep_timeout
+from policy import buddy_sync_action, capture_is_stale, effective_sleep_timeout
 from memory import Memory
 from stt import Transcriber, should_drop_follow_up, starts_with_wake_word, strip_wake_word
 from tasks import spawn
@@ -134,9 +136,16 @@ class ConnState:
     # emits {"event":"buddy_prompt","pending":...}). Elongates the sleep
     # timeout so the device doesn't sleep out from under an unanswered prompt.
     buddy_prompt_pending: bool = False
+    # BLE-buddy mode the firmware reported in its boot event (None: not
+    # reported — older firmware). set_buddy is only sent once boot_seen.
+    boot_seen: bool = False
+    buddy_reported: bool | None = None
     # Last BUDDY_ENABLED value sent to the firmware as set_buddy on this
-    # connection (None until the connect-time push).
+    # connection (None: nothing sent yet).
     buddy_sent: bool | None = None
+    # True while handle() is inside respond() (STT → agent → TTS). The message
+    # loop awaits it inline, but the idle ticker runs alongside.
+    turn_active: bool = False
 
 
 def frame_rms(frame: bytes) -> float:
@@ -459,13 +468,21 @@ async def _follow_up_timeout_task(
     if state.voiced_ms >= get_config().get("SPEECH_LEAD_MS"):
         # User started talking — let the normal VAD path finish.
         return
-    log.info("follow-up window timed out (no speech) — closing")
+    _close_capture(state, "follow-up window timed out (no speech)")
+    await ws.send(json.dumps({"cmd": "stop_listening"}))
+
+
+def _close_capture(state: ConnState, reason: str) -> None:
+    """Drop an open capture without responding to it — how a follow-up
+    window that heard nothing ends, and how a capture the firmware abandoned
+    (listen_timeout) or that went stale is cleared. Callers outside the
+    follow-up timeout task also cancel that task first."""
+    log.info("capture closed: %s", reason)
     state.listening = False
     state.follow_up = False
     state.speech_buf = bytearray()
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
-    await ws.send(json.dumps({"cmd": "stop_listening"}))
 
 
 def _cancel_follow_up_timeout(state: ConnState) -> None:
@@ -535,25 +552,68 @@ async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
             # folding, so make one.
             agent = ensure_agent(ws, state)
             state.summarize_task = spawn(maybe_summarize(agent), "summarize")
+        cfg = get_config()
+        if capture_is_stale(
+            state.listening,
+            state.started_at,
+            time.monotonic(),
+            cfg.get("MAX_UTTERANCE_MS"),
+            state.follow_up,
+            cfg.get("FOLLOW_UP_WINDOW_S"),
+        ):
+            # Utterance end is only judged on incoming audio; with no frames
+            # (firmware gave up, event lost) nothing else would ever close it.
+            log.warning("capture open %.1fs with no end — clearing",
+                        time.monotonic() - state.started_at)
+            _cancel_follow_up_timeout(state)
+            _close_capture(state, "stale")
+            try:
+                await ws.send(json.dumps({"cmd": "stop_listening"}))
+            except Exception:
+                log.exception("stop_listening send failed")
         if _should_sleep(state):
             await go_to_sleep(ws, state)
-        await _sync_buddy(ws, state)
+        if state.boot_seen:
+            await _sync_buddy(ws, state)
+
+
+def _conversation_busy(state: ConnState) -> bool:
+    """A conversation is in progress: mic open, speaking, a turn running, or
+    the session's turn lock held (a turn or a fold committing)."""
+    if state.listening or state.speaking or state.turn_active:
+        return True
+    return state.agent is not None and state.agent._turn_lock.locked()
 
 
 async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
-    """Send set_buddy when BUDDY_ENABLED differs from what this connection
-    last sent. A change makes the firmware reboot (~15 s), dropping the link;
-    the reconnect's push then finds the two in agreement."""
-    msg = buddy_sync_command(get_config().get("BUDDY_ENABLED"), state.buddy_sent)
-    if msg is None:
+    """Push BUDDY_ENABLED to the firmware as set_buddy, between conversations
+    only. When the firmware's reported mode differs it saves the new value and
+    reboots (~15 s), so close our side of the link straight away rather than
+    leave a handler, ticker and session talking to a dead socket; the
+    reconnect's boot report then matches."""
+    knob = get_config().get("BUDDY_ENABLED")
+    action = buddy_sync_action(
+        knob, state.buddy_reported, state.buddy_sent, _conversation_busy(state)
+    )
+    if action is None:
         return
+    enabled = bool(knob)
     try:
-        await ws.send(json.dumps(msg))
+        await ws.send(json.dumps({"cmd": "set_buddy", "enabled": enabled}))
     except Exception:
         log.exception("set_buddy send failed")
         return
-    state.buddy_sent = msg["enabled"]
-    log.info("set_buddy enabled=%s", msg["enabled"])
+    state.buddy_sent = enabled
+    if action == "send_close":
+        log.warning(
+            "set_buddy enabled=%s (firmware reports %s) — device rebooting, "
+            "closing the link", enabled, state.buddy_reported,
+        )
+        # Spawned, not awaited: the idle ticker is one caller, and handle()'s
+        # teardown cancels it once the close lands.
+        spawn(ws.close(code=1012, reason="buddy mode change"), "buddy_close")
+    else:
+        log.info("set_buddy enabled=%s (firmware did not report its mode)", enabled)
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
@@ -610,19 +670,21 @@ async def handle(ws: ServerConnection) -> None:
     # for the next reflash.
     await ws.send(json.dumps({"cmd": "stop_speaking"}))
     state = ConnState()
-    # Push the BLE-buddy setting. The firmware keeps it in NVS and reboots
-    # only when it changes, so this is a no-op on every ordinary connect.
-    await _sync_buddy(ws, state)
+    # The BLE-buddy setting is pushed once the firmware's boot event says
+    # which mode it is running in (see the "boot" branch below).
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.
     state.last_activity_s = time.monotonic()
     # Restore the persisted sleep flag: if the device was asleep when the
     # brain last ran (or restarted), stay dormant and let only a wake word /
-    # head tap (which the firmware lights locally) bring it back. The firmware is still backlit-off from its earlier
-    # `sleep`, so the two stay consistent without sending any command.
+    # head tap (which the firmware lights locally) bring it back. Re-send
+    # sleep rather than assume the screen is still dark: the firmware may have
+    # rebooted since (power cut, set_buddy, OTA) and come up lit. Idempotent
+    # on a firmware that is already asleep.
     if bool(memory.get_runtime_state("asleep", False)):
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
+        await ws.send(json.dumps({"cmd": "sleep"}))
     idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
     try:
         async for msg in ws:
@@ -679,7 +741,11 @@ async def handle(ws: ServerConnection) -> None:
                         state.trailing_silence_ms,
                         elapsed_ms,
                     )
-                    await respond(ws, state)
+                    state.turn_active = True
+                    try:
+                        await respond(ws, state)
+                    finally:
+                        state.turn_active = False
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)
@@ -694,6 +760,25 @@ async def handle(ws: ServerConnection) -> None:
                     # firmware has already switched itself to LISTENING and
                     # relit the screen on the same trigger.
                     _on_wake_trigger(state)
+                elif event == "boot":
+                    state.boot_seen = True
+                    buddy = payload.get("buddy")
+                    state.buddy_reported = buddy if isinstance(buddy, bool) else None
+                    log.info("firmware reports buddy=%s",
+                             "unknown" if state.buddy_reported is None
+                             else state.buddy_reported)
+                    await _sync_buddy(ws, state)
+                elif event == "listen_timeout":
+                    # The firmware's 15 s watchdog gave up on the capture and
+                    # is back in IDLE (wakeword armed). Drop ours to match.
+                    log.warning("firmware listen_timeout — dropping the capture")
+                    _cancel_follow_up_timeout(state)
+                    _close_capture(state, "firmware listen_timeout")
+                elif event == "speak_timeout":
+                    # 60 s in SPEAKING with no frame from us; the firmware has
+                    # gone back to IDLE on its own. Nothing to undo here.
+                    log.warning("firmware speak_timeout — it saw no frames "
+                                "for 60 s while speaking")
                 elif event == "buddy_prompt":
                     # The firmware's BLE buddy reports whether a permission
                     # prompt is waiting on the device, so _should_sleep can

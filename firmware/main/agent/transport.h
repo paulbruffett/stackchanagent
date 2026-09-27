@@ -35,6 +35,10 @@ bool send_audio(const int16_t* samples, size_t sample_count);
 // Send a JSON text frame. Pass a complete JSON string.
 bool send_event_json(std::string_view json);
 
+// state::now_ms() when the last frame (audio or JSON) arrived from the brain;
+// 0 if none yet.
+int64_t last_rx_ms();
+
 // Register handler for incoming OP_AUDIO frames. The pointer is into
 // the WebSocket library's internal buffer and is only valid for the
 // duration of the call — copy if you need to retain.

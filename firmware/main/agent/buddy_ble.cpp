@@ -295,9 +295,11 @@ void start()
 namespace {
 constexpr const char* kNvsNamespace = "stackchan";
 constexpr const char* kNvsKey       = "buddy_ble";
-}  // namespace
 
-bool enabled()
+// Raw NVS rather than xiaozhi's Settings wrapper: Settings commits in its
+// destructor under ESP_ERROR_CHECK (a failed commit aborts), while
+// set_enabled() must see the error and skip the reboot instead.
+bool read_setting()
 {
     nvs_handle_t h;
     if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) {
@@ -307,6 +309,15 @@ bool enabled()
     nvs_get_u8(h, kNvsKey, &v);
     nvs_close(h);
     return v != 0;
+}
+}  // namespace
+
+bool enabled()
+{
+    // Read once: this is the mode the current boot runs in. set_enabled()
+    // reboots on any change, so NVS and this never disagree for long.
+    static const bool v = read_setting();
+    return v;
 }
 
 void set_enabled(bool on)

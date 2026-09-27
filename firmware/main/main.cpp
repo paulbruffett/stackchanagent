@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <string_view>
 
+#include <esp_bt.h>
+#include <esp_heap_caps.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -79,12 +81,20 @@ static void network_task(void*)
         // Wi-Fi controller's, the order this build has always run in.
         agent::buddy_ble::start();
     } else {
+        // BLE can't come back this boot (turning the buddy on goes through
+        // set_buddy's reboot), so hand the idle controller's static memory
+        // (~70 KB internal RAM) to the heap. Legal only while the controller
+        // is IDLE, i.e. never initialised — nothing else here brings BT up.
+        size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        esp_err_t rel_err  = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        size_t free_after  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        mclog::tagInfo(TAG, "BLE buddy: off; bt controller mem release: {} (internal free {} -> {})",
+                       esp_err_to_name(rel_err), free_before, free_after);
         // No BLE controller running, so Wi-Fi can stay awake. Modem sleep
         // (the default, and mandatory under BT coexistence) parks ACKs until
         // the next beacon, which throttles the mic uplink's TCP window.
         esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
-        mclog::tagInfo(TAG, "BLE buddy: off; wifi power save off: {}",
-                       esp_err_to_name(ps_err));
+        mclog::tagInfo(TAG, "wifi power save off: {}", esp_err_to_name(ps_err));
     }
     vTaskDelete(nullptr);
 }
@@ -158,11 +168,11 @@ extern "C" void app_main(void)
         // Relight the screen first if we were asleep (instant, local —
         // doesn't wait on the brain round-trip).
         agent::commands::wake_face();
-        // Only arm LISTENING once the brain has actually been told. Nothing
-        // on-device leaves LISTENING on its own — the wakenet is paused there
-        // and the head tap is gated to Idle — so transitioning on an event the
-        // transport silently dropped would leave the robot deaf for the rest
-        // of the outage. AfeWakeWord::AudioDetectionTask already called Stop()
+        // Only arm LISTENING once the brain has actually been told. Only the
+        // brain (or, 15 s later, the turn watchdog) leaves LISTENING — the
+        // wakenet is paused there and the head tap is gated to Idle — so
+        // transitioning on an event the transport silently dropped would leave
+        // the robot deaf for no reason. AfeWakeWord::AudioDetectionTask already called Stop()
         // before invoking us, and staying in Idle means transition() would
         // never resume it (prev == next short-circuits), so re-arm by hand.
         if (!agent::transport::send_event_json(
@@ -254,7 +264,7 @@ extern "C" void app_main(void)
         // Brain commands run here, on the one task that owns StackChan and the
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
-        agent::commands::check_listening_watchdog();
+        agent::commands::check_turn_watchdog();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();

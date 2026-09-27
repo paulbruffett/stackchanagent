@@ -36,24 +36,14 @@ const char* name(Mode m)
     return "?";
 }
 
-}  // namespace
-
-int64_t entered_at_ms()
+// Caller holds mu_.
+void transition_locked(Mode next)
 {
-    return entered_at_ms_.load();
-}
-
-Mode current()
-{
-    return mode_.load(std::memory_order_relaxed);
-}
-
-void transition(Mode next)
-{
-    std::lock_guard<std::mutex> lock(mu_);
+    if (mode_.load(std::memory_order_acquire) == next) return;
+    // Stamp before publishing the mode, so a reader that sees the new mode
+    // never pairs it with the previous episode's entry time.
+    entered_at_ms_.store(now_ms());
     Mode prev = mode_.exchange(next, std::memory_order_acq_rel);
-    if (prev == next) return;
-    entered_at_ms_.store(esp_timer_get_time() / 1000);
     mclog::tagInfo(TAG, "{} -> {}", name(prev), name(next));
 
     switch (next) {
@@ -65,6 +55,35 @@ void transition(Mode next)
             wakeword::pause();
             break;
     }
+}
+
+}  // namespace
+
+int64_t now_ms()
+{
+    return esp_timer_get_time() / 1000;
+}
+
+Mode current()
+{
+    return mode_.load(std::memory_order_relaxed);
+}
+
+void transition(Mode next)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    transition_locked(next);
+}
+
+bool expire_if_stale(Mode mode, int64_t last_activity_ms, int64_t timeout_ms)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    if (mode_.load(std::memory_order_acquire) != mode) return false;
+    int64_t since = entered_at_ms_.load();
+    if (last_activity_ms > since) since = last_activity_ms;
+    if (now_ms() - since <= timeout_ms) return false;
+    transition_locked(Mode::Idle);
+    return true;
 }
 
 }  // namespace agent::state

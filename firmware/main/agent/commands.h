@@ -37,11 +37,12 @@ void enqueue(std::string_view json);
 // OUTSIDE the LVGL lock (dispatch takes it itself).
 void drain();
 
-// Drop back to Idle (as stop_listening would) if the device has been
-// LISTENING for 15 s with no brain command in that time — a connected but
-// wedged brain would otherwise leave the wakeword paused forever. Call from
+// Drop back to Idle if the device has been LISTENING for 15 s, or SPEAKING
+// for 60 s, with no inbound brain frame in that time — a connected but wedged
+// brain would otherwise leave the wakeword paused forever — and tell the
+// brain ({"event":"listen_timeout"} / {"event":"speak_timeout"}). Call from
 // the main idle loop, after drain().
-void check_listening_watchdog();
+void check_turn_watchdog();
 
 // Relight the screen if it was turned off for sleep; no-op otherwise.
 // Called locally from the wake word / head-tap handlers so waking is

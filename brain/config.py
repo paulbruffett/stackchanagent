@@ -119,11 +119,16 @@ SPECS: dict[str, Spec] = {
     ),
     "MAX_UTTERANCE_MS": Spec(
         10000, "int", False, "capture",
-        "Hard cap on a single utterance length.",
+        "Hard cap on a single utterance length. Max 12000: the firmware gives "
+        "up on a listening turn after 15 s with no word from the brain.",
+        maximum=12000,
     ),
     "FOLLOW_UP_WINDOW_S": Spec(
         4.5, "float", False, "capture",
-        "How long the mic stays open after a reply without re-saying the wakeword.",
+        "How long the mic stays open after a reply without re-saying the "
+        "wakeword. Max 10: the firmware gives up on a listening turn after "
+        "15 s with no word from the brain.",
+        maximum=10,
     ),
     "FOLLOW_UP_GUARD_S": Spec(
         0.5, "float", False, "capture",
