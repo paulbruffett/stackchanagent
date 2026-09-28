@@ -69,6 +69,8 @@ SIG_CRC_OFFSET = 1196
 SIG_BLOCK_HEAD = bytes([0xE7, 0x02, 0x00, 0x00])
 
 DOWNLOAD_TTL_S = 600.0
+# Shortest reported ELF-hash prefix accepted as identifying a build.
+MIN_SHA_PREFIX = 8
 # Sent or mid-download with no word from the robot for this long: give up on
 # it. The firmware's HTTP read times out well before this.
 STALL_TIMEOUT_S = 120.0
@@ -444,8 +446,14 @@ class OtaManager:
         log.warning("ota #%d: %s", self.attempt, self.error)
 
     def _is_target(self, fw_sha: Any) -> bool:
-        return (isinstance(fw_sha, str) and self.target is not None
-                and fw_sha.lower() == self.target.elf_sha256)
+        """Whether the robot's reported ELF hash is the image we sent. Firmware
+        built before CONFIG_APP_RETRIEVE_LEN_ELF_SHA=64 reports only the first
+        9 hex characters, so accept a prefix of at least MIN_SHA_PREFIX."""
+        if not isinstance(fw_sha, str) or self.target is None:
+            return False
+        reported = fw_sha.lower()
+        return (len(reported) >= MIN_SHA_PREFIX
+                and self.target.elf_sha256.startswith(reported))
 
     def _set(self, state: str, *, error: str = "", now: float | None = None) -> None:
         self.state = state

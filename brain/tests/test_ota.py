@@ -251,6 +251,24 @@ class TestOtaFlow:
         mgr.on_boot("1.4.1", "x", "cd" * 32, True, now=90.0)
         assert mgr.state == "done"
 
+    def test_short_hash_from_older_firmware_matches_by_prefix(self, mgr):
+        # Seen live: firmware built with the ESP-IDF default reports only 9
+        # hex characters of the ELF hash; the update succeeded but was judged
+        # "rolled back".
+        elf = "6c3b52d6da7feca79f8b33d499b3bbf2886801a2c8610e40b39829ecc82c6a41"
+        _sent(mgr, elf=elf)
+        mgr.on_event({"id": 1, "state": "rebooting"}, now=30.0)
+        mgr.on_boot("959e48f", "x", elf[:9], False, now=45.0)
+        assert mgr.state == "confirming"
+        mgr.on_event({"state": "confirmed", "fw_sha": elf[:9]}, now=80.0)
+        assert mgr.state == "done"
+
+    def test_too_short_a_hash_prefix_is_not_a_match(self, mgr):
+        _sent(mgr, elf="cd" * 32)
+        mgr.on_event({"id": 1, "state": "rebooting"}, now=30.0)
+        mgr.on_boot("1.4.1", "x", "cdc", True, now=45.0)
+        assert mgr.state == "failed"
+
     def test_same_version_different_build_is_a_rollback(self, mgr):
         _sent(mgr, elf="cd" * 32)
         mgr.on_event({"id": 1, "state": "rebooting"}, now=30.0)

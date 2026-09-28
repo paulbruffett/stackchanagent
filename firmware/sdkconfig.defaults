@@ -99,3 +99,6 @@ CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
 # Logs on the USB-C port (UART0 is on header pins nobody has wired).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Report the full app ELF SHA-256 (the brain matches OTA images on it); the
+# default is only the first 9 hex characters.
+CONFIG_APP_RETRIEVE_LEN_ELF_SHA=64

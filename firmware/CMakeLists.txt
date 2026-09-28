@@ -2,7 +2,19 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VER "1.4.1")
+# The firmware version is the git commit it was built from (e.g. "a1b2c3d",
+# or "a1b2c3d-dirty" with uncommitted changes), so the console's "robot is
+# running X" means something. The OTA success check uses the ELF SHA-256, not
+# this; it's for humans. Falls back to the old fixed string outside a checkout.
+execute_process(
+    COMMAND git describe --always --dirty --abbrev=7
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE PROJECT_VER
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT PROJECT_VER)
+    set(PROJECT_VER "1.4.1")
+endif()
 add_definitions(-DFIRMWARE_VERSION=\"${PROJECT_VER}\")
 
 # Add this line to disable the specific warning
