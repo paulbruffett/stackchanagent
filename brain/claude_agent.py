@@ -153,20 +153,30 @@ def _opening(user_text: str, follow_up: bool) -> str:
 ToolObserver = Callable[[str, Any], None]
 
 
-def _strip_brackets(text: str, depth: int) -> tuple[str, int]:
-    """Drop any text inside [square brackets], tracking nesting `depth`
-    across streamed chunks. Returns (text_outside_brackets, new_depth).
-    A '[' with no matching ']' suppresses the rest of the turn — fine,
-    since the model only brackets non-spoken meta-commentary."""
+def _strip_brackets(text: str, state: int) -> tuple[str, int]:
+    """Drop text the model didn't mean to be spoken, tracking `state` across
+    streamed chunks: anything inside [square brackets] (meta-commentary;
+    nesting counted), and *asterisk actions* like "*Dances happily.*", which
+    TTS would otherwise read out. Each `*` toggles, so markdown **bold**
+    keeps its words — the doubled asterisks open and close an empty span,
+    even when split across chunks. A '[' with no matching ']' suppresses the
+    rest of the turn — fine, since the model only brackets non-spoken
+    meta-commentary.
+
+    `state` packs the bracket depth (state >> 1) and whether we're inside
+    asterisks (state & 1); start a turn at 0."""
+    depth, in_star = state >> 1, state & 1
     out: list[str] = []
     for ch in text:
         if ch == "[":
             depth += 1
         elif ch == "]":
             depth = max(0, depth - 1)
-        elif depth == 0:
+        elif ch == "*":
+            in_star ^= 1
+        elif depth == 0 and not in_star:
             out.append(ch)
-    return "".join(out), depth
+    return "".join(out), (depth << 1) | in_star
 
 
 def _pick_filler() -> str:
@@ -301,7 +311,7 @@ When the user's whole request is a device command (turning something on or off, 
 
 What the user says reaches you through speech recognition, which sometimes mishears — especially names. If a word doesn't make sense, act on the closest plausible request rather than taking it literally ("turn on office air" almost certainly means the office light), and only ask if it is genuinely ambiguous.
 
-Everything you output is spoken aloud verbatim, so output ONLY the words you want said. Never narrate your reasoning and never write square-bracketed commentary — brackets are reserved for incoming system context, never your output. To stay silent, output nothing at all (an empty reply). Do not write things like "[The user is just chatting, I'll stay quiet]" — that would be read aloud; just return nothing.
+Everything you output is spoken aloud verbatim, so output ONLY the words you want said. Never narrate your reasoning, never write actions or stage directions in asterisks (like *dances*), and never write square-bracketed commentary — brackets are reserved for incoming system context, never your output. To stay silent, output nothing at all (an empty reply). Do not write things like "[The user is just chatting, I'll stay quiet]" — that would be read aloud; just return nothing.
 
 Text in [square brackets] is system context, not the user speaking. Don't read it aloud.
 

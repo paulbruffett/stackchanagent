@@ -371,6 +371,24 @@ async def test_entirely_bracketed_reply_speaks_nothing(mem, make_agent, speaker)
     assert full == "" and spoken == []
 
 
+
+async def test_asterisk_action_is_not_spoken(mem, make_agent, speaker):
+    # Seen live: after a dance tool call the model replied "*Dances happily.*"
+    # and Piper read it out. Asterisk actions are stripped like brackets.
+    spoken, speak = speaker
+    sess = make_agent([("text_chunks", ["*Dances ", "happily.*"])])
+    full = await sess.respond("dance", speak)
+    assert spoken == [] and full == ""
+
+
+async def test_markdown_bold_keeps_its_words(mem, make_agent, speaker):
+    # Each `*` toggles, so doubled asterisks open and close an empty span —
+    # even with the pair split across chunks.
+    spoken, speak = speaker
+    sess = make_agent([("text_chunks", ["That is *", "*very good.*", "* Bye."])])
+    await sess.respond("how was it", speak)
+    assert spoken == ["That is very good.", "Bye."]
+
 # --- turn-state handshake with the firmware (busy indicator + ack) ----------
 
 async def test_slow_tool_turn_shows_then_clears_the_busy_indicator(
