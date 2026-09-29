@@ -301,6 +301,24 @@ def clean_mcp_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def ha_name_fallback(name: str, args: dict[str, Any], result: str) -> dict[str, Any] | None:
+    """Arguments to retry a Home Assistant intent with after HA found no
+    device by that name, or None. HA's matcher only takes entity names and
+    aliases, so a model's natural guess fails — `name="Office"` for the
+    Office room's light (its display name, but not a matchable one), or
+    `name="lamp", area="Office"`. Rooms do match: a lone name is retried as
+    the area, and a name beside an area is dropped. One retry, only on HA's
+    name-mismatch error."""
+    if not name.rsplit("__", 1)[-1].startswith("Hass") or "name" not in args:
+        return None
+    if not is_error_result(result) or "MatchFailedReason.NAME" not in result:
+        return None
+    retry = {k: v for k, v in args.items() if k != "name"}
+    if "area" not in retry:
+        retry["area"] = args["name"]
+    return retry
+
+
 async def dispatch(
     name: str, input_: dict[str, Any], ctx: ToolContext
 ) -> str:
@@ -323,7 +341,13 @@ async def _dispatch(
     # MCP tools (Phase 9b) take priority — they're namespaced (`mcp__…`)
     # so they can't collide with the native tools below.
     if ctx.mcp is not None and ctx.mcp.is_mcp_tool(name):
-        return await ctx.mcp.dispatch(name, clean_mcp_args(name, input_))
+        args = clean_mcp_args(name, input_)
+        result = await ctx.mcp.dispatch(name, args)
+        retry = ha_name_fallback(name, args, result)
+        if retry is not None:
+            log.info("%s: no device named %r — retrying as %s", name, args.get("name"), retry)
+            return await ctx.mcp.dispatch(name, retry)
+        return result
     if name == "set_expression":
         await ctx.ws.send(
             json.dumps({"cmd": "set_expression", "value": input_["expression"]})

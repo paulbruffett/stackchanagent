@@ -113,11 +113,40 @@ def _speech(resp: dict) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
+# Words that make an utterance a device command HA could place in a room.
+_DEVICE_WORDS = re.compile(r"\b(lights?|lamps?|switch(es)?|fans?)\b", re.IGNORECASE)
+
+
+def with_default_area(text: str, area: str) -> str | None:
+    """The utterance with ROBOT_AREA appended ("turn off light" → "turn off
+    light in the office"), or None when that doesn't apply: no area set, not
+    a light/lamp/switch/fan command, or a room is already named. HA's matcher
+    can't place a bare "turn off the light" — it doesn't know which room the
+    robot is in — so it answers no_valid_targets and the turn goes to the
+    LLM, which may guess a name HA rejects."""
+    area = area.strip()
+    if not area or not _DEVICE_WORDS.search(text):
+        return None
+    lowered = text.lower()
+    if area.lower() in lowered or re.search(r"\b(in|at) the\b", lowered):
+        return None
+    return f"{text.strip().rstrip('.!?')} in the {area}"
+
+
+async def _ask(text: str) -> tuple[str, str, str]:
+    """(response_type, speech, error code) for one conversation call."""
+    resp = await asyncio.wait_for(_process(text), TIMEOUT_S)
+    data = resp.get("data")
+    return (str(resp.get("response_type") or ""), _speech(resp),
+            data.get("code", "") if isinstance(data, dict) else "")
+
+
 async def try_handle(text: str) -> FastPathResult | None:
     """Ask HA's local intent matcher about `text`. Returns None if the fast
     path is off (no attempt made); otherwise a result whose `speech` is set
     only on a definite hit — a miss still carries the latency it cost."""
-    if not get_config().get("HA_FAST_PATH") or not text.strip():
+    cfg = get_config()
+    if not cfg.get("HA_FAST_PATH") or not text.strip():
         return None
     if not (os.environ.get("HA_TOKEN") or "").strip():
         return None
@@ -126,11 +155,12 @@ async def try_handle(text: str) -> FastPathResult | None:
         return None
     t0 = time.monotonic()
     try:
-        resp = await asyncio.wait_for(_process(text), TIMEOUT_S)
-        rtype = str(resp.get("response_type") or "")
-        speech = _speech(resp)
-        data = resp.get("data")
-        code = data.get("code", "") if isinstance(data, dict) else ""
+        rtype, speech, code = await _ask(text)
+        if rtype not in TRUSTED and code == "no_valid_targets":
+            placed = with_default_area(text, str(cfg.get("ROBOT_AREA")))
+            if placed is not None:
+                log.info("ha fast path: no target — retrying as %r", placed)
+                rtype, speech, code = await _ask(placed)
     except Exception as e:
         latency_ms = int((time.monotonic() - t0) * 1000)
         log.warning("ha fast path unavailable (%r, %d ms) — to LLM", e, latency_ms)
