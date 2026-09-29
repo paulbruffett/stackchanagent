@@ -202,6 +202,12 @@ SPECS: dict[str, Spec] = {
         "0 = off.",
         minimum=0, maximum=1,
     ),
+    "ROBOT_AREA": Spec(
+        "", "str", False, "tools",
+        "The Home Assistant area (room) the robot is in, e.g. \"Office\". A "
+        "bare \"turn off the light\" that HA can't place is retried as \"… in "
+        "the <area>\" on the fast path. Empty = off.",
+    ),
     "DEFAULT_LOCATION": Spec(
         "Seattle, Washington", "str", False, "tools",
         "Default location for the weather tool when the user doesn't name one.",

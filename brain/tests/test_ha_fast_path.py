@@ -129,3 +129,39 @@ def test_vocabulary_takes_exposed_names_aliases_and_areas():
 
     # Curly apostrophes normalised and deduplicated case-insensitively.
     assert words == ["office light", "office lights", "Office", "Mary's room"]
+
+
+@pytest.mark.parametrize("text, area, expected", [
+    ("computer, turn off light.", "Office", "computer, turn off light in the Office"),
+    ("Turn on the lights", "Office", "Turn on the lights in the Office"),
+    ("turn off the lamp in the bedroom", "Office", None),   # a room is named
+    ("turn off the office light", "Office", None),          # the area itself is named
+    ("what's the weather", "Office", None),                 # not a device command
+    ("turn off light", "", None),                           # no area configured
+])
+def test_with_default_area(text, area, expected):
+    assert ha_fast_path.with_default_area(text, area) == expected
+
+
+async def test_unplaced_light_command_retries_with_robot_area(ha):
+    seen, state = ha
+    get_config().set("ROBOT_AREA", "Office")
+    replies = [_ha_reply("error", "Sorry, I am not aware of any area called", "no_valid_targets"),
+               _ha_reply("action_done", "Turned off the lights")]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=replies[len(seen) - 1])
+
+    ha_fast_path._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    got = await ha_fast_path.try_handle("turn off light")
+    assert got.speech == "Turned off the lights"
+    assert b"turn off light in the Office" in seen[1].read()
+
+
+async def test_no_retry_without_robot_area(ha):
+    seen, state = ha
+    get_config().set("ROBOT_AREA", "")
+    state["reply"] = _ha_reply("error", "x", "no_valid_targets")
+    got = await ha_fast_path.try_handle("turn off light")
+    assert got.speech is None and len(seen) == 1

@@ -21,3 +21,26 @@ def test_ha_zero_colour_temperature_dropped_but_brightness_zero_kept():
 
 def test_non_ha_tools_keep_zero_values():
     assert clean_mcp_args("mcp__weather__get_weather", {"days": 0, "location": ""}) == {"days": 0}
+
+
+def test_ha_name_miss_is_retried_as_area():
+    from tools import ha_name_fallback
+
+    miss = "[tool error] Error calling tool: <MatchFailedError ... MatchFailedReason.NAME: 1>"
+    assert ha_name_fallback("mcp__homeassistant__HassTurnOff",
+                            {"name": "Office", "domain": ["light"]}, miss) == {
+        "domain": ["light"], "area": "Office"}
+    # A name beside an area: drop the name, keep the area.
+    assert ha_name_fallback("mcp__homeassistant__HassTurnOff",
+                            {"name": "lamp", "area": "Office"}, miss) == {"area": "Office"}
+
+
+def test_ha_name_fallback_only_on_name_mismatch():
+    from tools import ha_name_fallback
+
+    other = "[tool error] Error calling tool: Failed to call turn_on for: ['light.office']"
+    assert ha_name_fallback("mcp__homeassistant__HassTurnOff", {"name": "Office"}, other) is None
+    assert ha_name_fallback("mcp__homeassistant__HassTurnOff", {"name": "Office"}, "ok") is None
+    miss = "[tool error] MatchFailedReason.NAME"
+    assert ha_name_fallback("mcp__weather__get_weather", {"name": "x"}, miss) is None
+    assert ha_name_fallback("mcp__homeassistant__HassTurnOff", {"area": "Office"}, miss) is None
