@@ -11,6 +11,7 @@
  * can call: set_expression, look_at (set_motion_rate not yet wired
  * firmware-side; IdleMotionModifier install is Phase 6).
  */
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,42 @@ static constexpr int BRAIN_PORT = CONFIG_BRAIN_PORT;
 // URL would otherwise only ever reach the UART — useless to an owner whose
 // robot is sitting on a desk with no serial cable.
 static std::unique_ptr<uitk::lvgl_cpp::Label> net_status_label;
+
+// Double-tap detection on the head sensor. A second press inside the window
+// is a double tap; a press closer than the min gap is sensor flicker and is
+// ignored. Both are first guesses — tune on the device.
+static constexpr uint32_t kDoubleTapWindowMs = 450;
+static constexpr uint32_t kDoubleTapMinGapMs = 120;
+// millis() of a first press still waiting to see if a second follows; 0 = none.
+// Written by the head-touch task, claimed by whichever of it (double tap) or
+// the idle loop (window expired → single tap) gets there first.
+static std::atomic<uint32_t> g_pending_tap_ms{0};
+static uint32_t g_last_tap_ms = 0;  // head-touch task only
+
+// Single head tap → talk. Treated exactly like the wake word: relight the
+// screen if asleep, notify the brain, and start listening. Gated to IDLE so
+// a touch can't interrupt an active turn. Runs on the idle loop, outside the
+// LVGL lock (wake_face takes it itself).
+static void on_single_tap()
+{
+    // A waiting desktop permission prompt takes priority: tap = approve
+    // (decision "once"), and does NOT start a listening turn.
+    if (agent::buddy_ble::prompt_pending()) {
+        agent::buddy_ble::approve_pending();
+        mclog::tagInfo(TAG, "head tap → approve buddy prompt");
+        return;
+    }
+    if (agent::state::current() != agent::state::Mode::Idle) return;
+    agent::commands::wake_face();
+    // Same reasoning as the wakeword path: don't enter LISTENING unless
+    // the brain heard the tap.
+    if (!agent::transport::send_event_json("{\"event\":\"tap\"}")) {
+        mclog::tagWarn(TAG, "head tap dropped — brain link down");
+        return;
+    }
+    agent::state::transition(agent::state::Mode::Listening);
+    mclog::tagInfo(TAG, "head tap → listening");
+}
 
 static void set_net_status(const std::string& msg)
 {
@@ -165,34 +202,32 @@ extern "C" void app_main(void)
     agent::wakeword::start();
     agent::mic_pump::start();
 
-    // Head tap → talk. The capacitive head sensor emits HeadPetGesture::Press
-    // on a touch-down (the avatar's HeadPet modifier only reacts to swipes, so
-    // Press is unused). Treat a debounced Press while idle exactly like the
-    // wake word: relight the screen if asleep, notify the brain, and start
-    // listening. Gated to IDLE so a touch can't interrupt an active turn.
+    // Head taps. The capacitive head sensor emits HeadPetGesture::Press on a
+    // touch-down (the avatar's HeadPet modifier only reacts to swipes, so
+    // Press is unused). The touch task only records presses; the idle loop
+    // below runs the single-tap action once the double-tap window closes.
+    //   single tap → talk (see on_single_tap above)
+    //   double tap → {"event":"double_tap"}; the brain toggles a light
     GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
         if (gesture != HeadPetGesture::Press) return;
-        static uint32_t last_tap_ms = 0;
         uint32_t now = GetHAL().millis();
-        if (now - last_tap_ms < 800) return;  // debounce repeated touches
-        last_tap_ms = now;
-        // A waiting desktop permission prompt takes priority: tap = approve
-        // (decision "once"), and does NOT start a listening turn.
-        if (agent::buddy_ble::prompt_pending()) {
-            agent::buddy_ble::approve_pending();
-            mclog::tagInfo(TAG, "head tap → approve buddy prompt");
+        uint32_t first = g_pending_tap_ms.load();
+        if (first != 0 && now - first < kDoubleTapWindowMs) {
+            // Too soon after the first press: sensor flicker, not a tap.
+            if (now - first < kDoubleTapMinGapMs) return;
+            // Claim the pending tap so the idle loop can't also fire it.
+            if (!g_pending_tap_ms.compare_exchange_strong(first, 0)) return;
+            g_last_tap_ms = now;
+            if (agent::transport::send_event_json("{\"event\":\"double_tap\"}")) {
+                mclog::tagInfo(TAG, "head double tap → toggle light");
+            } else {
+                mclog::tagWarn(TAG, "head double tap dropped — brain link down");
+            }
             return;
         }
-        if (agent::state::current() != agent::state::Mode::Idle) return;
-        agent::commands::wake_face();
-        // Same reasoning as the wakeword path: don't enter LISTENING unless
-        // the brain heard the tap.
-        if (!agent::transport::send_event_json("{\"event\":\"tap\"}")) {
-            mclog::tagWarn(TAG, "head tap dropped — brain link down");
-            return;
-        }
-        agent::state::transition(agent::state::Mode::Listening);
-        mclog::tagInfo(TAG, "head tap → listening");
+        if (now - g_last_tap_ms < 800) return;  // debounce repeated touches
+        g_last_tap_ms = now;
+        g_pending_tap_ms.store(now ? now : 1);  // 0 means "none pending"
     });
 
     // Brain-offline badge: small red "OFFLINE" label in the top-right
@@ -247,6 +282,12 @@ extern "C" void app_main(void)
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();
         uint32_t now = GetHAL().millis();
+        // No second press inside the window: it was a single tap.
+        uint32_t tap = g_pending_tap_ms.load();
+        if (tap != 0 && now - tap >= kDoubleTapWindowMs
+            && g_pending_tap_ms.compare_exchange_strong(tap, 0)) {
+            on_single_tap();
+        }
         if (now >= next_pose_log_ms) {
             next_pose_log_ms = now + 500;
             auto angles = GetStackChan().motion().getCurrentAngles();

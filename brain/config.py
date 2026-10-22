@@ -189,6 +189,11 @@ SPECS: dict[str, Spec] = {
         "Seattle, Washington", "str", False, "tools",
         "Default location for the weather tool when the user doesn't name one.",
     ),
+    "DOUBLE_TAP_LIGHT": Spec(
+        "Office Light", "str", False, "tools",
+        "Home Assistant light that a double tap on the head toggles "
+        "(its name as Home Assistant's MCP server exposes it).",
+    ),
     # Note: HUE_BRIDGE_IP and HUE_TOKEN live in .env, not here — the Hue
     # MCP server reads them from its environment (HUE_BRIDGE_IP passes
     # through the child env; HUE_TOKEN is injected via the server's

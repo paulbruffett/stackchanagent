@@ -9,7 +9,7 @@ Wire protocol:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
       0x02  JPEG camera frame (phase 4+)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot"|"wakeword"|"vad_end", ...}
+      from ESP32: {"event": "boot"|"wakeword"|"tap"|"double_tap"|"vad_end", ...}
       to   ESP32: {"cmd": "stop_listening"|"start_speaking"|"stop_speaking"|
                           "set_expression"|"look_at"|"set_motion_rate"}
 """
@@ -44,6 +44,7 @@ from behavior import IdleBehavior
 from claude_agent import AgentSession, repair_memory
 from config import get_config, init_config
 from a2a_client import A2aClient
+from light_toggle import toggle_light
 from mcp_client import McpClient
 from policy import effective_sleep_timeout, skin_for_rocky_mode
 from memory import Memory
@@ -603,6 +604,12 @@ def _on_wake_trigger(state: ConnState) -> None:
     state.last_activity_s = now
 
 
+async def _toggle_tap_light() -> None:
+    name = get_config().get("DOUBLE_TAP_LIGHT")
+    result = await toggle_light(mcp_client, name)
+    log.info("double tap → toggle %r: %s", name, result)
+
+
 async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
     """Run an agent turn triggered by a non-speech event (new face seen).
     Bypasses STT and uses a stage-direction message instead."""
@@ -822,6 +829,10 @@ async def handle(ws: ServerConnection) -> None:
                     # firmware has already switched itself to LISTENING and
                     # relit the screen on the same trigger.
                     _on_wake_trigger(state)
+                elif event == "double_tap":
+                    # Head double tap: toggle a light directly through the
+                    # Home Assistant MCP tools, no LLM turn.
+                    spawn(_toggle_tap_light(), "toggle_light")
                 elif event == "buddy_prompt":
                     # The firmware's BLE buddy reports whether a permission
                     # prompt is waiting on the device, so _should_sleep can

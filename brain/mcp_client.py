@@ -429,6 +429,11 @@ class McpClient:
     def is_mcp_tool(self, name: str) -> bool:
         return name in self._index
 
+    def find_tool(self, raw: str) -> str | None:
+        """The namespaced name of the first connected tool whose own name is
+        `raw` (e.g. HA's "HassTurnOn"), for callers that skip the LLM."""
+        return next((full for full, (_, r) in self._index.items() if r == raw), None)
+
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
         entry = self._index.get(name)
         if entry is None:
