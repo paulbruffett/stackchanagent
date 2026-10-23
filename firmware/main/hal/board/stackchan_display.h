@@ -40,6 +40,9 @@ public:
 
     // Override Display methods to control Robot
     virtual void SetEmotion(const char* emotion) override;
+    // Tell the blink modifier to re-read the eyes' base weights, as SetEmotion
+    // does after changing them. Caller holds the LVGL lock.
+    void ResyncBlinkEyeWeights();
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;

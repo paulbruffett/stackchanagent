@@ -60,7 +60,7 @@ $$("nav button").forEach((b) =>
     if (b.dataset.tab === "config") loadConfig();
     if (b.dataset.tab === "persona") loadPersona();
     if (b.dataset.tab === "mcp") loadMcp();
-    if (b.dataset.tab === "a2a") loadA2a();
+    if (b.dataset.tab === "firmware") loadFirmware();
   })
 );
 
@@ -71,6 +71,26 @@ function setStatus(msg, cls = "") {
 }
 
 // ---- config ----
+// Model knobs get OpenRouter's tool-capable models as suggestions (a
+// <datalist>, so any id can still be typed). Fetched once per page load; an
+// empty list just means no suggestions.
+const MODEL_KEYS = new Set(["MODEL", "SUMMARY_MODEL"]);
+let modelList = null;
+async function modelDatalist() {
+  let dl = $("#or-models");
+  if (dl) return dl;
+  dl = el("datalist", { id: "or-models" });
+  document.body.append(dl);
+  if (!modelList) {
+    try { modelList = await (await fetch("/api/models")).json(); } catch { modelList = []; }
+  }
+  for (const m of modelList) {
+    const ctx = m.context_length ? ` · ${Math.round(m.context_length / 1000)}k ctx` : "";
+    dl.append(el("option", { value: m.id, label: `${m.name}${ctx}` }));
+  }
+  return dl;
+}
+
 async function loadConfig() {
   const { items } = await (await fetch("/api/config")).json();
   const root = $("#config");
@@ -81,6 +101,7 @@ async function loadConfig() {
     const sec = el("div", { className: "group" }, el("h2", { textContent: g }));
     for (const it of rows) {
       const input = el("input", { value: it.value });
+      if (MODEL_KEYS.has(it.key)) modelDatalist().then((dl) => input.setAttribute("list", dl.id));
       const label = el("div", { className: "k" });
       label.append(it.key, el("small", { textContent: it.help }));
       const save = el("button", { className: "act", textContent: "Save" });
@@ -156,14 +177,59 @@ async function savePersona(prompt) {
 }
 
 // ---- memories ----
+// ---- timers ----
+// Active voice timers/reminders with a live countdown and a cancel button.
+// The countdown runs off the brain's clock (offset from its "now"), and stops
+// ticking once the list is no longer on the page.
+const fmtLeft = (s) => {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mmss = `${String(m).padStart(h ? 2 : 1, "0")}:${String(sec).padStart(2, "0")}`;
+  return h ? `${h}:${mmss}` : mmss;
+};
+
+function renderTimers({ now, timers }) {
+  const skew = now - Date.now() / 1000;
+  const sec = el("div", { className: "group" }, el("h2", { textContent: `Timers (${timers.length})` }));
+  if (!timers.length) sec.append(el("div", { className: "muted", textContent: "No timers or reminders set." }));
+  const clocks = [];
+  for (const t of timers) {
+    const left = el("span", { className: "muted" });
+    clocks.push([left, t.fire_ts]);
+    const cancel = el("button", { className: "ghost", textContent: "cancel" });
+    cancel.addEventListener("click", async () => {
+      const r = await fetch(`/api/timers/${t.id}`, { method: "DELETE" });
+      setStatus(r.ok ? "timer cancelled" : "cancel failed", r.ok ? "ok" : "err");
+      loadMemories();
+    });
+    const name = t.label || (t.kind === "reminder" ? "reminder" : "timer");
+    sec.append(el("div", { className: "card fact" },
+      el("span", { className: "pill", textContent: t.kind }),
+      el("span", { textContent: `${name} · ${t.describe}`, style: "flex:1" }),
+      left, cancel));
+  }
+  const paint = () => {
+    for (const [node, fire] of clocks) node.textContent = fmtLeft(fire - (Date.now() / 1000 + skew));
+  };
+  paint();
+  if (clocks.length) {
+    const iv = setInterval(() => (sec.isConnected ? paint() : clearInterval(iv)), 1000);
+  }
+  return sec;
+}
+
 async function loadMemories() {
   const root = $("#memories");
   root.innerHTML = "";
-  const [facts, summaries, turns] = await Promise.all([
+  const [facts, summaries, turns, tmr] = await Promise.all([
     (await fetch("/api/memories/facts")).json(),
     (await fetch("/api/memories/summaries")).json(),
     (await fetch("/api/memories/turns?limit=40")).json(),
+    (await fetch("/api/timers")).json(),
   ]);
+
+  // --- timers ---
+  root.append(renderTimers(tmr));
 
   // --- facts ---
   const fsec = el("div", { className: "group" }, el("h2", { textContent: `Permanent knowledge (${facts.facts.length})` }));
@@ -263,7 +329,7 @@ async function loadMemories() {
   for (const t of turns.turns) {
     tsec.append(el("div", { className: "card" },
       el("div", { className: "muted", textContent: `#${t.id} ${t.role}` }),
-      el("div", { innerHTML: renderContent(t.content) })));
+      el("div", { innerHTML: renderTurn(t) })));
   }
   root.append(tsec);
 }
@@ -333,6 +399,20 @@ async function compactFacts() {
     el("div", { className: "toolbar" }, el("span", { style: "flex:1" }), cancel, apply),
   );
   out.append(card);
+}
+
+// A stored turn: OpenAI chat messages carry tool calls beside the content
+// (assistant) or answer one (role "tool"); pre-OpenRouter rows have
+// Anthropic block-list content, which renderContent still handles.
+function renderTurn(t) {
+  const parts = [];
+  if (t.role === "tool") parts.push(`<span class="pill">result</span>${esc(t.content ?? "")}`);
+  else if (t.content != null && t.content !== "") parts.push(renderContent(t.content));
+  for (const c of t.tool_calls || []) {
+    const fn = c.function || {};
+    parts.push(`<span class="pill">tool ${esc(fn.name ?? "?")}</span>${esc(fn.arguments ?? "")}`);
+  }
+  return parts.join("<br>");
 }
 
 function renderContent(content) {
@@ -406,7 +486,7 @@ async function loadMcp() {
     field("name", "name (e.g. weather)"),
     field("command", "command (stdio, e.g. python)"),
     field("args", "args, space-separated (e.g. mcp_servers/weather.py)"),
-    field("env_ref", "secret env var name (optional, e.g. HUE_TOKEN)"),
+    field("env_ref", "secret env var name (optional, e.g. HA_TOKEN)"),
   );
   const add = el("button", { className: "act", textContent: "Add (stdio)" });
   add.addEventListener("click", async () => {
@@ -423,84 +503,6 @@ async function loadMcp() {
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     setStatus(r.ok ? "server added — Reload to connect" : "add failed", r.ok ? "ok" : "err");
     loadMcp();
-  });
-  form.append(add);
-  root.append(form);
-}
-
-// ---- A2A ----
-async function loadA2a() {
-  const root = $("#a2a");
-  root.innerHTML = "";
-  const data = await (await fetch("/api/a2a/servers")).json();
-
-  const bar = el("div", { className: "toolbar" });
-  const reload = el("button", { className: "act", textContent: "Reload A2A" });
-  reload.addEventListener("click", async () => {
-    setStatus("reloading A2A…");
-    const r = await fetch("/api/a2a/reload", { method: "POST" });
-    setStatus(r.ok ? "A2A reloaded" : "reload failed", r.ok ? "ok" : "err");
-    loadA2a();
-  });
-  bar.append(el("div", { className: "muted",
-    textContent: "Agent2Agent endpoints. Edits persist immediately; click Reload to (re)fetch agent cards and apply." }),
-    el("span", { style: "flex:1" }), reload);
-  root.append(bar);
-
-  for (const s of data.servers) {
-    const card = el("div", { className: "card" });
-    const dot = s.connected ? `<span class="ok">●</span>` : (s.enabled ? `<span class="err">●</span>` : `<span class="muted">○</span>`);
-    const head = el("div", { className: "fact" });
-    head.innerHTML = `${dot} <b>${esc(s.name)}</b>` + (s.agent ? ` <span class="muted">${esc(s.agent)}</span>` : "");
-    const toggle = el("button", { className: "ghost",
-      textContent: s.enabled ? "disable" : "enable" });
-    toggle.addEventListener("click", async () => {
-      await fetch(`/api/a2a/servers/${s.id}`, { method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: !s.enabled }) });
-      loadA2a();
-    });
-    const del = el("button", { className: "ghost", textContent: "✕" });
-    del.addEventListener("click", async () => {
-      if (!confirm(`Delete A2A server "${s.name}"?`)) return;
-      await fetch(`/api/a2a/servers/${s.id}`, { method: "DELETE" });
-      loadA2a();
-    });
-    head.append(el("span", { style: "flex:1" }), toggle, del);
-    card.append(head);
-
-    card.append(el("div", { className: "muted", style: "font-family:ui-monospace,monospace;font-size:12px;margin-top:6px",
-      textContent: s.url }));
-    if (s.env_ref) card.append(el("div", { className: "muted", innerHTML: `bearer token env: <code>${esc(s.env_ref)}</code> (value from .env)` }));
-    if (s.error) card.append(el("div", { className: "err", textContent: s.error }));
-    if (s.delegates && s.delegates.length)
-      card.append(el("div", { innerHTML: s.delegates.map((d) => `<span class="pill">${esc(d)}</span>`).join("") }));
-    root.append(card);
-  }
-
-  // add-server form
-  const form = el("div", { className: "group" }, el("h2", { textContent: "Add endpoint" }));
-  const f = {};
-  const field = (key, ph) => { const i = el("input", { placeholder: ph, style: "width:100%;margin-bottom:6px" }); f[key] = i; return i; };
-  form.append(
-    field("name", "name (e.g. hermes)"),
-    field("url", "url (agent base or /.well-known/agent.json, e.g. http://192.168.4.30:8080)"),
-    field("env_ref", "bearer token env var name (optional)"),
-  );
-  const add = el("button", { className: "act", textContent: "Add" });
-  add.addEventListener("click", async () => {
-    const body = {
-      name: f.name.value.trim(),
-      url: f.url.value.trim(),
-      env_ref: f.env_ref.value.trim() || null,
-      enabled: true,
-    };
-    if (!body.name) { setStatus("name required", "err"); return; }
-    if (!body.url) { setStatus("url required", "err"); return; }
-    const r = await fetch("/api/a2a/servers", { method: "POST",
-      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    setStatus(r.ok ? "endpoint added — Reload to connect" : "add failed", r.ok ? "ok" : "err");
-    loadA2a();
   });
   form.append(add);
   root.append(form);
@@ -524,11 +526,95 @@ function appendLog(item) {
   if (near) out.scrollTop = out.scrollHeight;
 }
 
+// ---- firmware (OTA) ----
+// Upload build/stack-chan.bin, then "Send to robot": the brain queues it,
+// sends it between conversations, and the robot downloads, flashes and
+// reboots. Progress comes back as the robot's ota events; poll while it runs.
+let fwPoll = null;
+// Builds are told apart by their ELF SHA-256 (the version string rarely
+// changes); a 12-hex prefix is enough to read, the brain compares all of it.
+const fwSha = (h) => (h ? h.slice(0, 12) : "?");
+const fwDesc = (i) => i ? `${i.project} ${i.version} · ${fwSha(i.elf_sha256)} · built ${i.built} · ${(i.size / 1048576).toFixed(2)} MB` : "—";
+const FW_BUSY = ["queued", "sent", "downloading", "rebooting", "confirming"];
+
+async function loadFirmware() {
+  const res = await fetch("/api/firmware");
+  if (!res.ok) { $("#firmware").textContent = "firmware updates unavailable"; return; }
+  renderFirmware(await res.json());
+}
+
+function fwRow(label, ...kids) {
+  return el("div", { className: "row" }, el("div", { className: "k", textContent: label }), ...kids);
+}
+
+function renderFirmware(st) {
+  const root = $("#firmware");
+  root.innerHTML = "";
+  const sec = el("div", { className: "group" }, el("h2", { textContent: "Update firmware" }));
+  const robot = st.robot ? `${st.robot.version} · ${fwSha(st.robot.elf_sha256)} · built ${st.robot.built}`
+    : "unknown (no boot report since the brain started)";
+  sec.append(fwRow("Robot is running", el("span", { textContent: robot })));
+  sec.append(fwRow("Uploaded image", el("span", { textContent: fwDesc(st.stored) })));
+  for (const w of (st.stored && st.stored.warnings) || [])
+    sec.append(el("div", { className: "err", textContent: "warning: " + w }));
+
+  const busy = FW_BUSY.includes(st.state);
+  const file = el("input", { type: "file", accept: ".bin" });
+  const up = el("button", { className: "ghost", textContent: "Upload", disabled: busy });
+  up.addEventListener("click", async () => {
+    if (!file.files.length) { setStatus("pick build/stack-chan.bin first", "err"); return; }
+    const body = new FormData();
+    body.append("file", file.files[0]);
+    setStatus("uploading…");
+    const r = await fetch("/api/firmware", { method: "POST", body });
+    const j = await r.json();
+    if (!r.ok) { setStatus(`upload refused: ${j.detail}`, "err"); return; }
+    setStatus("firmware uploaded", "ok");
+    renderFirmware(j);
+  });
+  const send = el("button", { className: "act", textContent: "Send to robot", disabled: busy || !st.stored });
+  send.addEventListener("click", async () => {
+    if (!confirm(`Flash ${fwDesc(st.stored)} to the robot? It reboots when done.`)) return;
+    const r = await fetch("/api/firmware/send", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { setStatus(`send refused: ${j.detail}`, "err"); return; }
+    setStatus("update queued — sent at the next quiet moment", "ok");
+    renderFirmware(j);
+  });
+  const row = el("div", { className: "row" }, file, up, el("span", { style: "flex:1" }));
+  if (st.state === "queued") {
+    const cancel = el("button", { className: "ghost", textContent: "Cancel update" });
+    cancel.addEventListener("click", async () => {
+      const r = await fetch("/api/firmware/cancel", { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) { setStatus(`cancel refused: ${j.detail}`, "err"); loadFirmware(); return; }
+      setStatus("update cancelled", "ok");
+      renderFirmware(j);
+    });
+    row.append(cancel);
+  }
+  row.append(send);
+  sec.append(row);
+
+  let line = st.state;
+  if (st.state === "downloading") line += ` ${st.pct}%`;
+  if (st.state === "queued") line += " (waiting for the robot to be idle)";
+  if (st.state === "confirming") line += " (new image up; waiting for it to confirm itself)";
+  if (st.state === "done") line += ` — robot is running ${fwDesc(st.target)}`;
+  if (st.error) line += ` — ${st.error}`;
+  const cls = st.state === "failed" ? "err" : st.state === "done" ? "ok" : "";
+  sec.append(fwRow("Update status", el("span", { className: cls, textContent: line })));
+  root.append(sec);
+
+  clearTimeout(fwPoll);
+  if (busy && root.classList.contains("active")) fwPoll = setTimeout(loadFirmware, 2000);
+}
+
 // ---- live transaction feed ----
 function appendTurn(t) {
   const list = $("#tx-list");
   const card = el("div", { className: "card tx" });
-  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") }));
+  card.append(el("div", { className: "muted", textContent: fmtTs(t.ts) + (t.follow_up ? " · follow-up" : "") + (t.path === "ha" ? " · home assistant" : "") + (t.path === "timer" ? " · timer" : "") }));
   card.append(el("div", {}, el("span", { className: "t", textContent: "“" + (t.transcript || "") + "”" })));
   if (t.tools && t.tools.length)
     card.append(el("div", { innerHTML: t.tools.map((x) => `<span class="pill">${esc(x.name)} ${esc(JSON.stringify(x.input))}</span>`).join("") }));
@@ -536,6 +622,7 @@ function appendTurn(t) {
   else card.append(el("div", { className: "muted", textContent: "(silent)" }));
   const meta = [];
   if (t.stt_ms != null) meta.push(`stt ${t.stt_ms}ms`);
+  if (t.ha_ms != null) meta.push(`ha ${t.ha_ms}ms`);
   if (t.total_ms != null) meta.push(`turn ${t.total_ms}ms`);
   card.append(el("div", { className: "meta", textContent: meta.join(" · ") }));
   list.prepend(card);
@@ -565,6 +652,29 @@ function connectFeed(path, onItem) {
   };
 }
 
+// ---- device status (header) ----
+// Battery / charging / volume from the robot's last report (every 60 s, or on
+// a charging flip). Low battery shows in the warning colour; the robot itself
+// never says so unprompted.
+async function loadDevice() {
+  const d = $("#device");
+  let j;
+  try {
+    // A background poll: window.fetch, not the wrapper above, so a 401 here
+    // never pops the token prompt — user-initiated loads do that.
+    const r = await window.fetch("/api/device", { headers: { "x-stackchan-token": TOKEN } });
+    if (!r.ok) return;
+    j = await r.json();
+  } catch { return; }
+  if (!j.connected) { d.textContent = "robot offline"; d.className = "muted"; return; }
+  const bat = j.battery == null ? "🔋 ?" : `🔋 ${j.battery}%${j.charging ? " ⚡" : ""}`;
+  const vol = j.volume == null ? "🔊 ?" : `🔊 ${j.volume}`;
+  d.textContent = `${bat}${j.low_battery ? " low" : ""} · ${vol}`;
+  d.className = j.low_battery ? "lvl-WARNING" : "muted";
+}
+
 loadConfig();
+loadDevice();
+setInterval(loadDevice, 30000);
 connectFeed("/ws/logs", appendLog);
 connectFeed("/ws/turns", appendTurn);

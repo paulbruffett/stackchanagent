@@ -17,6 +17,7 @@
 #include <stackchan/stackchan.h>
 #include <assets/lang_config.h>
 #include <hal/hal.h>
+#include <board.h>
 
 using namespace stackchan;
 using namespace stackchan::avatar;
@@ -372,6 +373,22 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
     auto blink_modifier = static_cast<BlinkModifier*>(stackchan.getModifier(blink_modifier_id_));
     if (blink_modifier) {
         blink_modifier->resyncEyeWeights();
+    }
+}
+
+void StackChanAvatarDisplay::ResyncBlinkEyeWeights()
+{
+    auto blink_modifier = static_cast<BlinkModifier*>(GetStackChan().getModifier(blink_modifier_id_));
+    if (blink_modifier) {
+        blink_modifier->resyncEyeWeights();
+    }
+}
+
+void hal_bridge::display_resync_blink()
+{
+    auto display = static_cast<StackChanAvatarDisplay*>(Board::GetInstance().GetDisplay());
+    if (display) {
+        display->ResyncBlinkEyeWeights();
     }
 }
 

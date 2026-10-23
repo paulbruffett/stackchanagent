@@ -29,10 +29,8 @@ TARGET_SR = 16000
 
 def resample_to_16k(pcm_int16: np.ndarray, src_sr: int) -> np.ndarray:
     """Polyphase resample an int16 PCM array to 16 kHz (the firmware codec
-    rate). Returns the input unchanged when it's already 16 kHz. Shared by
-    every TTS backend (Piper at 22050 Hz, Hume at 48000 Hz) so they all hit
-    the same anti-aliased path — linear interpolation aliases audibly on the
-    AW88298."""
+    rate). Returns the input unchanged when it's already 16 kHz. Polyphase,
+    not linear interpolation, which aliases audibly on the AW88298."""
     if src_sr == TARGET_SR:
         return pcm_int16
     g = gcd(TARGET_SR, src_sr)
@@ -64,8 +62,7 @@ class Synthesizer:
             # writes the two as separate non-atomic files. Gating the download
             # on the .onnx alone makes a power cut mid-fetch permanent: the
             # guard says "downloaded", the load raises on the missing config,
-            # and nothing ever re-downloads — leaving the robot mute, since
-            # Piper is also the fallback for every Hume failure.
+            # and nothing ever re-downloads — leaving the robot mute.
             cfg = onnx.with_name(onnx.name + ".json")
             if not (onnx.exists() and cfg.exists()):
                 log.info("downloading piper voice %s …", self.voice_name)

@@ -8,14 +8,14 @@ Two classes of knob:
   - hot   : read at the use site every time, so a write takes effect on
             the next turn/tick with no restart.
   - restart : bound when a long-lived object is constructed (the TTS
-            voice, the STT model, the Anthropic model name). Editing it
+            voice, the STT model). Editing it
             is persisted but only applies after a process restart; the
             UI surfaces this.
 
 Usage:
     from config import get_config
     cfg = get_config()
-    interval = cfg.get("LOOK_AROUND_INTERVAL_S")
+    timeout = cfg.get("SLEEP_TIMEOUT_S")
 
 `init_config(memory)` must be called once at startup (agent_server.main)
 before any `get_config()` call.
@@ -48,6 +48,14 @@ class Spec:
     # value that merely casts cleanly used to be persisted forever.
     minimum: float | None = None
     maximum: float | None = None
+    # str knobs: the allowed values (matched case-insensitively, stored
+    # lowercase).
+    choices: tuple[str, ...] | None = None
+    # str knobs holding an OpenRouter model id ("vendor/model"). An empty
+    # value is allowed only when the default is empty ("use the fallback").
+    # Catches a leftover Anthropic-era MODEL ("claude-haiku-4-5") that would
+    # otherwise 400 every turn.
+    model_id: bool = False
 
 
 # The knob catalog. Keys mirror the original module constant names so the
@@ -59,8 +67,23 @@ SPECS: dict[str, Spec] = {
         "Piper TTS voice model name.",
     ),
     "MODEL": Spec(
-        "claude-haiku-4-5", "str", True, "voice",
-        "Anthropic model for conversational turns.",
+        "openai/gpt-5.6-luna", "str", False, "voice",
+        "OpenRouter model id (vendor/model) for conversational turns; must "
+        "support tool calls. Read per turn — no restart needed.",
+        model_id=True,
+    ),
+    "SUMMARY_MODEL": Spec(
+        "", "str", False, "voice",
+        "OpenRouter model id (vendor/model) for background jobs: conversation "
+        "summaries, fact extraction and fact compaction. Empty = same as MODEL.",
+        model_id=True,
+    ),
+    "REASONING_EFFORT": Spec(
+        "low", "str", False, "voice",
+        "Reasoning effort sent to OpenRouter for models that reason: minimal, "
+        "low, medium or high. Higher is slower. Empty = don't send it (the "
+        "model's own default).",
+        choices=("", "minimal", "low", "medium", "high"),
     ),
     "STT_DEVICE": Spec(
         "cuda", "str", True, "voice",
@@ -96,11 +119,16 @@ SPECS: dict[str, Spec] = {
     ),
     "MAX_UTTERANCE_MS": Spec(
         10000, "int", False, "capture",
-        "Hard cap on a single utterance length.",
+        "Hard cap on a single utterance length. Max 12000: the firmware gives "
+        "up on a listening turn after 15 s with no word from the brain.",
+        maximum=12000,
     ),
     "FOLLOW_UP_WINDOW_S": Spec(
-        8.0, "float", False, "capture",
-        "How long the mic stays open after a reply without re-saying the wakeword.",
+        4.5, "float", False, "capture",
+        "How long the mic stays open after a reply without re-saying the "
+        "wakeword. Max 10: the firmware gives up on a listening turn after "
+        "15 s with no word from the brain.",
+        maximum=10,
     ),
     "FOLLOW_UP_GUARD_S": Spec(
         0.5, "float", False, "capture",
@@ -134,13 +162,12 @@ SPECS: dict[str, Spec] = {
         "(risks dropping a very short real follow-up).",
     ),
 
-    # --- Behavior / vision (hot) ----------------------------------------
+    # --- Behavior (hot) -------------------------------------------------
     "SLEEP_TIMEOUT_S": Spec(
         300.0, "float", False, "behavior",
         "Sleep after this many seconds with no interaction (conversation, "
-        "wake word, or head tap). Sleeping turns off the screen and stops "
-        "look-around + face detection until a wake word or tap. 0 = never "
-        "sleep.",
+        "wake word, or head tap). Sleeping turns off the screen until a wake "
+        "word or tap. 0 = never sleep.",
     ),
     "BUDDY_PROMPT_SLEEP_TIMEOUT_S": Spec(
         1800.0, "float", False, "behavior",
@@ -149,55 +176,47 @@ SPECS: dict[str, Spec] = {
         "sleep out from under an unanswered prompt. Never shortens "
         "SLEEP_TIMEOUT_S.",
     ),
-    "GREETING_COOLDOWN_S": Spec(
-        1800.0, "float", False, "behavior",
-        "Minimum time between proactive greetings.",
+    "BUDDY_ENABLED": Spec(
+        0, "int", False, "behavior",
+        "BLE link for Claude Desktop permission prompts (shown on the face, "
+        "approved with a head tap). Changing it reboots the robot (~15 s). "
+        "Off frees the radio for Wi-Fi audio. 0 = off, 1 = on.",
+        minimum=0, maximum=1,
     ),
-    "RECENT_INTERACTION_S": Spec(
-        90.0, "float", False, "behavior",
-        "Suppress greeting if the user spoke within this window.",
-    ),
-    "DETECT_INTERVAL_IDLE_S": Spec(
-        20.0, "float", False, "behavior",
-        "Seconds between face-detection passes when idle.",
-    ),
-    "LOOK_AROUND_INTERVAL_S": Spec(
-        180.0, "float", False, "behavior",
-        "Seconds between idle look-around sweeps.",
-    ),
-    "LOOK_AROUND_POSE_DURATION_S": Spec(
-        4.0, "float", False, "behavior",
-        "Dwell time at each look-around pose.",
-    ),
-    "LOOK_AROUND_SPEED": Spec(
-        350, "int", False, "behavior",
-        "Servo spring speed (0-1000) for look-around sweep poses; higher = "
-        "snappier glance. Centering and agent look_at keep the gentler "
-        "firmware default.",
-    ),
-    "CENTERING_COOLDOWN_S": Spec(
-        180.0, "float", False, "behavior",
-        "Lockout after centering on a face before the next centering.",
-    ),
-    "CENTERING_GAIN": Spec(
-        0.7, "float", False, "behavior",
-        "Under-centering factor (FOV is approximate).",
+    "SPEAKER_VOLUME": Spec(
+        70, "int", False, "behavior",
+        "Robot speaker volume, 0-100. Until set, the robot's own volume is "
+        "adopted on first report (a fresh brain never overrides it). Pushed "
+        "to the robot between conversations; the set_volume voice tool "
+        "writes it too.",
+        minimum=0, maximum=100,
     ),
 
     # --- MCP / tools (hot) ----------------------------------------------
+    "HA_FAST_PATH": Spec(
+        1, "int", False, "tools",
+        "Try Home Assistant's local intent matcher before the LLM. A definite "
+        "hit (a device action or state answer) is spoken straight back with "
+        "no LLM call; anything else falls through. Needs HA_TOKEN (and "
+        "optionally HA_URL) in .env. "
+        "0 = off.",
+        minimum=0, maximum=1,
+    ),
+    "ROBOT_AREA": Spec(
+        "", "str", False, "tools",
+        "The Home Assistant area (room) the robot is in, e.g. \"Office\". A "
+        "bare \"turn off the light\" that HA can't place is retried as \"… in "
+        "the <area>\" on the fast path. Empty = off.",
+    ),
+    "DOUBLE_TAP_LIGHT": Spec(
+        "Office Light", "str", False, "tools",
+        "Home Assistant device a double tap on the robot's head toggles, by "
+        "its friendly name. Needs HA_TOKEN in .env. Empty = off.",
+    ),
     "DEFAULT_LOCATION": Spec(
         "Seattle, Washington", "str", False, "tools",
         "Default location for the weather tool when the user doesn't name one.",
     ),
-    "DOUBLE_TAP_LIGHT": Spec(
-        "Office Light", "str", False, "tools",
-        "Home Assistant light that a double tap on the head toggles "
-        "(its name as Home Assistant's MCP server exposes it).",
-    ),
-    # Note: HUE_BRIDGE_IP and HUE_TOKEN live in .env, not here — the Hue
-    # MCP server reads them from its environment (HUE_BRIDGE_IP passes
-    # through the child env; HUE_TOKEN is injected via the server's
-    # env_ref). Set once out-of-band; see mcp_servers/README.md.
 
     # --- Responsiveness during slow tool calls (hot) --------------------
     # int 0/1 are used as booleans (the config layer has no bool type);
@@ -223,23 +242,21 @@ SPECS: dict[str, Spec] = {
         "while tool calls run, cleared when the reply begins. 1=on, 0=off. "
         "Requires firmware with the set_busy command.",
     ),
-    "FOLLOW_UP_THINKING": Spec(
-        1, "int", False, "responsiveness",
-        "Give the model a private extended-thinking channel on follow-up "
-        "and stage-direction (event) turns — the turns where it has to "
-        "judge whether speech is even directed at it. Reasoning then lands "
-        "in thinking (never spoken) instead of leaking into the spoken "
-        "reply, and 'stay silent' becomes an empty spoken turn. Initial "
-        "wake-word request/response turns never think (kept snappy). "
-        "1=on, 0=off. Adds some latency/tokens on those turns.",
-    ),
 
     # --- Memory / summarizer (hot) --------------------------------------
     "SUMMARIZE_TRIGGER": Spec(
         20, "int", False, "memory",
-        "Unsummarized-turn backlog that triggers a background fold into a "
-        "summary. Lower = summarize more eagerly (smaller prompts, more "
-        "LLM calls).",
+        "Unsummarized-turn backlog at which the next idle stretch "
+        "(SUMMARIZE_IDLE_S) folds it into a summary; at twice this it folds "
+        "between turns even mid-conversation. Lower = summarize more eagerly "
+        "(smaller prompts, more LLM calls).",
+        minimum=0,
+    ),
+    "SUMMARIZE_IDLE_S": Spec(
+        120.0, "float", False, "memory",
+        "Seconds of idle (no turn, no open mic) after a conversation before "
+        "the backlog is folded. Summarizing waits for the conversation to "
+        "end so its LLM calls never compete with a live turn.",
         minimum=0,
     ),
     "KEEP_RECENT_TURNS": Spec(
@@ -284,25 +301,6 @@ SPECS: dict[str, Spec] = {
         hidden=True,
     ),
 
-    # --- Rocky mode (hot) — Milestone 4 ---------------------------------
-    # Device-wide character mode: the Rocky persona (broken-English speech)
-    # plus, when a Hume voice is configured in .env, a cloud TTS voice.
-    # Degrades gracefully — persona-only on Piper when no Hume key is set.
-    "ROCKY_MODE": Spec(
-        0, "int", False, "rocky",
-        "Enable Rocky mode: the robot adopts the Rocky persona (broken "
-        "English, third-person self-reference, sentence-ending 'question'). "
-        "If HUME_API_KEY + a Hume voice are set in .env, speech also switches "
-        "to the Hume cloud voice; otherwise the persona runs on the normal "
-        "Piper voice. 1=on, 0=off. Also toggleable by voice ('rocky mode' / "
-        "'normal mode').",
-    ),
-    "ROCKY_SPEED": Spec(
-        1.25, "float", False, "rocky",
-        "Speaking-rate multiplier for the Hume Rocky voice (Hume only; no "
-        "effect on Piper). 1.0 = natural; the default speeds Rocky up a touch.",
-    ),
-
     # --- Persona (hot; edited via its own console panel, not the grid) ---
     "SYSTEM_PROMPT": Spec(
         "", "str", False, "persona",
@@ -327,6 +325,18 @@ def _coerce(spec: Spec, value: Any) -> Any:
         # as SYSTEM_PROMPT, surviving every restart.
         if not isinstance(value, str):
             raise TypeError(f"expected a string, got {type(value).__name__}")
+        if spec.choices is not None:
+            value = value.strip().lower()
+            if value not in spec.choices:
+                raise ValueError(f"{value!r} is not one of {spec.choices}")
+        if spec.model_id:
+            value = value.strip()
+            vendor, _, name = value.partition("/")
+            if value or spec.default:
+                if not (vendor and name) or any(c.isspace() for c in value):
+                    raise ValueError(
+                        f"{value!r} is not an OpenRouter model id (vendor/model)"
+                    )
         return value
     # bool is an int subclass and containers have a length, so both would
     # otherwise slip through int()/float() as 1/0 or a TypeError-free cast.
@@ -368,6 +378,10 @@ class Config:
         if spec is None:
             raise KeyError(f"unknown config key: {key}")
         return self._overrides.get(key, spec.default)
+
+    def is_set(self, key: str) -> bool:
+        """True if `key` has a stored override (vs. running on its default)."""
+        return key in self._overrides
 
     def set(self, key: str, value: Any) -> Any:
         spec = SPECS.get(key)

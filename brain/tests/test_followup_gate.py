@@ -55,3 +55,29 @@ def test_thresholds_are_boundary_inclusive():
     # >= / <= boundaries: exactly at the threshold drops.
     assert should_drop_follow_up(_t(no_speech_prob=0.6), 800, **K)[0] is True
     assert should_drop_follow_up(_t(avg_logprob=-0.8), 800, **K)[0] is True
+
+
+def test_strip_wake_word_drops_leading_computer_and_its_clipped_tail():
+    from stt import strip_wake_word
+
+    assert strip_wake_word("Computer, turn off the office light.") == "turn off the office light."
+    assert strip_wake_word("...puter turn off the office light") == "turn off the office light"
+    assert strip_wake_word("Hey computer. What time is it?") == "What time is it?"
+    assert strip_wake_word("Computer.") == ""
+
+
+def test_strip_wake_word_leaves_other_text_alone():
+    from stt import strip_wake_word
+
+    assert strip_wake_word("turn off the computer monitor") == "turn off the computer monitor"
+    assert strip_wake_word("computers are neat") == "computers are neat"
+    assert strip_wake_word("") == ""
+
+
+def test_starts_with_wake_word():
+    from stt import starts_with_wake_word
+
+    assert starts_with_wake_word("Computer, turn on the office light.")
+    assert starts_with_wake_word("...puter turn on the light")
+    assert not starts_with_wake_word("turn on the computer")
+    assert not starts_with_wake_word("Thanks.")

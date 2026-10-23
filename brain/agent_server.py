@@ -7,11 +7,17 @@ connection state machine.
 Wire protocol:
   - Binary frame, first byte = opcode:
       0x01  PCM audio frame (16 kHz, mono, s16le, 20 ms = 640 bytes)
-      0x02  JPEG camera frame (phase 4+)
   - Text frame: JSON control message, both directions.
-      from ESP32: {"event": "boot"|"wakeword"|"tap"|"double_tap"|"vad_end", ...}
-      to   ESP32: {"cmd": "stop_listening"|"start_speaking"|"stop_speaking"|
-                          "set_expression"|"look_at"|"set_motion_rate"}
+      from ESP32: {"event": "boot" (+ "buddy": bool, "fw"/"fw_built"/"fw_sha": str,
+                   "fw_valid": bool, + status fields)|
+                   "status" ("battery": 0-100|null, "charging": bool|null,
+                   "volume": 0-100)|"wakeword"|"tap"|"double_tap"|"buddy_prompt"|
+                   "listen_timeout"|"speak_timeout"|"alert_dismissed"|
+                   "ota" (+ "id", "state", "pct"/"error"/"fw_sha"), ...}
+      to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
+                          "stop_speaking"|"set_expression"|"look_at"|"set_busy"|
+                          "sleep"|"wake"|"set_buddy"|"set_volume"|"dance"|"ota"|
+                          "alert"}
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import socket
 import sys
 import time
 import wave
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -36,23 +43,30 @@ from websockets.asyncio.server import ServerConnection, serve
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
-# Load ANTHROPIC_API_KEY (and any other env) from the project root .env
-# before importing the agent module (which constructs the Anthropic client).
+from firmware_ota import OtaManager, firmware_base_url  # stdlib-only; no .env needed
+import timers  # pure (no env or model deps), so it can sit above load_dotenv
+
+# Load OPENROUTER_API_KEY (and any other env) from the project root .env
+# before importing the agent module (which constructs the OpenRouter client).
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from behavior import IdleBehavior
-from claude_agent import AgentSession, repair_memory
+from claude_agent import AgentSession, maybe_summarize, migrate_turn_format, repair_memory
 from config import get_config, init_config
-from a2a_client import A2aClient
-from light_toggle import toggle_light
+import ha_fast_path
 from mcp_client import McpClient
-from policy import effective_sleep_timeout, skin_for_rocky_mode
+from policy import (
+    DeviceStatus,
+    buddy_sync_action,
+    capture_is_stale,
+    effective_sleep_timeout,
+    low_battery_check,
+    ota_send_ready,
+    volume_sync_action,
+)
 from memory import Memory
-from stt import Transcriber, should_drop_follow_up
+from stt import Transcriber, should_drop_follow_up, starts_with_wake_word, strip_wake_word
 from tasks import spawn
 from tts import Synthesizer
-from tts_hume import HumeSynthesizer
-from vision import FaceDetector, FaceTracker
 from webui.app import create_app
 from webui.logbuf import LOGS, TURNS, WebUILogHandler, publish_turn
 
@@ -62,7 +76,6 @@ WEB_PORT = 8080
 MDNS_NAME = "stackchan-brain"
 
 OP_AUDIO = 0x01
-OP_JPEG = 0x02
 
 # Audio assumptions (must match firmware).
 SAMPLE_RATE = 16000
@@ -70,63 +83,15 @@ FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 320
 FRAME_BYTES = FRAME_SAMPLES * 2                  # 640
 
-# VAD / greeting / follow-up / detect-cadence knobs are now hot-editable
-# via config.py (web UI). Read with get_config().get("SPEECH_RMS") etc.
-# at the use sites below. Defaults live in config.py::SPECS.
-#
-# DETECT_INTERVAL_LOOK_AROUND_S stays a constant — during a sweep we want
-# detection on every frame, and 0.0 ("every frame") is not a useful knob.
-DETECT_INTERVAL_LOOK_AROUND_S = 0.0    # 0 = every frame (~1.5 s)
+# VAD / follow-up / sleep knobs are hot-editable via config.py (web UI).
+# Read with get_config().get("SPEECH_RMS") etc. at the use sites below.
+# Defaults live in config.py::SPECS.
 
 log = logging.getLogger("brain")
 
 # Lazy globals — one model load per process.
 stt = Transcriber()
 tts = Synthesizer()
-# Rocky-mode cloud voice (Milestone 4). Lazy — no HTTP client until first
-# use, and reports unavailable when no Hume key/voice is in .env, so this is
-# harmless to construct even with no Hume account.
-hume_tts = HumeSynthesizer()
-# Debounce so a Rocky-mode-without-Hume run logs the degradation once, not
-# per sentence.
-_rocky_no_hume_warned = False
-# Rolling Hume reliability tally (since process start). Reported on every
-# fallback so the real flake rate is visible from the log without a separate
-# metric — decide whether the mid-reply voice-flip is frequent enough to
-# mitigate off data, not off a single 500.
-_hume_ok = 0
-_hume_fallback = 0
-
-
-def _synthesize(sentence: str, use_rocky: bool, speed: float) -> bytes:
-    """Synthesize one sentence to 16 kHz PCM in a worker thread. In Rocky
-    mode with a Hume voice configured, use Hume; any Hume failure (network,
-    quota, malformed stream) falls back to Piper for that sentence so audio
-    is never dropped. Without Rocky mode — or without a Hume key — this is
-    plain Piper."""
-    global _rocky_no_hume_warned, _hume_ok, _hume_fallback
-    if use_rocky:
-        if hume_tts.available:
-            try:
-                pcm = hume_tts.synthesize(sentence, speed=speed)
-                _hume_ok += 1
-                return pcm
-            except Exception:
-                _hume_fallback += 1
-                total = _hume_ok + _hume_fallback
-                log.warning(
-                    "hume tts failed; falling back to piper "
-                    "(fallbacks %d/%d = %.1f%%)",
-                    _hume_fallback, total, 100.0 * _hume_fallback / total,
-                    exc_info=True,
-                )
-        elif not _rocky_no_hume_warned:
-            log.warning(
-                "ROCKY_MODE on but no Hume voice configured — persona active, "
-                "voice stays Piper (set HUME_API_KEY + a voice in .env)"
-            )
-            _rocky_no_hume_warned = True
-    return tts.synthesize(sentence)
 # Single shared Memory across all WS connections, so the robot
 # remembers conversations even after a disconnect/reconnect or process
 # restart. Sqlite handles file locking; only one process should write.
@@ -134,14 +99,21 @@ memory = Memory()
 # Shared MCP client (Phase 9b): one set of server connections for the
 # whole process. Started in main(); tools merged into every agent turn.
 mcp_client = McpClient(memory)
-# Shared A2A client (Phase 9c): connects to Agent2Agent servers (e.g.
-# Hermes) and surfaces their sub-agents as delegation tools in every turn.
-a2a_client = A2aClient(memory)
 # Live agent sessions, one per connected firmware WebSocket (normally exactly
 # one). The web console edits durable history; a session hydrates its thread
 # once at construction, so the console needs a way to reach the in-memory copy
 # — see resync_live_sessions.
 live_sessions: set[AgentSession] = set()
+# Connected firmware links (normally one), newest last, for the console's
+# device panel.
+live_conns: list["ConnState"] = []
+
+# Firmware updates: the console uploads and queues an image, the idle ticker
+# sends it between conversations, the firmware's ota/boot events report back.
+ota = OtaManager(base_url=lambda: firmware_base_url(_web_host, WEB_PORT, lan_ip))
+# Where the console is bound (set in main()); the robot downloads firmware
+# images from the same server.
+_web_host = HOST
 
 # A session busy with a turn holds its turn lock for the whole exchange
 # (model round trips + tool calls). Bound the console's wait on it rather than
@@ -150,8 +122,24 @@ live_sessions: set[AgentSession] = set()
 RESYNC_TIMEOUT_S = 15.0
 
 
+# The firmware reports status every 60 s (agent/commands.cpp), so a link that
+# has sent nothing for three periods is dead even if TCP hasn't noticed — a
+# robot that lost power mid-session leaves a half-open socket that would
+# otherwise sit in live_conns (and receive brain-initiated commands) until
+# the kernel gives up on it. Checked only between turns: the message loop
+# doesn't read while respond() runs, so a long turn would look like silence.
+LINK_SILENCE_S = 180.0
+
+
 @dataclass
 class ConnState:
+    # This connection's socket, so a newer connection can supersede it.
+    ws: Any = field(default=None, repr=False, compare=False)
+    # monotonic time of the last frame of any kind from the firmware, and
+    # whether it has sent a periodic status event (older firmware doesn't,
+    # and must not be judged by LINK_SILENCE_S).
+    last_rx_s: float = 0.0
+    status_seen: bool = False
     listening: bool = False
     speaking: bool = False
     # True when listening was opened by the brain (post-reply window) rather
@@ -166,39 +154,43 @@ class ConnState:
     trailing_silence_ms: int = 0
     started_at: float = 0.0
     agent: AgentSession | None = None
-    latest_jpeg: bytes | None = None
-    face_detector: FaceDetector | None = None
-    face_tracker: FaceTracker = field(default_factory=FaceTracker)
-    behavior: IdleBehavior = field(default_factory=IdleBehavior)
-    last_user_interaction_s: float = 0.0
-    last_greeting_s: float = 0.0
-    last_detect_s: float = 0.0
-    # True while asleep: screen is off, look-around and face detection are
-    # suspended. Cleared by a wake word or head tap. Driven by SLEEP_TIMEOUT_S.
+    # True while asleep: the screen is off until a wake word or head tap.
+    # Driven by SLEEP_TIMEOUT_S.
     asleep: bool = False
     # monotonic time of the last interaction that should keep the device
     # awake (conversation, wake word, tap). Seeded at connect so a fresh
-    # connection doesn't immediately sleep. Distinct from
-    # last_user_interaction_s (which gates greetings) so sleep timing and
-    # greeting suppression stay independent.
+    # connection doesn't immediately sleep.
     last_activity_s: float = 0.0
+    # last_activity_s of the idle stretch the summarizer already ran in, so a
+    # long quiet spell folds the backlog once rather than every tick.
+    summarized_for_activity_s: float = -1.0
+    # The in-flight fold, if any, and when the last one started (spaces out
+    # retries of the overflow fold if the LLM call keeps failing).
+    summarize_task: asyncio.Task | None = None
+    last_summarize_s: float = 0.0
     # monotonic time the most recent TTS playback is expected to finish on
     # the device. The brain sends audio faster than real time, so when the
     # speaker worker returns the device still has buffered audio playing;
     # we wait until past this before reopening the mic (else the robot
     # hears its own voice tail and replies to itself).
     est_playback_end_s: float = 0.0
-    # Set while a vision/detection task is in flight, so we drop overlapping
-    # frames rather than queuing detections behind a slow mediapipe call.
-    detecting: bool = False
-    # The avatar skin last pushed to the firmware ("rocky"/"default"). Tracks
-    # ROCKY_MODE; synced on connect and whenever it changes (see
-    # _maybe_sync_skin). None until the first sync on connect.
-    last_skin: str | None = None
     # True while a BLE buddy approve prompt is pending on the device (firmware
     # emits {"event":"buddy_prompt","pending":...}). Elongates the sleep
     # timeout so the device doesn't sleep out from under an unanswered prompt.
     buddy_prompt_pending: bool = False
+    # BLE-buddy mode the firmware reported in its boot event (None: not
+    # reported — older firmware). set_buddy is only sent once boot_seen.
+    boot_seen: bool = False
+    buddy_reported: bool | None = None
+    # Last BUDDY_ENABLED value sent to the firmware as set_buddy on this
+    # connection (None: nothing sent yet).
+    buddy_sent: bool | None = None
+    # Battery / charging / volume from the boot and status events, plus the
+    # volume sync and low-battery bookkeeping. Shared with the agent's tools.
+    device: DeviceStatus = field(default_factory=DeviceStatus)
+    # True while handle() is inside respond() (STT → agent → TTS). The message
+    # loop awaits it inline, but the idle ticker runs alongside.
+    turn_active: bool = False
 
 
 def frame_rms(frame: bytes) -> float:
@@ -226,14 +218,8 @@ async def send_pcm_stream(ws: ServerConnection, pcm: bytes) -> None:
 
 def ensure_agent(ws: ServerConnection, state: ConnState) -> AgentSession:
     if state.agent is None:
-        state.agent = AgentSession(
-            ws,
-            memory=memory,
-            get_latest_jpeg=lambda: state.latest_jpeg,
-            on_external_head_move=state.behavior.notify_head_moved,
-            mcp=mcp_client,
-            a2a=a2a_client,
-        )
+        state.agent = AgentSession(ws, memory=memory, mcp=mcp_client,
+                                   device=state.device)
         live_sessions.add(state.agent)
     return state.agent
 
@@ -269,14 +255,13 @@ async def run_speaker(
     speaking face) and `stop_speaking` only if we ever started."""
     started = False
     state.speaking = True
-    play_start: float | None = None
-    total_audio_s = 0.0
-    # Pick the TTS backend once per turn (Rocky mode → Hume when configured).
-    # Read here in the event loop, not in the worker thread, per the config
-    # single-loop contract.
-    cfg = get_config()
-    use_rocky = bool(cfg.get("ROCKY_MODE"))
-    speed = float(cfg.get("ROCKY_SPEED"))
+    # When the device's speaker will run dry. Each sentence starts playing
+    # when its first frame arrives or when the previous one ends, whichever
+    # is later — NOT back-to-back from the first sentence: a spoken ack
+    # filler followed by seconds of tool call + second model round leaves the
+    # speaker idle in between, and summing audio from the first sentence
+    # reopened the follow-up mic ~2 s early, into the robot's own voice.
+    play_end = 0.0
     try:
         while True:
             sentence = await queue.get()
@@ -286,26 +271,21 @@ async def run_speaker(
                 await ws.send(json.dumps({"cmd": "start_speaking"}))
                 started = True
             t0 = time.monotonic()
-            tts_pcm = await asyncio.to_thread(_synthesize, sentence, use_rocky, speed)
+            tts_pcm = await asyncio.to_thread(tts.synthesize, sentence)
             audio_s = len(tts_pcm) / (SAMPLE_RATE * 2)
             log.info(
                 "tts: %d ms, %.2fs audio, %r",
                 int((time.monotonic() - t0) * 1000), audio_s, sentence[:80],
             )
-            # Playback starts ~when the first frame reaches the device.
-            if play_start is None:
-                play_start = time.monotonic()
-            total_audio_s += audio_s
+            play_end = max(play_end, time.monotonic()) + audio_s
             await send_pcm_stream(ws, tts_pcm)
         if started:
             await ws.send(json.dumps({"cmd": "stop_speaking"}))
     finally:
         state.speaking = False
-        # Device plays at real time from play_start; record when the last
-        # sample will have left the speaker so respond() can wait it out.
-        state.est_playback_end_s = (
-            play_start + total_audio_s if play_start is not None else 0.0
-        )
+        # Record when the last sample will have left the speaker so
+        # respond() can wait it out before reopening the mic.
+        state.est_playback_end_s = play_end
 
 
 async def _drive_agent_turn(
@@ -372,7 +352,22 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         # Whole-file WAV write; off the loop like every other blocking call
         # here, so turning the debug dump on doesn't stall the console/mDNS.
         await asyncio.to_thread(_dump_capture, pcm)
-    transcript = await stt.transcribe(pcm)
+    try:
+        transcript = await stt.transcribe(pcm)
+    except Exception:
+        # A CUDA OOM here used to escape the message loop and drop the socket,
+        # turning one failed utterance into a reconnect. The firmware has
+        # already been sent stop_listening, so just treat it as "heard nothing".
+        log.exception("stt failed — going idle")
+        return
+    if follow_up_turn and starts_with_wake_word(transcript.text):
+        # The firmware's wake word is paused while the follow-up mic is open,
+        # so "computer, turn on the office light" said inside the window
+        # arrives as a follow-up. Saying the wake word is the user addressing
+        # us directly: no follow-up judgement, and the HA fast path applies.
+        log.info("wake word inside the follow-up window — direct request")
+        follow_up_turn = False
+    transcript = dataclasses.replace(transcript, text=strip_wake_word(transcript.text))
     if not transcript.text:
         log.info("empty transcript — going idle")
         return
@@ -414,13 +409,28 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
 
     agent = ensure_agent(ws, state)
     tool_calls: list[dict[str, Any]] = []
-    # Per-turn observer, not a slot on the session: a greeting turn can be in
-    # flight against the same AgentSession (it blocks on the turn lock inside
-    # respond*), and a shared slot let this turn collect the greeting's tool
-    # calls and then publish its own as empty.
+    # Per-turn observer, not a slot on the session: _turn_lock is taken inside
+    # respond*, so another turn can be in flight against the same AgentSession,
+    # and a shared slot let one turn collect the other's tool calls and then
+    # publish its own as empty.
     on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
     t0 = time.monotonic()
-    if follow_up_turn:
+    # Home Assistant first: a device command or state question it matches
+    # locally is answered in ~50 ms with no LLM call; a miss adds the same
+    # ~50 ms before the LLM (published as ha_ms either way). Not on follow-up
+    # turns: with no wake word, the model has to judge whether the words were
+    # even meant for us (side conversation, TV, our own echo) before anything
+    # in the house moves.
+    fast = None if follow_up_turn else await ha_fast_path.try_handle(transcript.text)
+    ha_hit = fast is not None and fast.speech is not None
+    if ha_hit:
+        speech = fast.speech
+
+        async def run(spk: Callable[[str], Awaitable[None]]) -> str:
+            await spk(speech)
+            await agent.record_exchange(transcript.text, speech, follow_up=False)
+            return speech
+    elif follow_up_turn:
         run = lambda spk: agent.respond_follow_up(
             transcript.text, spk, on_tool=on_tool
         )
@@ -428,18 +438,19 @@ async def respond(ws: ServerConnection, state: ConnState) -> None:
         run = lambda spk: agent.respond(transcript.text, spk, on_tool=on_tool)
     speak_text = await _drive_agent_turn(ws, state, run)
     total_ms = int((time.monotonic() - t0) * 1000)
-    log.info("agent turn: %d ms total, %r", total_ms, speak_text[:120])
+    log.info("%s turn: %d ms total, %r", "ha" if ha_hit else "agent", total_ms, speak_text[:120])
     publish_turn({
         "ts": time.time(),
         "transcript": transcript.text,
         "follow_up": follow_up_turn,
+        "path": "ha" if ha_hit else "llm",
         "tools": tool_calls,
         "reply": speak_text,
         "stt_ms": transcript.latency_ms,
+        "ha_ms": fast.latency_ms if fast is not None else None,
         "total_ms": total_ms,
     })
 
-    state.last_user_interaction_s = time.monotonic()
     state.last_activity_s = time.monotonic()
 
     # If the agent chose to stay silent (typical on a follow-up that
@@ -503,13 +514,21 @@ async def _follow_up_timeout_task(
     if state.voiced_ms >= get_config().get("SPEECH_LEAD_MS"):
         # User started talking — let the normal VAD path finish.
         return
-    log.info("follow-up window timed out (no speech) — closing")
+    _close_capture(state, "follow-up window timed out (no speech)")
+    await ws.send(json.dumps({"cmd": "stop_listening"}))
+
+
+def _close_capture(state: ConnState, reason: str) -> None:
+    """Drop an open capture without responding to it — how a follow-up
+    window that heard nothing ends, and how a capture the firmware abandoned
+    (listen_timeout) or that went stale is cleared. Callers outside the
+    follow-up timeout task also cancel that task first."""
+    log.info("capture closed: %s", reason)
     state.listening = False
     state.follow_up = False
     state.speech_buf = bytearray()
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
-    await ws.send(json.dumps({"cmd": "stop_listening"}))
 
 
 def _cancel_follow_up_timeout(state: ConnState) -> None:
@@ -521,11 +540,7 @@ def _cancel_follow_up_timeout(state: ConnState) -> None:
 def _should_sleep(state: ConnState) -> bool:
     """True when the inactivity timeout has elapsed and we're idle. A
     SLEEP_TIMEOUT_S of 0 disables sleeping entirely."""
-    if state.asleep or state.listening or state.speaking:
-        return False
-    # Don't drop the screen mid-sweep, or the head would keep moving while
-    # "asleep". A sweep is short (~16 s) and infrequent; just wait it out.
-    if state.behavior.look_around_in_progress:
+    if state.asleep or _device_busy(state):
         return False
     timeout = get_config().get("SLEEP_TIMEOUT_S")
     if not timeout or timeout <= 0:
@@ -540,33 +555,307 @@ def _should_sleep(state: ConnState) -> bool:
     return time.monotonic() - state.last_activity_s >= timeout
 
 
-async def _maybe_sync_skin(ws: ServerConnection, state: ConnState) -> None:
-    """Push the avatar skin to the firmware if ROCKY_MODE has changed since the
-    last sync. ROCKY_MODE is the single source of truth (voice + face); this
-    catches both the voice tool (set_persona_mode) and a web-console toggle
-    with no callback machinery. Cheap to call on every camera frame."""
-    want = skin_for_rocky_mode(get_config().get("ROCKY_MODE"))
-    if want == state.last_skin:
+IDLE_CHECK_INTERVAL_S = 5.0
+
+
+# A conversation that never goes quiet for SUMMARIZE_IDLE_S would otherwise
+# never fold, and an ever-growing backlog ends in an over-length 400 whose
+# recovery deletes the whole unsummarized history. Past this multiple of
+# SUMMARIZE_TRIGGER, fold between turns anyway.
+SUMMARIZE_OVERFLOW_FACTOR = 2
+SUMMARIZE_RETRY_S = 60.0
+
+
+def _should_summarize(state: ConnState) -> bool:
+    """Fold once per idle stretch, SUMMARIZE_IDLE_S after the last turn — or
+    between turns if the backlog has overflowed. Never while a mic is open or
+    a fold is already running."""
+    if state.listening or state.speaking:
+        return False
+    if state.summarize_task is not None and not state.summarize_task.done():
+        return False
+    cfg = get_config()
+    now = time.monotonic()
+    trigger = int(cfg.get("SUMMARIZE_TRIGGER"))
+    if memory.unsummarized_count() >= trigger * SUMMARIZE_OVERFLOW_FACTOR:
+        return now - state.last_summarize_s >= SUMMARIZE_RETRY_S
+    if state.summarized_for_activity_s == state.last_activity_s:
+        return False
+    return now - state.last_activity_s >= float(cfg.get("SUMMARIZE_IDLE_S"))
+
+
+async def _idle_ticker(ws: ServerConnection, state: ConnState) -> None:
+    """Housekeeping that runs between conversations, on its own clock:
+    idle → sleep, and folding the turn backlog into a summary. Cancelled by
+    handle() on disconnect."""
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL_S)
+        if (state.status_seen and not _conversation_busy(state)
+                and time.monotonic() - state.last_rx_s > LINK_SILENCE_S):
+            log.warning("no frame from the firmware for %.0fs — closing the dead link",
+                        time.monotonic() - state.last_rx_s)
+            # Spawned: handle()'s teardown cancels this ticker once it lands.
+            spawn(ws.close(code=1011, reason="link silent"), "silent_close")
+            return
+        if _should_summarize(state):
+            state.summarized_for_activity_s = state.last_activity_s
+            state.last_summarize_s = time.monotonic()
+            # A fresh connection (reconnect, brain restart) has no session
+            # until its first turn; the backlog it inherited still needs
+            # folding, so make one.
+            agent = ensure_agent(ws, state)
+            state.summarize_task = spawn(maybe_summarize(agent), "summarize")
+        cfg = get_config()
+        if capture_is_stale(
+            state.listening,
+            state.started_at,
+            time.monotonic(),
+            cfg.get("MAX_UTTERANCE_MS"),
+            state.follow_up,
+            cfg.get("FOLLOW_UP_WINDOW_S"),
+        ):
+            # Utterance end is only judged on incoming audio; with no frames
+            # (firmware gave up, event lost) nothing else would ever close it.
+            log.warning("capture open %.1fs with no end — clearing",
+                        time.monotonic() - state.started_at)
+            _cancel_follow_up_timeout(state)
+            _close_capture(state, "stale")
+            try:
+                await ws.send(json.dumps({"cmd": "stop_listening"}))
+            except Exception:
+                log.exception("stop_listening send failed")
+        if _should_sleep(state):
+            await go_to_sleep(ws, state)
+        if state.boot_seen:
+            await _sync_buddy(ws, state)
+            await _sync_volume(ws, state)
+            await _maybe_send_ota(ws, state)
+        ota.check_stall()
+
+
+# How often the timer loop looks for due timers, and how long the firmware's
+# first chime gets before the announcement is spoken over it.
+TIMER_CHECK_INTERVAL_S = 1.0
+ALERT_CHIME_S = 1.2
+# Poll interval while an announcement waits for a conversation to finish.
+ANNOUNCE_WAIT_POLL_S = 0.25
+
+
+async def _timer_loop(ws: ServerConnection, state: ConnState) -> None:
+    """Fire due timers on this connection, oldest first. Runs only while the
+    robot is connected. A timer that came due during an outage (or a brain
+    restart) is fired on the reconnect if at most timers.LATE_GRACE_S late,
+    dropped with a log line otherwise; one that comes due while connected is
+    always announced, waiting for any conversation to end first. Detection
+    never waits: while a conversation runs, due timers just stay in the DB
+    and the next idle tick announces them all in order. Cancelled by
+    handle() on disconnect."""
+    connected_ts = time.time()
+    while True:
+        await asyncio.sleep(TIMER_CHECK_INTERVAL_S)
+        due, missed = timers.partition_due(memory.list_timers(), time.time(), connected_ts)
+        for t in missed:
+            if memory.delete_timer(t.id):
+                log.warning("timer %d (%s) missed by %.0fs while offline — dropped",
+                            t.id, t.label or t.kind, time.time() - t.fire_ts)
+        if not due or _device_busy(state):
+            continue
+        for t in due:
+            try:
+                await _fire_timer(ws, state, t)
+            except Exception:
+                # A dead socket ends up cancelled by handle(); anything else
+                # (TTS) must not stop the loop for the rest of the connection.
+                log.exception("firing timer %d failed", t.id)
+
+
+async def _wait_until_idle(state: ConnState) -> None:
+    """Hold an announcement until no conversation is in progress and no
+    firmware update is in flight, rather than talk over a turn, into an open
+    mic, or across a flash."""
+    while _device_busy(state):
+        await asyncio.sleep(ANNOUNCE_WAIT_POLL_S)
+
+
+async def _fire_timer(ws: ServerConnection, state: ConnState, t: timers.Timer) -> None:
+    """Chime (the firmware's alert), then say what went off and record it in
+    the conversation. The row is claimed (deleted) first, so a timer
+    cancelled meanwhile — from the console or a turn — is never announced;
+    if the alert then can't be sent (the link died), the row is put back so
+    the reconnect fires it."""
+    await _wait_until_idle(state)
+    if not memory.delete_timer(t.id):
         return
     try:
-        await ws.send(json.dumps({"cmd": "set_skin", "value": want}))
+        await ws.send(json.dumps({"cmd": "alert", "style": "timer"}))
     except Exception:
-        # Leave last_skin unchanged so the next frame retries rather than
-        # latching a skin we never actually pushed.
-        log.exception("set_skin send failed")
+        memory.restore_timer(t)
+        log.warning("timer %d: alert not sent — kept for the reconnect", t.id)
+        raise
+    text = timers.announcement(t)
+    log.info("timer %d fired: %r (%.1fs late)", t.id, text, time.time() - t.fire_ts)
+    # The firmware relit the screen for the alert; our sleep flag follows,
+    # and the idle clock restarts so the robot doesn't doze straight off.
+    wake_up(state)
+    state.last_activity_s = time.monotonic()
+    await asyncio.sleep(ALERT_CHIME_S)
+    await _wait_until_idle(state)
+    # No await between that idle check and run_speaker setting
+    # state.speaking (the queue is pre-filled), so a turn can't slip in.
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue.put_nowait(text)
+    queue.put_nowait(None)
+    await run_speaker(ws, state, queue)
+    state.last_activity_s = time.monotonic()
+    # Recorded as a bracketed system-context opening plus the spoken line:
+    # the same user/assistant shape as any exchange, so the thread contract
+    # holds and the model knows what it just announced. No follow-up window:
+    # this wasn't a conversation.
+    note = timers.history_note(t)
+    await ensure_agent(ws, state).record_exchange(note, text, follow_up=False)
+    publish_turn({
+        "ts": time.time(), "transcript": note, "follow_up": False,
+        "path": "timer", "tools": [], "reply": text,
+        "stt_ms": None, "ha_ms": None, "total_ms": 0,
+    })
+
+
+def _conversation_busy(state: ConnState) -> bool:
+    """A conversation is in progress: mic open, speaking, a turn running, or
+    the session's turn lock held (a turn or a fold committing)."""
+    if state.listening or state.speaking or state.turn_active:
+        return True
+    return state.agent is not None and state.agent._turn_lock.locked()
+
+
+def _device_busy(state: ConnState) -> bool:
+    """The robot must not be disturbed by anything the brain starts on its
+    own (sleep, set_buddy, set_volume, an update, a timer going off): a
+    conversation is in progress, or a firmware update is being downloaded,
+    flashed, or is still on probation after its reboot — a set_buddy reboot
+    then would roll it back."""
+    return _conversation_busy(state) or ota.device_busy
+
+
+async def _sync_buddy(ws: ServerConnection, state: ConnState) -> None:
+    """Push BUDDY_ENABLED to the firmware as set_buddy, between conversations
+    only. When the firmware's reported mode differs it saves the new value and
+    reboots (~15 s), so close our side of the link straight away rather than
+    leave a handler, ticker and session talking to a dead socket; the
+    reconnect's boot report then matches."""
+    knob = get_config().get("BUDDY_ENABLED")
+    action = buddy_sync_action(
+        knob, state.buddy_reported, state.buddy_sent, _device_busy(state)
+    )
+    if action is None:
         return
-    state.last_skin = want
-    log.info("skin → %s", want)
+    enabled = bool(knob)
+    try:
+        await ws.send(json.dumps({"cmd": "set_buddy", "enabled": enabled}))
+    except Exception:
+        log.exception("set_buddy send failed")
+        return
+    state.buddy_sent = enabled
+    if action == "send_close":
+        log.warning(
+            "set_buddy enabled=%s (firmware reports %s) — device rebooting, "
+            "closing the link", enabled, state.buddy_reported,
+        )
+        # Spawned, not awaited: the idle ticker is one caller, and handle()'s
+        # teardown cancels it once the close lands.
+        spawn(ws.close(code=1012, reason="buddy mode change"), "buddy_close")
+    else:
+        log.info("set_buddy enabled=%s (firmware did not report its mode)", enabled)
+
+
+async def _sync_volume(ws: ServerConnection, state: ConnState) -> None:
+    """Push SPEAKER_VOLUME to the firmware as set_volume when it differs from
+    what the firmware reports, between conversations only. No reboot, so the
+    link stays up; the firmware answers with a status event."""
+    cfg = get_config()
+    reported = state.device.volume
+    value = volume_sync_action(
+        cfg.get("SPEAKER_VOLUME"), reported, _device_busy(state),
+        knob_set=cfg.is_set("SPEAKER_VOLUME"),
+    )
+    if value is None:
+        return
+    try:
+        await ws.send(json.dumps({"cmd": "set_volume", "value": value}))
+    except Exception:
+        log.exception("set_volume send failed")
+        return
+    # The firmware's status event confirms (or corrects) it.
+    state.device.volume = value
+    log.info("set_volume %d (firmware reported %s)", value, reported)
+
+
+# Whether the low-battery warning was already logged this discharge cycle.
+# Process-wide (not per connection) and persisted, so a reconnect or brain
+# restart mid-cycle doesn't warn again; only seeing the robot charge clears it.
+# None until first read from runtime state.
+_low_battery_warned: bool | None = None
+
+
+def _on_device_report(state: ConnState, payload: dict[str, Any]) -> None:
+    """Fold a boot/status event into state.device, adopt the robot's volume
+    into an unset SPEAKER_VOLUME, and log a low battery once per discharge
+    cycle. Never spoken: the robot doesn't nag unprompted; the console shows
+    it."""
+    global _low_battery_warned
+    dev = state.device
+    dev.update(payload, time.time())
+    cfg = get_config()
+    if dev.volume is not None and not cfg.is_set("SPEAKER_VOLUME"):
+        # A fresh brain never overrides the robot's volume: it takes the
+        # robot's as the setting, so the console shows the truth and later
+        # console edits push from there.
+        cfg.set("SPEAKER_VOLUME", dev.volume)
+    if _low_battery_warned is None:
+        _low_battery_warned = bool(memory.get_runtime_state("low_battery_warned", False))
+    warn, warned = low_battery_check(dev.battery, dev.charging, _low_battery_warned)
+    if warned != _low_battery_warned:
+        _low_battery_warned = warned
+        memory.set_runtime_state("low_battery_warned", warned)
+    if warn:
+        log.warning("robot battery low: %d%% and not charging", dev.battery)
+
+
+async def _maybe_send_ota(ws: ServerConnection, state: ConnState) -> None:
+    """Send a queued firmware update, between conversations only. The
+    firmware downloads it on its own task, reports progress as ota events and
+    reboots into it; the reconnect's boot event closes the update out."""
+    if not ota_send_ready(ota.requested, state.boot_seen, _device_busy(state)):
+        return
+    try:
+        cmd = ota.build_command()
+    except OSError as exc:
+        # No LAN address yet (DHCP); stays queued for the next tick.
+        log.warning("ota: no LAN address to serve the image from (%s)", exc)
+        return
+    except ValueError as exc:
+        ota.fail(str(exc))
+        return
+    if cmd is None:
+        return
+    try:
+        await ws.send(json.dumps(cmd))
+    except Exception:
+        # Still requested: the next tick (or connection) tries again.
+        log.exception("ota send failed")
+        return
+    ota.mark_sent()
+    log.info("ota #%d: sent %d-byte image to the robot (download from %s)",
+             cmd["id"], cmd["size"], cmd["url"].rsplit("/", 1)[0])
 
 
 async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
     """Enter sleep: tell the firmware to turn the screen off (it sets a
-    sleepy face first), and stop look-around + face detection. The wake
-    word and head tap stay armed on the firmware as the only way out."""
+    sleepy face first). The wake word and head tap stay armed on the
+    firmware as the only way out."""
     state.asleep = True
     # Persist so a brain restart while asleep resumes in the asleep state
-    # instead of re-running autonomous behavior (look-around / face-detect
-    # greet) against a still-dark firmware screen.
+    # rather than treating a still-dark firmware screen as awake.
     memory.set_runtime_state("asleep", True)
     log.info("sleeping (idle %.0fs)", time.monotonic() - state.last_activity_s)
     try:
@@ -578,13 +867,19 @@ async def go_to_sleep(ws: ServerConnection, state: ConnState) -> None:
 def wake_up(state: ConnState) -> None:
     """Clear the sleep state on a wake word / tap. The firmware relights
     its own screen locally on the same trigger (instant, offline-safe), so
-    no wake command is sent from here — we just resume brain-side behavior
-    and reset the look-around clock so a sweep doesn't fire immediately."""
+    no wake command is sent from here — we just clear the flag."""
     if state.asleep:
         log.info("waking")
     state.asleep = False
     memory.set_runtime_state("asleep", False)
-    state.behavior.last_look_around_s = time.monotonic()
+
+
+async def _toggle_tap_light() -> None:
+    name = str(get_config().get("DOUBLE_TAP_LIGHT")).strip()
+    if not name:
+        return
+    result = await ha_fast_path.toggle_by_name(name)
+    log.info("double tap → %r: %s", name, result)
 
 
 def _on_wake_trigger(state: ConnState) -> None:
@@ -599,107 +894,7 @@ def _on_wake_trigger(state: ConnState) -> None:
     state.voiced_ms = 0
     state.trailing_silence_ms = 0
     state.started_at = time.monotonic()
-    now = time.monotonic()
-    state.last_user_interaction_s = now
-    state.last_activity_s = now
-
-
-async def _toggle_tap_light() -> None:
-    name = get_config().get("DOUBLE_TAP_LIGHT")
-    result = await toggle_light(mcp_client, name)
-    log.info("double tap → toggle %r: %s", name, result)
-
-
-async def proactive_greet(ws: ServerConnection, state: ConnState) -> None:
-    """Run an agent turn triggered by a non-speech event (new face seen).
-    Bypasses STT and uses a stage-direction message instead."""
-    now = time.monotonic()
-    if state.listening or state.speaking:
-        log.info("greet skipped: busy (listening=%s speaking=%s)",
-                 state.listening, state.speaking)
-        return
-    if now - state.last_greeting_s < get_config().get("GREETING_COOLDOWN_S"):
-        log.info("greet skipped: cooldown (%.0fs since last)",
-                 now - state.last_greeting_s)
-        return
-    if now - state.last_user_interaction_s < get_config().get("RECENT_INTERACTION_S"):
-        log.info("greet skipped: recent interaction (%.0fs ago)",
-                 now - state.last_user_interaction_s)
-        return
-
-    state.last_greeting_s = now
-    # A greeting is an interaction, so it has to defer sleep like any other
-    # turn — otherwise a face arriving just before SLEEP_TIMEOUT_S expires
-    # gets greeted and then watches the screen go dark on the next camera
-    # frame. last_user_interaction_s is deliberately NOT touched: that one
-    # gates greetings and must stay driven by the user, not by us.
-    state.last_activity_s = now
-    log.info("proactive greeting: new face")
-
-    agent = ensure_agent(ws, state)
-    tool_calls: list[dict[str, Any]] = []
-    on_tool = lambda name, inp: tool_calls.append({"name": name, "input": inp})
-    t0 = time.monotonic()
-    speak_text = await _drive_agent_turn(
-        ws,
-        state,
-        lambda spk: agent.respond_to_event(
-            "A new person just appeared in front of you. Greet them in one "
-            "short, friendly sentence.",
-            spk,
-            on_tool=on_tool,
-        ),
-    )
-    total_ms = int((time.monotonic() - t0) * 1000)
-    # Re-stamp after the turn: the greeting itself can run for seconds, and
-    # the sleep check that matters is the one on the next camera frame.
     state.last_activity_s = time.monotonic()
-    log.info("greet turn: %d ms, %r", total_ms, speak_text[:120])
-    publish_turn({
-        "ts": time.time(),
-        "transcript": "[new face — proactive greeting]",
-        "follow_up": False,
-        "tools": tool_calls,
-        "reply": speak_text,
-        "stt_ms": None,
-        "total_ms": total_ms,
-    })
-
-
-async def process_latest_jpeg(ws: ServerConnection, state: ConnState) -> None:
-    """Run face detection + gaze update + proactive-greeting check on the
-    most recent JPEG. Skipped if a previous detection is still running,
-    so a slow frame doesn't queue up backlogged work — we always look at
-    the newest available frame instead."""
-    if state.detecting:
-        return
-    jpeg = state.latest_jpeg
-    if jpeg is None:
-        return
-
-    if state.face_detector is None:
-        try:
-            state.face_detector = FaceDetector()
-        except Exception:
-            log.exception("FaceDetector init failed — disabling vision")
-            return
-
-    state.detecting = True
-    try:
-        faces = await asyncio.to_thread(state.face_detector.detect, jpeg)
-    except Exception:
-        log.exception("face detect failed")
-        state.detecting = False
-        return
-    state.detecting = False
-
-    new_face = state.face_tracker.update(faces)
-
-    in_conversation = state.listening or state.speaking
-    await state.behavior.tick(ws, faces, in_conversation)
-
-    if new_face:
-        spawn(proactive_greet(ws, state), "proactive_greet")
 
 
 async def handle(ws: ServerConnection) -> None:
@@ -716,23 +911,37 @@ async def handle(ws: ServerConnection) -> None:
     # for the next reflash.
     await ws.send(json.dumps({"cmd": "stop_speaking"}))
     state = ConnState()
+    # The BLE-buddy setting is pushed once the firmware's boot event says
+    # which mode it is running in (see the "boot" branch below).
     # Seed the sleep clock at connect so a fresh link doesn't immediately
     # sleep before any interaction.
     state.last_activity_s = time.monotonic()
     # Restore the persisted sleep flag: if the device was asleep when the
-    # brain last ran (or restarted), stay dormant — keep look-around and
-    # face detection suppressed so we don't act against a dark screen — and
-    # let only a wake word / head tap (which the firmware lights locally)
-    # bring it back. The firmware is still backlit-off from its earlier
-    # `sleep`, so the two stay consistent without sending any command.
+    # brain last ran (or restarted), stay dormant and let only a wake word /
+    # head tap (which the firmware lights locally) bring it back. Re-send
+    # sleep rather than assume the screen is still dark: the firmware may have
+    # rebooted since (power cut, set_buddy, OTA) and come up lit. Idempotent
+    # on a firmware that is already asleep.
     if bool(memory.get_runtime_state("asleep", False)):
         state.asleep = True
         log.info("restored sleep state on connect: asleep")
-    # Sync the avatar skin to the current ROCKY_MODE on connect (boot brings up
-    # the default skin; this flips it to Rocky if ROCKY_MODE is on).
-    await _maybe_sync_skin(ws, state)
+        await ws.send(json.dumps({"cmd": "sleep"}))
+    state.ws = ws
+    state.last_rx_s = time.monotonic()
+    # There is one robot. A new connection from it means any older one is a
+    # leftover (it rebooted, or the link died without a FIN) — close it so
+    # its handler tears down and stops sending it brain-initiated commands.
+    for old in list(live_conns):
+        log.warning("superseding the previous firmware connection %s",
+                    getattr(old.ws, "remote_address", "?"))
+        if old.ws is not None:
+            spawn(old.ws.close(code=1012, reason="superseded"), "supersede_close")
+    idle_ticker = spawn(_idle_ticker(ws, state), "idle_ticker")
+    live_conns.append(state)
+    timer_loop = spawn(_timer_loop(ws, state), "timer_loop")
     try:
         async for msg in ws:
+            state.last_rx_s = time.monotonic()
             if isinstance(msg, bytes) and msg and msg[0] == OP_AUDIO:
                 if not state.listening:
                     continue
@@ -786,42 +995,21 @@ async def handle(ws: ServerConnection) -> None:
                         state.trailing_silence_ms,
                         elapsed_ms,
                     )
-                    await respond(ws, state)
-            elif isinstance(msg, bytes) and msg and msg[0] == OP_JPEG:
-                jpeg = bytes(msg[1:])
-                log.debug("jpeg frame, %d bytes", len(jpeg))
-                # Always keep the latest frame around for describe_view,
-                # but only RUN detection at the configured cadence.
-                state.latest_jpeg = jpeg
-                # Frames are the steady heartbeat (~every 1.5 s, even while
-                # asleep), so use them to push a ROCKY_MODE skin change.
-                await _maybe_sync_skin(ws, state)
-                # While asleep: no look-around, no face detection — the wake
-                # word / tap is the only way out. Frames keep arriving (cheap)
-                # so describe_view still has a recent one after waking.
-                if state.asleep:
-                    continue
-                # Awake + idle long enough → sleep. Checked on each frame
-                # (~every 1.5 s), which is a fine cadence for a minutes-scale
-                # timeout.
-                if _should_sleep(state):
-                    await go_to_sleep(ws, state)
-                    continue
-                interval = (
-                    DETECT_INTERVAL_LOOK_AROUND_S
-                    if state.behavior.look_around_in_progress
-                    else get_config().get("DETECT_INTERVAL_IDLE_S")
-                )
-                if time.monotonic() - state.last_detect_s >= interval:
-                    state.last_detect_s = time.monotonic()
-                    spawn(process_latest_jpeg(ws, state), "process_jpeg")
+                    state.turn_active = True
+                    try:
+                        await respond(ws, state)
+                    finally:
+                        state.turn_active = False
             elif isinstance(msg, str):
                 try:
                     payload = json.loads(msg)
                 except json.JSONDecodeError:
                     log.warning("bad json from esp32: %r", msg[:120])
                     continue
-                log.info("event: %s", payload)
+                # Status reports arrive every 60 s; keep them out of the
+                # info log unless something in them needs attention.
+                (log.debug if payload.get("event") == "status" else log.info)(
+                    "event: %s", payload)
                 event = payload.get("event")
                 if event in ("wakeword", "tap"):
                     # Wake word or head tap: wake (if asleep) and start a
@@ -830,9 +1018,45 @@ async def handle(ws: ServerConnection) -> None:
                     # relit the screen on the same trigger.
                     _on_wake_trigger(state)
                 elif event == "double_tap":
-                    # Head double tap: toggle a light directly through the
-                    # Home Assistant MCP tools, no LLM turn.
+                    # Head double tap: toggle a light in Home Assistant
+                    # directly, no LLM turn.
                     spawn(_toggle_tap_light(), "toggle_light")
+                elif event == "boot":
+                    state.boot_seen = True
+                    buddy = payload.get("buddy")
+                    state.buddy_reported = buddy if isinstance(buddy, bool) else None
+                    log.info("firmware reports buddy=%s",
+                             "unknown" if state.buddy_reported is None
+                             else state.buddy_reported)
+                    _on_device_report(state, payload)
+                    def _s(key: str) -> str | None:
+                        v = payload.get(key)
+                        return v if isinstance(v, str) else None
+                    valid = payload.get("fw_valid")
+                    ota.on_boot(_s("fw"), _s("fw_built"), _s("fw_sha"),
+                                valid if isinstance(valid, bool) else None)
+                    await _sync_buddy(ws, state)
+                    await _sync_volume(ws, state)
+                elif event == "status":
+                    state.status_seen = True
+                    _on_device_report(state, payload)
+                elif event == "ota":
+                    ota.on_event(payload)
+                elif event == "listen_timeout":
+                    # The firmware's 15 s watchdog gave up on the capture and
+                    # is back in IDLE (wakeword armed). Drop ours to match.
+                    log.warning("firmware listen_timeout — dropping the capture")
+                    _cancel_follow_up_timeout(state)
+                    _close_capture(state, "firmware listen_timeout")
+                elif event == "speak_timeout":
+                    # 60 s in SPEAKING with no frame from us; the firmware has
+                    # gone back to IDLE on its own. Nothing to undo here.
+                    log.warning("firmware speak_timeout — it saw no frames "
+                                "for 60 s while speaking")
+                elif event == "alert_dismissed":
+                    # Head tap or wake word during a timer chime (logged
+                    # above). The spoken announcement still follows.
+                    pass
                 elif event == "buddy_prompt":
                     # The firmware's BLE buddy reports whether a permission
                     # prompt is waiting on the device, so _should_sleep can
@@ -840,11 +1064,12 @@ async def handle(ws: ServerConnection) -> None:
                     state.buddy_prompt_pending = bool(payload.get("pending"))
                     log.info("buddy prompt pending: %s", state.buddy_prompt_pending)
             elif isinstance(msg, bytes):
-                # A zero-length binary frame is legal WebSocket and lands here
-                # (both opcode branches require a non-empty msg). Log arguments
-                # are evaluated eagerly, so an unguarded msg[0] would IndexError
-                # out of the message loop and tear the connection down.
-                log.warning(
+                # Any other opcode is ignored. A zero-length binary frame is
+                # legal WebSocket and lands here too (the audio branch
+                # requires a non-empty msg). Log arguments are evaluated
+                # eagerly, so an unguarded msg[0] would IndexError out of the
+                # message loop and tear the connection down.
+                log.debug(
                     "unknown binary frame: opcode %s, %d bytes",
                     f"0x{msg[0]:02x}" if msg else "none", len(msg),
                 )
@@ -855,6 +1080,8 @@ async def handle(ws: ServerConnection) -> None:
     finally:
         if state.agent is not None:
             live_sessions.discard(state.agent)
+        # By identity: ConnState is a dataclass, so == compares fields.
+        live_conns[:] = [c for c in live_conns if c is not state]
         # The follow-up timer outlives the socket otherwise: it wakes up to
         # FOLLOW_UP_WINDOW_S later, mutates a ConnState nothing owns any more
         # (pinning its AgentSession and speech buffer alive with it) and then
@@ -862,7 +1089,44 @@ async def handle(ws: ServerConnection) -> None:
         # deliberately left to finish — cancelling it at an arbitrary await is
         # how the M6.1 half-written tool_use corruption happens.
         _cancel_follow_up_timeout(state)
+        idle_ticker.cancel()
+        timer_loop.cancel()
         log.info("esp32 disconnected")
+
+
+def device_status() -> dict[str, Any]:
+    """The console's view of the robot: the newest connection's last report."""
+    if not live_conns:
+        return {"connected": False}
+    dev = live_conns[-1].device
+    return {
+        "connected": True,
+        "battery": dev.battery,
+        "charging": dev.charging,
+        "volume": dev.volume,
+        "low_battery": dev.low_battery,
+        "updated_at": dev.updated_at,
+    }
+
+
+STT_VOCAB_REFRESH_S = 600.0
+
+
+async def _refresh_stt_vocabulary() -> None:
+    """Keep Whisper's hint words in step with the device and room names Home
+    Assistant exposes, so renames and new aliases land without a restart."""
+    while True:
+        words = await ha_fast_path.fetch_vocabulary()
+        if words:
+            # The wake word first: the firmware's pre-roll often opens a
+            # capture with the tail of "computer", and with only device names
+            # to go on Whisper bent it into one ("bedroom, what's the
+            # weather"), which strip_wake_word then can't remove.
+            hotwords = ", ".join(["Computer", *words])
+            if hotwords != stt.hotwords:
+                log.info("stt vocabulary: %d names from home assistant", len(words))
+            stt.hotwords = hotwords
+        await asyncio.sleep(STT_VOCAB_REFRESH_S)
 
 
 def lan_ip() -> str:
@@ -974,10 +1238,9 @@ async def advertise_mdns() -> tuple[AsyncZeroconf, ServiceInfo] | tuple[None, No
 
 
 def _seed_default_mcp_servers() -> None:
-    """Register the bundled weather + Hue servers once (empty registry).
-    Uses the running interpreter and absolute script paths so it works
-    regardless of cwd. Weather is enabled; Hue is disabled until the user
-    sets HUE_BRIDGE_IP/HUE_TOKEN in .env and toggles it on."""
+    """Register the bundled weather server once (empty registry). Uses the
+    running interpreter and an absolute script path so it works regardless
+    of cwd."""
     if memory.list_mcp_servers():
         return
     srv_dir = Path(__file__).parent / "mcp_servers"
@@ -985,26 +1248,11 @@ def _seed_default_mcp_servers() -> None:
         "weather", "stdio", sys.executable,
         args=[str(srv_dir / "weather.py")], enabled=True,
     )
-    memory.add_mcp_server(
-        "hue", "stdio", sys.executable,
-        args=[str(srv_dir / "hue.py")], env_ref="HUE_TOKEN", enabled=False,
-    )
-    log.info("seeded default MCP servers: weather (on), hue (off)")
-
-
-def _seed_default_a2a_servers() -> None:
-    """Register the Hermes A2A endpoint once (empty registry), disabled
-    until the user confirms the URL and toggles it on (like Hue)."""
-    if memory.list_a2a_servers():
-        return
-    memory.add_a2a_server(
-        "hermes", "http://192.168.4.30:8080", enabled=False,
-    )
-    log.info("seeded default A2A server: hermes (off)")
+    log.info("seeded default MCP server: weather")
 
 
 async def main() -> None:
-    global stt, tts
+    global stt, tts, _web_host
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -1014,8 +1262,11 @@ async def main() -> None:
     # model is loaded until first use — so reconstructing here is cheap and
     # picks up any web-UI override saved on a previous run.
     cfg = init_config(memory)
-    # M6.5: heal any durable conversation-state corruption (dangling tool_use
-    # from a pre-M6.1 crash, etc.) before the first turn replays it.
+    # One-time: drop the unsummarized Anthropic-format tail left from before
+    # the OpenRouter switch (a no-op on every later start).
+    migrate_turn_format(memory)
+    # M6.5: heal any durable conversation-state corruption (a dangling tool
+    # call from a crash, etc.) before the first turn replays it.
     repair_memory(memory)
     tts = Synthesizer(voice=cfg.get("PIPER_VOICE"))
     stt = Transcriber(
@@ -1029,17 +1280,13 @@ async def main() -> None:
     # Background, not awaited: the socket should be accepting connections
     # while the model comes up.
     spawn(stt.warm(), "stt_warm")
+    spawn(_refresh_stt_vocabulary(), "stt_vocabulary")
 
-    # MCP servers (Phase 9b): seed the two local servers on first run so
-    # weather works out of the box and Hue is one toggle + .env away.
-    # Then connect — best-effort, a down server just contributes no tools.
+    # MCP servers (Phase 9b): seed the local weather server on first run so
+    # it works out of the box. Then connect — best-effort, a down server just
+    # contributes no tools.
     _seed_default_mcp_servers()
     await mcp_client.start()
-
-    # A2A servers (Phase 9c): seed Hermes (disabled) on first run, then
-    # connect any enabled endpoints — best-effort, like MCP.
-    _seed_default_a2a_servers()
-    await a2a_client.start()
 
     # Web console: tee brain.* logs to the live feed and serve the
     # FastAPI app in-process on WEB_PORT, sharing memory + config + mcp.
@@ -1049,11 +1296,14 @@ async def main() -> None:
     logging.getLogger("brain").addHandler(WebUILogHandler())
     console_token, console_generated = _console_token()
     web_host = _console_bind()
+    _web_host = web_host
     web = uvicorn.Server(
         uvicorn.Config(
-            create_app(memory, cfg, mcp_client, a2a_client,
+            create_app(memory, cfg, mcp_client,
                        token=console_token,
-                       resync_sessions=resync_live_sessions),
+                       resync_sessions=resync_live_sessions,
+                       device_status=device_status,
+                       ota=ota),
             host=web_host, port=WEB_PORT, loop="none", log_level="warning",
         )
     )
@@ -1061,9 +1311,13 @@ async def main() -> None:
 
     aiozc, info = await advertise_mdns()
     try:
-        # ping_interval=None: the 78/esp-ml307 WebSocket on the firmware
-        # doesn't reply to pings, so server-side keepalive trips the
-        # connection every ~50 s. We accept the lost dead-conn detection.
+        # ping_interval=None: server-side keepalive tripped the firmware's
+        # link every ~50 s when it was tried (Phase 4). esp-ml307 3.6.x does
+        # answer pings on paper (web_socket.cc echoes 0x9 as 0xA), but that
+        # isn't re-verified on the device, and a wrong guess drops the robot
+        # every minute. Dead links are caught instead by the firmware's
+        # 60 s status heartbeat (LINK_SILENCE_S) and by a reconnect
+        # superseding the old connection (handle()).
         async with serve(
             handle, HOST, PORT, max_size=2**20, ping_interval=None
         ):
@@ -1086,7 +1340,7 @@ async def main() -> None:
         web.should_exit = True
         await web_task
         await mcp_client.aclose()
-        await a2a_client.aclose()
+        await ha_fast_path.aclose()
         if aiozc is not None and info is not None:
             await aiozc.async_unregister_service(info)
             await aiozc.async_close()
@@ -1097,7 +1351,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         # systemd stops us with SIGINT (deploy/stackchan-brain.service) so that
-        # main()'s finally can unregister mDNS and close the MCP/A2A clients.
+        # main()'s finally can unregister mDNS and close the MCP client.
         # Letting KeyboardInterrupt escape would exit non-zero and leave the
         # unit sitting in `failed` after every ordinary stop.
         log.info("interrupted — shut down cleanly")

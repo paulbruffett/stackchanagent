@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,23 @@ class Transcript:
     avg_logprob: float = 0.0
     peak_pct: float = 0.0
     rms_pct: float = 0.0
+
+
+# The firmware sends ~500 ms of pre-roll from before the wakeword fired, so a
+# transcript often opens with the tail of the wake word itself.
+_WAKE_WORD_LEAD = re.compile(r"^\W*(?:hey\W+)?(?:com)?puter\b\W*", re.IGNORECASE)
+
+
+def strip_wake_word(text: str) -> str:
+    """Drop a leading "computer" (or its clipped tail, "puter") from a
+    transcript, keeping the rest verbatim."""
+    return _WAKE_WORD_LEAD.sub("", text, count=1)
+
+
+def starts_with_wake_word(text: str) -> bool:
+    """True when the transcript opens with the wake word — the user
+    addressed the robot directly even though the mic was already open."""
+    return bool(_WAKE_WORD_LEAD.match(text))
 
 
 def should_drop_follow_up(
@@ -83,6 +101,9 @@ class Transcriber:
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
+        # Space-separated hint phrases for Whisper (see transcribe). Replaced
+        # wholesale by the brain's vocabulary refresher; a str swap is atomic.
+        self.hotwords: str = ""
         self._model: WhisperModel | None = None
         # Everything that touches the model runs on a worker thread now, and
         # faster-whisper's model object is not safe to drive from two threads
@@ -145,6 +166,9 @@ class Transcriber:
                 audio,
                 language="en",
                 beam_size=1,
+                # Device and room names from Home Assistant (set by the
+                # brain); biases a quiet "office light" away from "office air".
+                hotwords=self.hotwords or None,
                 # Short utterances; word timestamps and VAD aren't needed.
                 vad_filter=False,
                 condition_on_previous_text=False,

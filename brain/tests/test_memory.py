@@ -9,7 +9,7 @@ import pytest
 def test_append_turns_atomic_and_ordered(mem):
     ids = mem.append_turns([
         {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "assistant", "content": "hello"},
     ])
     assert ids == [1, 2]
     assert mem.unsummarized_count() == 2
@@ -36,14 +36,20 @@ def test_append_turns_empty_is_noop(mem):
 
 
 def test_update_turn(mem):
-    (tid,) = mem.append_turns([{"role": "assistant", "content": [
-        {"type": "tool_use", "id": "a", "name": "x", "input": {}},
-        {"type": "text", "text": "hi"},
-    ]}])
-    assert mem.update_turn(tid, [{"type": "text", "text": "hi"}]) is True
+    call = {"id": "a", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+    (tid,) = mem.append_turns([
+        {"role": "assistant", "content": "hi", "tool_calls": [call]},
+    ])
+    assert mem.list_unsummarized_turns()[0].extra == {"tool_calls": [call]}
+    # The 2-arg form replaces content only; extra_json is left alone.
+    assert mem.update_turn(tid, "hello") is True
+    assert mem.list_unsummarized_turns()[0].message == {
+        "role": "assistant", "content": "hello", "tool_calls": [call]}
+    # Passing extra replaces it; {} clears it entirely.
+    assert mem.update_turn(tid, "hi", {}) is True
     rows = mem.list_unsummarized_turns()
-    assert rows[0].content == [{"type": "text", "text": "hi"}]
-    assert mem.update_turn(9999, []) is False
+    assert rows[0].message == {"role": "assistant", "content": "hi"}
+    assert mem.update_turn(9999, "x") is False
 
 
 def test_delete_turn(mem):
@@ -130,19 +136,46 @@ def test_pending_migrations_apply_once_to_an_existing_db(tmp_path, monkeypatch):
 
     path = tmp_path / "m.db"
     memory_mod.Memory(path).close()          # a DB from before the migration
+    head = len(memory_mod.MIGRATIONS)
     monkeypatch.setattr(
         memory_mod, "MIGRATIONS",
-        ["ALTER TABLE turns ADD COLUMN exchange_id INTEGER;"],
+        memory_mod.MIGRATIONS + ["ALTER TABLE turns ADD COLUMN exchange_id INTEGER;"],
     )
     m = memory_mod.Memory(path)
     cols = {r[1] for r in m._conn.execute("PRAGMA table_info(turns)")}
     assert "exchange_id" in cols
-    assert m._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert m._conn.execute("PRAGMA user_version").fetchone()[0] == head + 1
     m.close()
     # Re-opening must not re-run it — a second ALTER would raise.
     m2 = memory_mod.Memory(path)
-    assert m2._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert m2._conn.execute("PRAGMA user_version").fetchone()[0] == head + 1
     m2.close()
+
+
+def test_pre_openai_db_gains_the_extra_column_and_still_reads(tmp_path):
+    # The deployed memory.db predates extra_json (user_version 0). Opening it
+    # must add the column rather than fail the first SELECT naming it.
+    import sqlite3
+
+    import memory as memory_mod
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+        "role TEXT NOT NULL, content_json TEXT NOT NULL, "
+        "summarized INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO turns(ts, role, content_json) VALUES (0, 'user', '\"hi\"');"
+    )
+    conn.close()
+    m = memory_mod.Memory(path)
+    (turn,) = m.list_unsummarized_turns()
+    assert turn.message == {"role": "user", "content": "hi"}
+    m.append_turns([{"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "c1", "type": "function",
+                                     "function": {"name": "x", "arguments": "{}"}}]}])
+    assert m.list_unsummarized_turns()[-1].extra["tool_calls"][0]["id"] == "c1"
+    m.close()
 
 
 def test_fresh_db_is_stamped_at_head_without_running_migrations(tmp_path, monkeypatch):
@@ -215,3 +248,15 @@ def test_merge_facts_dedupes_case_insensitively(mem):
     ])
     assert added == 1
     assert mem.list_facts() == ["Paul likes coffee", "Paul lives in Seattle"]
+
+
+def test_delete_block_list_turns_spares_strings_and_nulls(mem):
+    mem.append_turns([
+        {"role": "user", "content": "keep"},
+        {"role": "assistant", "content": [{"type": "text", "text": "legacy"}]},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "user", "content": "[bracketed but a string]"},
+    ])
+    assert mem.delete_block_list_turns() == 1
+    assert [t.content for t in mem.recent_turns()] == [
+        "keep", None, "[bracketed but a string]"]

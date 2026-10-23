@@ -1,22 +1,31 @@
 #include "commands.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <hal/board/hal_bridge.h>
 #include <hal/hal.h>
 #include <mooncake_log.h>
+#include <stackchan/animation/animation.h>
 #include <stackchan/avatar/avatar/elements/emotion.h>
-#include <stackchan/avatar/skins/default/default.h>
-#include <stackchan/avatar/skins/rocky/rocky.h>
+#include <stackchan/modifiers/dance.h>
 #include <stackchan/stackchan.h>
 
+#include "alert.h"
 #include "buddy_ble.h"
+#include "ota.h"
 #include "state.h"
+#include "transport.h"
 
 namespace agent::commands {
 
@@ -53,8 +62,7 @@ std::mutex g_face_mu;
 // spring teleports — a visible head jump plus a dropped pose. The same two
 // tasks were also racing on _angle_anim, which no bus lock would cover. So
 // queue the raw frame here and let the idle loop run it: one task owns
-// StackChan. It also gets apply_set_skin's LVGL rebuild off tcp_receive's
-// 4 KB stack.
+// StackChan. It also keeps set_buddy's NVS write + restart off tcp_receive.
 constexpr size_t kMaxQueuedCommands = 16;
 
 std::mutex g_queue_mu;
@@ -76,8 +84,8 @@ void apply_set_expression(JsonDocument& doc)
     const char* value = doc["value"] | "neutral";
     LvglLockGuard lock;
     if (std::string_view{value} == "celebrate") {
-        // No "celebrate" Emotion; skins decide how to render it (Rocky adds
-        // confetti, the default maps it to Happy).
+        // No "celebrate" Emotion; the avatar decides how to render it (the
+        // default maps it to Happy).
         GetStackChan().avatar().celebrate();
     } else {
         GetStackChan().avatar().setEmotion(parse_emotion(value));
@@ -131,43 +139,292 @@ void apply_set_busy(JsonDocument& doc)
     mclog::tagInfo(TAG, "busy: {}", on);
 }
 
-// Active skin. Boot brings up DefaultAvatar (hal/board/stackchan_display.cc
-// SetupUI), so this starts at Default; the brain syncs it via set_skin on
-// connect and whenever ROCKY_MODE changes.
-enum class Skin { Default, Rocky };
-Skin g_current_skin = Skin::Default;
+// Turn watchdog. Only the brain ends a LISTENING or SPEAKING turn, and the
+// wakeword is paused and the head tap gated to Idle meanwhile. transport
+// already drops to Idle when the link goes down, but a brain that is connected
+// yet wedged would leave the robot deaf. Both clocks run from the later of
+// entering the mode and the last inbound brain frame.
+//
+// LISTENING: the brain's captures are capped below this — MAX_UTTERANCE_MS
+// max 12000 and FOLLOW_UP_WINDOW_S max 10 (brain/config.py); the follow-up
+// window is opened by start_listening, itself a frame. Keep those caps below
+// this value if either changes.
+constexpr int64_t kListeningWatchdogMs = 15000;
+// SPEAKING: a slow MCP tool (45 s dispatch timeout) can legitimately hold the
+// device in SPEAKING with no frames after the spoken ack filler.
+constexpr int64_t kSpeakingWatchdogMs = 60000;
 
-// Runtime skin swap. Both skins ship in the build; ROCKY_MODE (a brain knob)
-// is the single source of truth and the brain emits set_skin. The framework
-// swap is pointer-safe: the Breath/Blink/HeadPet modifiers re-fetch
-// avatar().leftEye()/mouth()/getEmotion() fresh every tick, so they need no
-// teardown — they simply poke the new avatar next tick.
-void apply_set_skin(JsonDocument& doc)
+void apply_set_buddy(JsonDocument& doc)
 {
-    const char* value = doc["value"] | "default";
-    Skin want         = (std::string_view{value} == "rocky") ? Skin::Rocky : Skin::Default;
-    if (want == g_current_skin) {
+    if (!doc["enabled"].is<bool>()) {
+        mclog::tagWarn(TAG, "set_buddy: missing/non-bool enabled");
         return;
     }
-    LvglLockGuard lock;
-    auto& stackchan = GetStackChan();
-    if (want == Skin::Rocky) {
-        auto a = std::make_unique<stackchan::avatar::RockyAvatar>();
-        a->init(lv_screen_active());
-        stackchan.attachAvatar(std::move(a));
-    } else {
-        auto a = std::make_unique<stackchan::avatar::DefaultAvatar>();
-        a->init(lv_screen_active());
-        stackchan.attachAvatar(std::move(a));
+    // May not return: restarts the device when the setting changes.
+    buddy_ble::set_enabled(doc["enabled"].as<bool>());
+}
+
+// Speaker volume as last applied, 0..100; -1 until first read. Tracked here
+// rather than re-read with getSpeakerVolume(): that one maps a stored 0 to 10
+// (xiaozhi's boot floor), so a brain that set 0 would see 10 reported and keep
+// re-sending. Written on the main task, read from the transport task (boot)
+// and the status task.
+std::atomic<int> g_volume{-1};
+
+int current_volume()
+{
+    int v = g_volume.load();
+    if (v < 0) {
+        v = GetHAL().getSpeakerVolume();
+        g_volume.store(v);
     }
-    g_current_skin = want;
-    // The new avatar starts blank — let the BLE buddy redraw any pending
-    // prompt/PIN bubble that the rebuild wiped.
-    buddy_ble::notify_avatar_swapped();
-    mclog::tagInfo(TAG, "skin: {}", value);
+    return v;
+}
+
+// "battery":..,"charging":..,"volume":.. from values already read.
+std::string format_status(bool read_ok, int pct, bool charging)
+{
+    std::string out = "\"battery\":";
+    // The AXP2101 fuel gauge reads 0..100; anything else means no usable
+    // reading (no battery, gauge not ready), reported as unknown.
+    if (read_ok && pct >= 0 && pct <= 100) {
+        out += std::to_string(pct);
+        out += charging ? ",\"charging\":true" : ",\"charging\":false";
+    } else {
+        out += "null,\"charging\":null";
+    }
+    out += ",\"volume\":" + std::to_string(current_volume());
+    return out;
+}
+
+// --- status reporter --------------------------------------------------------
+//
+// Its own low-priority task, so neither the PMIC's I2C reads nor a WebSocket
+// send that stalls on a full TCP window ever holds up the main loop (servos,
+// avatar, command drain). It polls only the charging bit every 2 s and reads
+// the level only when it actually reports: every 60 s, on a charging flip, or
+// when asked (request_status, after set_volume).
+constexpr uint32_t kStatusPollMs   = 2000;
+constexpr int64_t kStatusReportMs  = 60000;
+TaskHandle_t g_status_task         = nullptr;
+
+void status_task(void*)
+{
+    int last_charging      = -1;  // -1 unknown, else 0/1
+    int64_t next_report_ms = 0;
+    while (true) {
+        bool requested = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kStatusPollMs)) > 0;
+        bool charging  = false;
+        int ch         = GetHAL().readBatteryCharging(charging) ? (charging ? 1 : 0) : -1;
+        bool flipped   = last_charging != -1 && ch != -1 && ch != last_charging;
+        if (ch != -1) last_charging = ch;
+        if (flipped) mclog::tagInfo(TAG, "charging: {}", ch == 1);
+        int64_t now = state::now_ms();
+        if (!requested && !flipped && now < next_report_ms) continue;
+        // Not connected: the boot event carries it on (re)connect.
+        if (!transport::is_connected()) continue;
+        next_report_ms = now + kStatusReportMs;
+        int pct = 0;
+        bool ok = GetHAL().readBatteryStatus(pct, charging);
+        transport::send_event_json("{\"event\":\"status\"," + format_status(ok, pct, charging) + "}");
+    }
+}
+
+void request_status()
+{
+    if (g_status_task) xTaskNotifyGive(g_status_task);
+}
+
+void apply_set_volume(JsonDocument& doc)
+{
+    if (!doc["value"].is<int>()) {
+        mclog::tagWarn(TAG, "set_volume: missing/non-int value");
+        return;
+    }
+    int v = std::clamp(doc["value"].as<int>(), 0, 100);
+    // permanent: AudioCodec::SetOutputVolume writes NVS "audio"/"output_volume",
+    // which the codec reads back at boot.
+    GetHAL().setSpeakerVolume(static_cast<uint8_t>(v), true);
+    g_volume.store(v);
+    mclog::tagInfo(TAG, "volume: {}", v);
+    // Confirm at once (from the status task), so the brain's reported value
+    // is corrected if we clamped, instead of 60 s later.
+    request_status();
+}
+
+// --- dance ------------------------------------------------------------------
+//
+// Plays one of DanceModifier's stock keyframe sequences with our own bounded
+// modifier instead of DanceModifier itself: that one destroys itself when its
+// timeline ends, and a modifier id is reused as soon as it is freed, so the
+// caller could never tell "still dancing" from "some other modifier now has
+// that id".
+//
+// Only the fields this build wants are read from the stock keyframes, into
+// DanceStep:
+//  - Servos: pitch offset by the rest pose (the sequences were written around
+//    M5's home (0, 0); here pitch 0 is 3°, chin on the desk, and rest is 20°),
+//    and spring speed capped at kDanceMaxSpeed — Robot (800) and Panic (1000,
+//    reversing every 100 ms) otherwise command the snap moves 7d761aa/d976ad9
+//    worked to get rid of; capped, Panic reads as a fast wobble, not a jerk.
+//  - Features: weight, rotation and x only. Not size: FeatureKeyframe leaves
+//    it uninitialised, and no size value maps to the skin's default eye size
+//    (16 px; size 0 is 20 px), so it is left alone rather than reset. Not y:
+//    BreathModifier moves the features' y by deltas from its own running
+//    offset, and an absolute y write would silently shift that baseline (and
+//    drift a little further every dance). x is ours alone; every stock
+//    sequence ends at x = 0, and finish() puts it there too.
+constexpr int kRestYaw         = 0;
+constexpr int kRestPitch       = 200;  // tenths of a degree; matches main.cpp's resting pose
+constexpr int kDanceMaxSpeed   = 400;  // k ≈ 112, vs 200 (k ≈ 36) for look_at
+constexpr uint32_t kDanceMaxMs = 6000;
+
+bool g_dancing = false;  // main task only (dispatch + StackChan::update)
+
+struct FeatureStep {
+    int x, rotation, weight;
+};
+
+struct DanceStep {
+    FeatureStep left_eye, right_eye, mouth;
+    int yaw, yaw_speed, pitch, pitch_speed;
+    uint32_t duration_ms;
+};
+
+FeatureStep feature_step(const stackchan::animation::FeatureKeyframe& k)
+{
+    return {k.position.x, k.rotation, k.weight};
+}
+
+DanceStep dance_step(const stackchan::animation::Keyframe& kf)
+{
+    return {feature_step(kf.leftEye), feature_step(kf.rightEye), feature_step(kf.mouth),
+            kf.yawServo.angle, std::min(kf.yawServo.speed, kDanceMaxSpeed),
+            kf.pitchServo.angle + kRestPitch, std::min(kf.pitchServo.speed, kDanceMaxSpeed),
+            kf.durationMs};
+}
+
+void set_feature_x(stackchan::avatar::Feature& f, int x)
+{
+    auto pos = f.getPosition();
+    pos.x    = x;
+    f.setPosition(pos);
+}
+
+class BoundedDance : public stackchan::Modifier {
+public:
+    // Applies the first step at once: construct on the main task, LVGL lock held.
+    explicit BoundedDance(std::vector<DanceStep> steps)
+        : _steps(std::move(steps)), _deadline(GetHAL().millis() + kDanceMaxMs)
+    {
+        _step_at = GetHAL().millis();
+        apply(GetStackChan(), _steps[0]);
+    }
+
+    void _update(stackchan::Modifiable& sc) override
+    {
+        if (isDestroyRequested()) return;
+        uint32_t now = GetHAL().millis();
+        if (static_cast<int32_t>(now - _deadline) >= 0) {
+            finish(sc);
+            return;
+        }
+        if (now - _step_at < _steps[_index].duration_ms) return;
+        if (++_index >= _steps.size()) {
+            finish(sc);
+            return;
+        }
+        _step_at = now;
+        apply(sc, _steps[_index]);
+    }
+
+private:
+    static void apply_feature(stackchan::avatar::Feature& f, const FeatureStep& s)
+    {
+        set_feature_x(f, s.x);
+        f.setRotation(s.rotation);
+        f.setWeight(s.weight);
+    }
+
+    static void apply(stackchan::Modifiable& sc, const DanceStep& s)
+    {
+        if (sc.hasAvatar()) {
+            auto& avatar = sc.avatar();
+            apply_feature(avatar.leftEye(), s.left_eye);
+            apply_feature(avatar.rightEye(), s.right_eye);
+            apply_feature(avatar.mouth(), s.mouth);
+        }
+        sc.motion().yawServo().moveWithSpeed(s.yaw, s.yaw_speed);
+        sc.motion().pitchServo().moveWithSpeed(s.pitch, s.pitch_speed);
+    }
+
+    void finish(stackchan::Modifiable& sc)
+    {
+        // Home at the gentle look_at speed; put the face back to whatever
+        // emotion was set (it restores the eye weights/rotations the steps
+        // wrote), then re-sync the blink modifier's base weights exactly as
+        // StackChanAvatarDisplay::SetEmotion does.
+        sc.motion().moveWithSpeed(kRestYaw, kRestPitch, kLookAtSpeed);
+        if (sc.hasAvatar()) {
+            auto& avatar = sc.avatar();
+            set_feature_x(avatar.leftEye(), 0);
+            set_feature_x(avatar.rightEye(), 0);
+            set_feature_x(avatar.mouth(), 0);
+            avatar.setEmotion(avatar.getEmotion());
+            hal_bridge::display_resync_blink();
+        }
+        g_dancing = false;
+        requestDestroy();
+        mclog::tagInfo(TAG, "dance: done");
+    }
+
+    std::vector<DanceStep> _steps;
+    size_t _index = 0;
+    uint32_t _step_at = 0;
+    uint32_t _deadline;
+};
+
+void apply_dance(JsonDocument& doc)
+{
+    std::string_view style = doc["style"] | "happy";
+    if (g_dancing) {
+        mclog::tagInfo(TAG, "dance: {} ignored, already dancing", style);
+        return;
+    }
+    const stackchan::animation::KeyframeSequence* src = &stackchan::DanceModifier::Happy;
+    if (style == "robot") {
+        src = &stackchan::DanceModifier::Robot;
+    } else if (style == "panic") {
+        src = &stackchan::DanceModifier::Panic;
+    } else if (style != "happy") {
+        mclog::tagWarn(TAG, "dance: unknown style {}, dancing happy", style);
+        style = "happy";
+    }
+    std::vector<DanceStep> steps;
+    steps.reserve(src->size());
+    for (const auto& kf : *src) steps.push_back(dance_step(kf));
+    if (steps.empty()) return;
+    LvglLockGuard lock;
+    GetStackChan().addModifier(std::make_unique<BoundedDance>(std::move(steps)));
+    g_dancing = true;
+    mclog::tagInfo(TAG, "dance: {}", style);
 }
 
 }  // namespace
+
+std::string status_fields()
+{
+    int pct       = 0;
+    bool charging = false;
+    bool ok       = GetHAL().readBatteryStatus(pct, charging);
+    return format_status(ok, pct, charging);
+}
+
+void start_status_reporter()
+{
+    if (g_status_task) return;
+    xTaskCreatePinnedToCore(status_task, "agent_status", 4096, nullptr, 1, &g_status_task, 0);
+}
 
 void wake_face()
 {
@@ -225,6 +482,22 @@ void drain()
     }
 }
 
+void check_turn_watchdog()
+{
+    // Same Idle transition as the brain's stop_listening / stop_speaking,
+    // then tell the brain so it drops its side of the turn too.
+    int64_t last_rx = transport::last_rx_ms();
+    if (state::expire_if_stale(state::Mode::Listening, last_rx, kListeningWatchdogMs)) {
+        mclog::tagWarn(TAG, "LISTENING > {} ms with no brain frame; back to idle",
+                       kListeningWatchdogMs);
+        transport::send_event_json("{\"event\":\"listen_timeout\"}");
+    } else if (state::expire_if_stale(state::Mode::Speaking, last_rx, kSpeakingWatchdogMs)) {
+        mclog::tagWarn(TAG, "SPEAKING > {} ms with no brain frame; back to idle",
+                       kSpeakingWatchdogMs);
+        transport::send_event_json("{\"event\":\"speak_timeout\"}");
+    }
+}
+
 void dispatch(std::string_view json)
 {
     JsonDocument doc;
@@ -266,12 +539,24 @@ void dispatch(std::string_view json)
     } else if (c == "set_busy") {
         wake_face();
         apply_set_busy(doc);
-    } else if (c == "set_skin") {
-        apply_set_skin(doc);
+    } else if (c == "set_buddy") {
+        apply_set_buddy(doc);
+    } else if (c == "set_volume") {
+        apply_set_volume(doc);
+    } else if (c == "dance") {
+        wake_face();
+        apply_dance(doc);
+    } else if (c == "ota") {
+        // Only kicks off the download task; it never blocks this loop.
+        ota::start(doc["url"] | "", doc["size"] | static_cast<size_t>(0), doc["sha256"] | "",
+                   doc["id"] | 0);
     } else if (c == "sleep") {
         sleep_face();
     } else if (c == "wake") {
         wake_face();
+    } else if (c == "alert") {
+        // Timer/reminder chime + attention face; wakes the screen itself.
+        alert::start(doc["style"] | "timer");
     } else {
         mclog::tagWarn(TAG, "unknown cmd: {}", c);
     }

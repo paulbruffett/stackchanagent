@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <string_view>
 
+#include <esp_bt.h>
+#include <esp_heap_caps.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
@@ -25,10 +28,11 @@
 #include <board.h>
 #include <display/display.h>
 
+#include "agent/alert.h"
 #include "agent/buddy_ble.h"
-#include "agent/camera_pump.h"
 #include "agent/commands.h"
 #include "agent/mic_pump.h"
+#include "agent/ota.h"
 #include "agent/speaker_play.h"
 #include "agent/state.h"
 #include "agent/transport.h"
@@ -72,7 +76,13 @@ static void on_single_tap()
         mclog::tagInfo(TAG, "head tap → approve buddy prompt");
         return;
     }
+    // A chiming timer: tap = dismiss, not a listening turn.
+    if (agent::alert::dismiss()) {
+        mclog::tagInfo(TAG, "head tap → dismiss timer alert");
+        return;
+    }
     if (agent::state::current() != agent::state::Mode::Idle) return;
+    if (agent::ota::in_progress()) return;
     agent::commands::wake_face();
     // Same reasoning as the wakeword path: don't enter LISTENING unless
     // the brain heard the tap.
@@ -108,10 +118,29 @@ static void network_task(void*)
     set_net_status({});
 
     agent::transport::start(BRAIN_HOST, BRAIN_PORT);
-    agent::camera_pump::start();
-    // BLE last, deliberately: this keeps NimBLE's bring-up after the Wi-Fi
-    // controller's, the order this build has always run in.
-    agent::buddy_ble::start();
+    // Runtime setting in NVS, pushed by the brain's BUDDY_ENABLED knob
+    // (set_buddy reboots on change, so it is only ever read here).
+    if (agent::buddy_ble::enabled()) {
+        mclog::tagInfo(TAG, "BLE buddy: on");
+        // BLE last, deliberately: this keeps NimBLE's bring-up after the
+        // Wi-Fi controller's, the order this build has always run in.
+        agent::buddy_ble::start();
+    } else {
+        // BLE can't come back this boot (turning the buddy on goes through
+        // set_buddy's reboot), so hand the idle controller's static memory
+        // (~70 KB internal RAM) to the heap. Legal only while the controller
+        // is IDLE, i.e. never initialised — nothing else here brings BT up.
+        size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        esp_err_t rel_err  = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        size_t free_after  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        mclog::tagInfo(TAG, "BLE buddy: off; bt controller mem release: {} (internal free {} -> {})",
+                       esp_err_to_name(rel_err), free_before, free_after);
+        // No BLE controller running, so Wi-Fi can stay awake. Modem sleep
+        // (the default, and mandatory under BT coexistence) parks ACKs until
+        // the next beacon, which throttles the mic uplink's TCP window.
+        esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+        mclog::tagInfo(TAG, "wifi power save off: {}", esp_err_to_name(ps_err));
+    }
     vTaskDelete(nullptr);
 }
 
@@ -181,14 +210,17 @@ extern "C" void app_main(void)
         [](std::string_view json) { agent::commands::enqueue(json); });
     agent::speaker_play::start();
     agent::wakeword::on_detected([](const std::string& w) {
+        // Mid-update: no turns. ota::start paused detection; a detection
+        // that raced it just drops (the OTA task resumes on failure).
+        if (agent::ota::in_progress()) return;
         // Relight the screen first if we were asleep (instant, local —
         // doesn't wait on the brain round-trip).
         agent::commands::wake_face();
-        // Only arm LISTENING once the brain has actually been told. Nothing
-        // on-device leaves LISTENING on its own — the wakenet is paused there
-        // and the head tap is gated to Idle — so transitioning on an event the
-        // transport silently dropped would leave the robot deaf for the rest
-        // of the outage. AfeWakeWord::AudioDetectionTask already called Stop()
+        // Only arm LISTENING once the brain has actually been told. Only the
+        // brain (or, 15 s later, the turn watchdog) leaves LISTENING — the
+        // wakenet is paused there and the head tap is gated to Idle — so
+        // transitioning on an event the transport silently dropped would leave
+        // the robot deaf for no reason. AfeWakeWord::AudioDetectionTask already called Stop()
         // before invoking us, and staying in Idle means transition() would
         // never resume it (prev == next short-circuits), so re-arm by hand.
         if (!agent::transport::send_event_json(
@@ -201,16 +233,26 @@ extern "C" void app_main(void)
     });
     agent::wakeword::start();
     agent::mic_pump::start();
+    // Battery/charging/volume reports to the brain, on their own task.
+    agent::commands::start_status_reporter();
 
     // Head taps. The capacitive head sensor emits HeadPetGesture::Press on a
-    // touch-down (the avatar's HeadPet modifier only reacts to swipes, so
-    // Press is unused). The touch task only records presses; the idle loop
-    // below runs the single-tap action once the double-tap window closes.
+    // touch-down. The touch task only records presses; the idle loop below
+    // runs the single-tap action once the double-tap window closes.
     //   single tap → talk (see on_single_tap above)
     //   double tap → {"event":"double_tap"}; the brain toggles a light
+    // A swipe is petting (the avatar's HeadPet modifier reacts to it), not a
+    // tap: it cancels the pending press so stroking the head never toggles
+    // the light.
     GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
-        if (gesture != HeadPetGesture::Press) return;
         uint32_t now = GetHAL().millis();
+        if (gesture == HeadPetGesture::SwipeForward
+            || gesture == HeadPetGesture::SwipeBackward) {
+            g_pending_tap_ms.store(0);
+            g_last_tap_ms = now;
+            return;
+        }
+        if (gesture != HeadPetGesture::Press) return;
         uint32_t first = g_pending_tap_ms.load();
         if (first != 0 && now - first < kDoubleTapWindowMs) {
             // Too soon after the first press: sensor flicker, not a tap.
@@ -278,12 +320,16 @@ extern "C" void app_main(void)
         // Brain commands run here, on the one task that owns StackChan and the
         // servo bus. Outside the LVGL lock — dispatch takes it itself.
         agent::commands::drain();
+        agent::commands::check_turn_watchdog();
+        agent::alert::tick();
         // Buddy face/bubble arbitration — runs outside the LVGL lock (it
         // takes the lock itself when it draws). Cheap when there's no link.
         agent::buddy_ble::tick();
-        uint32_t now = GetHAL().millis();
-        // No second press inside the window: it was a single tap.
+        // No second press inside the window: it was a single tap. Load the
+        // pending press before reading the clock, so a press stamped just
+        // after `now` can't underflow `now - tap` and fire early.
         uint32_t tap = g_pending_tap_ms.load();
+        uint32_t now = GetHAL().millis();
         if (tap != 0 && now - tap >= kDoubleTapWindowMs
             && g_pending_tap_ms.compare_exchange_strong(tap, 0)) {
             on_single_tap();
@@ -304,21 +350,16 @@ extern "C" void app_main(void)
             if (offline != last_offline_state) {
                 LvglLockGuard lock;
                 offline_badge->setHidden(!offline);
-                // set_skin rebuilds the avatar as a new, opaque, full-screen
-                // child of the same screen, so LVGL draws it over the badge.
-                // With ROCKY_MODE on that happens on the first brain connect —
-                // before the badge has ever been shown. Re-raise it here.
-                offline_badge->moveForeground();
                 last_offline_state = offline;
                 mclog::tagInfo(TAG, "brain link: {}",
                                offline ? "OFFLINE" : "online");
             }
         }
-        // Also marks a freshly-OTA'd image valid: sdkconfig keeps
-        // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y over a two-slot partition
-        // table, and this is the only caller of the confirmation path left
-        // after the M5 app-launcher loop was removed. Self-rate-limited to
-        // 10 s; the heap stats come along for free.
+        // A freshly-OTA'd image boots PENDING_VERIFY
+        // (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE): valid after 30 s of
+        // unbroken brain link, rolled back if not within 5 min of boot.
+        agent::ota::confirm_tick();
+        // Self-rate-limited to 10 s.
         GetHAL().updateHeapStatusLog();
         GetHAL().feedTheDog();
         GetHAL().delay(20);

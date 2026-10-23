@@ -9,7 +9,12 @@ description = "Jetson-side agent for the M5StackChan refactor"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "websockets>=12.0",
-    "anthropic>=0.40.0",
+    # LLM calls go to OpenRouter through its OpenAI-compatible API.
+    "openai>=3.19,<4",
+    # Imported directly for their stream-time transport error types (see
+    # claude_agent._TRANSPORT_ERRORS); openai 3.x is built on them.
+    "httpx2>=2.12,<3",
+    "httpcore2>=2.12,<3",
     "zeroconf>=0.131.0",
     "python-dotenv>=1.0",
     "numpy>=1.26",
@@ -20,22 +25,22 @@ dependencies = [
     # overrides sources for packages listed in [project.dependencies].
     "ctranslate2>=4.7",
     "piper-tts>=1.2.0",
-    # Face detection uses OpenCV's bundled Haar cascade — no extra model
-    # download, no mediapipe. headless variant: no GUI libs, avoids
-    # libavdevice collision with faster-whisper's `av` (PyAV) dependency.
-    "opencv-python-headless>=4.9",
     # Phase 9a web console (in-process with agent_server). Plain uvicorn —
     # not uvicorn[standard] — to avoid compiling uvloop/httptools on the
     # Jetson aarch64; the default asyncio loop is fine here.
     "fastapi>=0.110",
     "uvicorn>=0.29",
-    # Phase 9b: MCP client (and FastMCP for our local weather/Hue servers).
+    # FastAPI's UploadFile/Form parsing (the console's firmware upload).
+    # mcp happens to pull it in too; declared so that stays true if mcp
+    # ever drops it.
+    "python-multipart>=0.0.9",
+    # Phase 9b: MCP client (and FastMCP for our local weather server).
     # Pinned below 2.0: mcp 2.x dropped mcp.server.fastmcp (FastMCP moved to
-    # the separate 'fastmcp' package), which mcp_servers/weather.py and
-    # hue.py import. Unpin once those are ported.
+    # the separate 'fastmcp' package), which mcp_servers/weather.py imports.
+    # Unpin once it's ported.
     "mcp>=1.2,<2",
-    # Weather/Hue MCP servers make outbound HTTP to Open-Meteo / the Hue
-    # bridge. httpx is already pulled in by mcp, but pin it explicitly.
+    # The weather MCP server makes outbound HTTP to Open-Meteo. httpx is
+    # already pulled in by mcp, but pin it explicitly.
     "httpx>=0.27",
 ]
 

@@ -14,26 +14,42 @@ sends it as a header, the log/turn WebSockets as a query param.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import secrets
 import socket
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 from claude_agent import (
     DEFAULT_SYSTEM_PROMPT,
+    OPENROUTER_BASE_URL,
     consolidate_facts,
+    get_client,
     repair_memory,
     summarize_backlog,
+    summary_model,
 )
+import timers
 from config import SPECS, Config
+from firmware_ota import OTA_PARTITION_SIZE, ImageError, OtaManager
 from memory import Memory
 from webui.logbuf import LOGS, TURNS, Broadcaster
 
@@ -43,18 +59,47 @@ log = logging.getLogger("brain.webui")
 
 TOKEN_HEADER = "x-stackchan-token"
 
-# `env_ref` names the one .env variable a child MCP server / A2A endpoint is
-# allowed to see, which is the point of the field (HUE_TOKEN for the Hue
+# `env_ref` names the one .env variable a child MCP server is allowed to see,
+# which is the point of the field (e.g. HA_TOKEN for a Home Assistant http
 # server). What it must never name is a credential the *brain* itself holds:
 # mcp_client._child_env strips secret-looking vars from the child environment
-# and then re-adds exactly the named one, so `env_ref: ANTHROPIC_API_KEY`
+# and then re-adds exactly the named one, so `env_ref: OPENROUTER_API_KEY`
 # hands our own key to whatever command that registry row launches.
-PROTECTED_ENV = {"ANTHROPIC_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
+PROTECTED_ENV = {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "HUME_API_KEY", "CONSOLE_TOKEN"}
 
 # The only two mcp_client._open_session knows how to open. Anything else was
 # accepted by the registry and then failed at connect time with a ValueError
 # the operator only ever saw as a red dot.
 MCP_TRANSPORTS = ("stdio", "http")
+
+# OpenRouter's public model catalog, offered as suggestions for the MODEL and
+# SUMMARY_MODEL knobs. It changes rarely and is a few hundred KB, so it is
+# cached in memory rather than fetched on every config-tab load.
+MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
+MODELS_TTL_S = 3600.0
+# Test seam: an httpx transport to fetch the catalog through (None = network).
+_MODELS_TRANSPORT: httpx.AsyncBaseTransport | None = None
+
+
+async def _fetch_tool_models() -> list[dict[str, Any]]:
+    """OpenRouter models that accept tool calls — the only ones this agent
+    can use — as [{id, name, context_length, pricing}] sorted by id. Raises
+    on any network or shape error; the endpoint degrades that to []."""
+    async with httpx.AsyncClient(timeout=10.0, transport=_MODELS_TRANSPORT) as client:
+        resp = await client.get(MODELS_URL)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+    out = [
+        {
+            "id": m["id"],
+            "name": m.get("name") or m["id"],
+            "context_length": m.get("context_length"),
+            "pricing": m.get("pricing"),
+        }
+        for m in data
+        if "tools" in (m.get("supported_parameters") or [])
+    ]
+    return sorted(out, key=lambda m: m["id"])
 
 
 def _host_allowed(host_header: str) -> bool:
@@ -106,10 +151,12 @@ def _check_transport(transport: Any) -> None:
 
 
 def create_app(
-    memory: Memory, config: Config, mcp: Any = None, a2a: Any = None,
+    memory: Memory, config: Config, mcp: Any = None,
     *,
     token: str | None = None,
     resync_sessions: Callable[[], Awaitable[int]] | None = None,
+    device_status: Callable[[], dict[str, Any]] | None = None,
+    ota: OtaManager | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Stack-Chan brain console")
 
@@ -117,15 +164,14 @@ def create_app(
         log.warning("web console running WITHOUT a token — every API route, "
                     "including MCP server registration, is open")
 
-    # Lazy Anthropic client for operator-triggered LLM jobs (summarize now,
-    # fact compaction). Created on first use inside the app's event loop and
-    # reused; the agent has its own per-session client.
-    _llm: dict[str, AsyncAnthropic] = {}
+    # OpenRouter client for operator-triggered LLM jobs (summarize now, fact
+    # compaction): the same process-wide client the agent sessions use.
+    def llm_client() -> AsyncOpenAI:
+        return get_client()
 
-    def llm_client() -> AsyncAnthropic:
-        if "c" not in _llm:
-            _llm["c"] = AsyncAnthropic()
-        return _llm["c"]
+    # (fetched_at, models) — only successful fetches are cached, so a
+    # transient failure is retried on the next config-tab load.
+    _models: dict[str, Any] = {"at": 0.0, "items": None}
 
     async def resync_live() -> int:
         """Push a durable-history rewrite into the live conversation(s).
@@ -148,12 +194,17 @@ def create_app(
         before it can present a token. Everything else needs the header (or
         `?token=` for clients that can't set one), because the mutating half
         of this API runs processes as the brain's user and the read half
-        streams every transcript."""
+        streams every transcript.
+
+        /firmware/<token>.bin is the exception: the robot fetches its update
+        there and can't present the console token, so the one-time, expiring
+        path is the credential (firmware_ota.OtaManager.claim)."""
         if not _host_allowed(request.headers.get("host", "")):
             return JSONResponse({"detail": "unrecognised Host header"},
                                 status_code=403)
         path = request.url.path
-        public = path == "/" or path.startswith("/static")
+        public = (path == "/" or path.startswith("/static")
+                  or path.startswith("/firmware/"))
         if token and not public:
             presented = (request.headers.get(TOKEN_HEADER)
                          or request.query_params.get("token"))
@@ -191,6 +242,11 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     # --- config -------------------------------------------------------
+    @app.get("/api/device")
+    async def get_device() -> dict[str, Any]:
+        """The robot's last battery / charging / volume report."""
+        return device_status() if device_status else {"connected": False}
+
     @app.get("/api/config")
     async def get_config_api() -> dict[str, Any]:
         return {"items": config.describe()}
@@ -212,6 +268,21 @@ def create_app(
         # config.set had already persisted the value, telling the caller the
         # write failed when it had landed.
         return {"key": key, "value": value, "restart": SPECS[key].restart}
+
+    @app.get("/api/models")
+    async def list_models() -> list[dict[str, Any]]:
+        """Tool-capable OpenRouter models, for the MODEL / SUMMARY_MODEL
+        suggestion lists. [] when the catalog can't be fetched — the inputs
+        still take free text, so this must never fail the config tab."""
+        if _models["items"] is not None and time.monotonic() - _models["at"] < MODELS_TTL_S:
+            return _models["items"]
+        try:
+            items = await _fetch_tool_models()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not fetch the OpenRouter model list: %s", exc)
+            return []
+        _models.update(at=time.monotonic(), items=items)
+        return items
 
     # --- persona / system prompt --------------------------------------
     # The persona is a hot config knob (SYSTEM_PROMPT) but too large for the
@@ -275,14 +346,32 @@ def create_app(
             raise HTTPException(404, "no such fact")
         return {"ok": True}
 
+    # --- timers (timers.py) -------------------------------------------
+    @app.get("/api/timers")
+    async def list_timers() -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        return {
+            "now": now.timestamp(),
+            "timers": [
+                {"id": t.id, "label": t.label, "kind": t.kind,
+                 "fire_ts": t.fire_ts, "duration_s": t.duration_s,
+                 "describe": timers.describe(t, now)}
+                for t in memory.list_timers()
+            ],
+        }
+
+    @app.delete("/api/timers/{timer_id}")
+    async def cancel_timer(timer_id: int) -> dict[str, Any]:
+        if not memory.delete_timer(timer_id):
+            raise HTTPException(404, "no such timer")
+        return {"ok": True}
+
     # LLM fact compaction: propose a consolidated list (no write), then the
     # client POSTs the approved set to /apply.
     @app.post("/api/memories/facts/compact")
     async def compact_facts() -> dict[str, Any]:
         facts = memory.list_facts()
-        proposed = await consolidate_facts(
-            llm_client(), config.get("MODEL"), facts
-        )
+        proposed = await consolidate_facts(llm_client(), summary_model(), facts)
         return {"original": facts, "proposed": proposed}
 
     @app.post("/api/memories/facts/apply")
@@ -332,7 +421,7 @@ def create_app(
         result, reason = await summarize_backlog(
             memory,
             llm_client(),
-            config.get("MODEL"),
+            summary_model(),
             keep_recent=int(config.get("KEEP_RECENT_TURNS")),
             force=True,
         )
@@ -355,16 +444,19 @@ def create_app(
     async def list_turns(limit: int = 50) -> dict[str, Any]:
         limit = max(1, min(limit, 500))
         return {
+            # The whole stored message: tool_calls / tool_call_id ride beside
+            # the content. Pre-OpenRouter rows still carry block-list content;
+            # the page renders both.
             "turns": [
-                {"id": t.id, "role": t.role, "content": t.content}
+                {"id": t.id, **t.message}
                 for t in memory.recent_turns(limit)
             ]
         }
 
     @app.post("/api/memories/repair")
     async def repair_conversation() -> dict[str, Any]:
-        """Run the M6.5 integrity pass on demand: heal dangling tool_use /
-        orphan tool_result corruption in the unsummarized tail and report the
+        """Run the M6.5 integrity pass on demand: heal dangling tool-call /
+        orphan tool-result corruption in the unsummarized tail and report the
         counts. Safe to run anytime; a clean DB changes nothing."""
         counts = repair_memory(memory)
         live = await resync_live()
@@ -452,68 +544,71 @@ def create_app(
         await mcp.reload()
         return {"servers": mcp.status()}
 
-    # --- A2A servers (Phase 9c) ---------------------------------------
-    @app.get("/api/a2a/servers")
-    async def list_a2a() -> dict[str, Any]:
-        # Merge persisted registry rows with live connection status.
-        status = {s["name"]: s for s in (a2a.status() if a2a else [])}
-        servers = []
-        for s in memory.list_a2a_servers():
-            live = status.get(s.name, {})
-            servers.append({
-                "id": s.id, "name": s.name, "url": s.url,
-                "env_ref": s.env_ref, "enabled": s.enabled,
-                "connected": live.get("connected", False),
-                "error": live.get("error"),
-                "agent": live.get("agent"),
-                "delegates": live.get("delegates", []),
-            })
-        return {"servers": servers, "a2a_available": a2a is not None}
+    # --- firmware (OTA) -------------------------------------------------
+    def need_ota() -> OtaManager:
+        if ota is None:
+            raise HTTPException(503, "firmware updates not available")
+        return ota
 
-    @app.post("/api/a2a/servers")
-    async def add_a2a(body: dict[str, Any]) -> dict[str, Any]:
-        name = (body.get("name") or "").strip()
-        url = (body.get("url") or "").strip()
-        if not name:
-            raise HTTPException(400, "missing 'name'")
-        if not url:
-            raise HTTPException(400, "missing 'url'")
-        _check_env_ref(body.get("env_ref"))
+    @app.get("/api/firmware")
+    async def firmware_status() -> dict[str, Any]:
+        return need_ota().status()
+
+    @app.post("/api/firmware")
+    async def firmware_upload(file: UploadFile) -> dict[str, Any]:
+        """Store a build/stack-chan.bin for the next send. Validated (ESP
+        image magic, chip, app description, partition size, signature block)
+        before it replaces the previous upload."""
+        mgr = need_ota()
+        if mgr.in_progress:
+            raise HTTPException(409, f"an update is {mgr.state}; wait for it to finish")
+        data = await file.read(OTA_PARTITION_SIZE + 1)
         try:
-            sid = memory.add_a2a_server(
-                name=name,
-                url=url,
-                env_ref=body.get("env_ref") or None,
-                enabled=bool(body.get("enabled", True)),
-            )
-        except Exception as exc:
-            raise HTTPException(400, f"could not add server: {exc}")
-        return {"id": sid}
+            info = await asyncio.to_thread(mgr.store.save, data)
+        except ImageError as exc:
+            raise HTTPException(400, str(exc))
+        log.info("firmware uploaded: %s %s (%s, elf %s, %d bytes)",
+                 info.project, info.version, info.built, info.elf_sha256[:12], info.size)
+        return mgr.status()
 
-    @app.put("/api/a2a/servers/{server_id}")
-    async def edit_a2a(server_id: int, body: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "url", "env_ref", "enabled"}
-        fields = {k: v for k, v in body.items() if k in allowed}
-        if not fields:
-            raise HTTPException(400, "no editable fields")
-        if "env_ref" in fields:
-            _check_env_ref(fields["env_ref"])
-        if not memory.update_a2a_server(server_id, **fields):
-            raise HTTPException(404, "no such server")
-        return {"ok": True}
+    @app.post("/api/firmware/send")
+    async def firmware_send() -> dict[str, Any]:
+        """Queue the stored image; the brain sends it to the robot at the
+        next moment it isn't in a conversation."""
+        mgr = need_ota()
+        try:
+            mgr.request_send()
+        except LookupError as exc:
+            raise HTTPException(404, str(exc))
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(409, str(exc))
+        except OSError as exc:
+            raise HTTPException(503, f"no LAN address to serve the image from: {exc}")
+        return mgr.status()
 
-    @app.delete("/api/a2a/servers/{server_id}")
-    async def remove_a2a(server_id: int) -> dict[str, Any]:
-        if not memory.delete_a2a_server(server_id):
-            raise HTTPException(404, "no such server")
-        return {"ok": True}
+    @app.post("/api/firmware/cancel")
+    async def firmware_cancel() -> dict[str, Any]:
+        """Drop a queued update that hasn't been sent to the robot yet."""
+        mgr = need_ota()
+        try:
+            mgr.cancel()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        return mgr.status()
 
-    @app.post("/api/a2a/reload")
-    async def reload_a2a() -> dict[str, Any]:
-        if a2a is None:
-            raise HTTPException(503, "A2A client not available")
-        await a2a.reload()
-        return {"servers": a2a.status()}
+    @app.get("/firmware/{name}")
+    async def firmware_download(name: str, request: Request) -> Response:
+        """The robot's one-shot download. Unauthenticated by design — see
+        authenticate() — so every miss is the same bare 404."""
+        mgr = need_ota()
+        if not name.endswith(".bin") or not mgr.claim(name[:-4]):
+            raise HTTPException(404)
+        data = await asyncio.to_thread(mgr.store.read)
+        if data is None:
+            raise HTTPException(404)
+        log.info("firmware download started by %s (%d bytes)",
+                 request.client.host if request.client else "?", len(data))
+        return Response(data, media_type="application/octet-stream")
 
     # --- live feeds ---------------------------------------------------
     @app.websocket("/ws/logs")

@@ -1,21 +1,18 @@
-"""The two outside-the-brain tool sources: namespacing, result size, and the
-bounds that keep one bad server from parking an agent turn.
+"""The MCP client: namespacing, result size, and the bounds that keep one bad
+server from parking an agent turn.
 
-Everything here runs against fakes — a scripted MCP session object and a
-scripted JSON-RPC endpoint — so no child process is spawned and no socket is
-opened.
+Everything here runs against a scripted MCP session object, so no child process
+is spawned and no socket is opened.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 
-import a2a_client
 import mcp_client
-from memory import A2aServer, McpServer
+from memory import McpServer
 
 
 # --- fakes -----------------------------------------------------------------
@@ -75,38 +72,6 @@ def _conn(name: str, tools: list[str], on_ready=None) -> mcp_client._ServerConn:
     return conn
 
 
-def _a2a_conn(url: str = "http://192.168.4.30:8080") -> a2a_client._A2aConn:
-    return a2a_client._A2aConn(
-        A2aServer(id=1, name="hermes", url=url, env_ref=None, enabled=True)
-    )
-
-
-class _Resp:
-    def __init__(self, payload: dict) -> None:
-        self._payload = payload
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict:
-        return self._payload
-
-
-class _PollHttp:
-    """A tasks/get endpoint that answers `payload` after `delay` seconds."""
-
-    def __init__(self, payload: dict, delay: float = 0.0) -> None:
-        self.payload = payload
-        self.delay = delay
-        self.polls = 0
-
-    async def post(self, url, json, headers, timeout):  # noqa: A002
-        self.polls += 1
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        return _Resp(self.payload)
-
-
 # --- MCP tool naming -------------------------------------------------------
 
 def test_namespaced_names_are_unchanged_for_the_bundled_servers():
@@ -134,9 +99,8 @@ async def test_colliding_tool_names_are_disambiguated_not_overwritten():
 
 # --- results are bounded ---------------------------------------------------
 
-@pytest.mark.parametrize("clamp", [mcp_client._clamp_result, a2a_client._clamp_result])
-def test_an_oversized_result_is_truncated_with_a_marker(clamp):
-    out = clamp("tool", "x" * (mcp_client.MAX_RESULT_CHARS + 5000))
+def test_an_oversized_result_is_truncated_with_a_marker():
+    out = mcp_client._clamp_result("tool", "x" * (mcp_client.MAX_RESULT_CHARS + 5000))
     assert len(out) < mcp_client.MAX_RESULT_CHARS + 200
     assert "[truncated, 5000 chars omitted]" in out
 
@@ -189,50 +153,3 @@ async def test_a_call_to_a_dead_server_is_rejected_immediately():
     conn.connected = False
     with pytest.raises(RuntimeError):
         await asyncio.wait_for(conn.call("get_weather", {}), 2.0)
-
-
-# --- A2A: the bearer token stays on the registered origin ------------------
-
-CARD_URL = "http://192.168.4.30:8080/.well-known/agent.json"
-
-
-def test_a_relative_card_endpoint_resolves_normally():
-    assert _a2a_conn()._endpoint(CARD_URL, "/rpc") == "http://192.168.4.30:8080/rpc"
-
-
-def test_an_off_origin_card_endpoint_is_pinned_back_to_the_registry():
-    conn = _a2a_conn()
-    assert conn._endpoint(CARD_URL, "https://attacker.example/collect") == (
-        "http://192.168.4.30:8080/collect"
-    )
-
-
-# --- A2A: task polling is bounded ------------------------------------------
-
-WORKING = {"kind": "task", "id": "t1", "status": {"state": "working"}}
-
-
-async def test_task_polling_stops_at_a_wall_clock_deadline(monkeypatch):
-    """Each poll's round trip counts against the budget, not just the sleep —
-    otherwise 55s of budget buys 37 polls of up to a minute each."""
-    monkeypatch.setattr(a2a_client, "POLL_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(a2a_client, "POLL_INTERVAL_S", 0.01)
-    http = _PollHttp({"jsonrpc": "2.0", "result": WORKING}, delay=0.05)
-
-    started = time.monotonic()
-    out = await _a2a_conn()._await_task(http, "http://192.168.4.30:8080/rpc", WORKING)
-    elapsed = time.monotonic() - started
-
-    assert out == WORKING
-    assert elapsed < 1.0            # ~20 polls x 0.05s under the old code
-    assert http.polls <= 6
-
-
-async def test_an_error_envelope_ends_polling(monkeypatch):
-    monkeypatch.setattr(a2a_client, "POLL_INTERVAL_S", 0.01)
-    http = _PollHttp({"jsonrpc": "2.0", "error": {"code": -32001, "message": "gone"}})
-
-    out = await _a2a_conn()._await_task(http, "http://192.168.4.30:8080/rpc", WORKING)
-
-    assert out == WORKING
-    assert http.polls == 1          # not re-polled until the budget runs out

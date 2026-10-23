@@ -13,8 +13,8 @@ memory change. Back up the DB first:
 
 It (1) harvests enduring facts from ALL existing summaries into known_facts
 and (2) prunes summaries down to SUMMARY_RETENTION (purging their turns).
-Nothing outside the SQLite DB is touched. Requires ANTHROPIC_API_KEY in
-brain/.env (same as the agent)."""
+Nothing outside the SQLite DB is touched. Requires OPENROUTER_API_KEY in
+the repo-root .env (same as the agent)."""
 
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ from dotenv import load_dotenv
 
 load_dotenv(BRAIN.parent / ".env")
 
-from anthropic import AsyncAnthropic  # noqa: E402
-
 import claude_agent  # noqa: E402
 from config import get_config, init_config  # noqa: E402
 from memory import Memory  # noqa: E402
@@ -42,7 +40,7 @@ async def main() -> None:
     memory = Memory(db_path)
     init_config(memory)
     cfg = get_config()
-    model = cfg.get("MODEL")
+    model = claude_agent.summary_model()
     retention = int(cfg.get("SUMMARY_RETENTION"))
 
     summaries = memory.list_summaries()
@@ -52,7 +50,7 @@ async def main() -> None:
 
     if summaries:
         transcript = "\n\n".join(s.summary for s in summaries)
-        client = AsyncAnthropic()
+        client = claude_agent.get_client()
         new_facts = await claude_agent.extract_facts(
             client, model, transcript, facts_before
         )

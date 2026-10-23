@@ -7,12 +7,19 @@
 #include <string>
 #include <vector>
 
+#include <ArduinoJson.h>
 #include <board.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
+#include <lwip/inet.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
 #include <web_socket.h>
 
+#include "buddy_ble.h"
+#include "commands.h"
+#include "ota.h"
 #include "state.h"
 
 namespace agent::transport {
@@ -28,7 +35,7 @@ constexpr uint32_t kBackoffMaxMs = 16000;
 // A session must last this long before it counts as healthy enough to reset
 // the backoff ladder. A brain that accepts the handshake and dies immediately
 // (systemd crash-loop) would otherwise pin us at kBackoffMinMs forever: a new
-// socket, a new tcp_receive task and a boot/stop_speaking/set_skin exchange
+// socket, a new tcp_receive task and a boot/stop_speaking/set_buddy exchange
 // every second for as long as it stays broken.
 constexpr uint32_t kStableSessionMs = 10000;
 
@@ -45,6 +52,12 @@ struct State {
     std::mutex mu;
     AudioFrameHandler on_audio;
     JsonFrameHandler on_json;
+    // IPv4 address `host` resolved to for the current connection ("" if the
+    // lookup failed). Guarded by `mu`.
+    std::string brain_ip;
+    // state::now_ms() of the last inbound frame (audio or JSON). Feeds the
+    // turn watchdog in commands.cpp.
+    std::atomic<int64_t> last_rx_ms{0};
 };
 
 State& state()
@@ -53,9 +66,26 @@ State& state()
     return s;
 }
 
+std::string resolve_ipv4(const std::string& host)
+{
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+        mclog::tagWarn(TAG, "could not resolve {} for the OTA host check", host);
+        return {};
+    }
+    char buf[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr, buf, sizeof buf);
+    freeaddrinfo(res);
+    return buf;
+}
+
 void handle_data(const char* data, size_t len, bool binary)
 {
     auto& s = state();
+    s.last_rx_ms.store(state::now_ms());
     if (binary) {
         if (len < 1) return;
         uint8_t op = static_cast<uint8_t>(data[0]);
@@ -144,10 +174,36 @@ void connection_task(void*)
             std::lock_guard<std::mutex> lock(s.mu);
             s.ws = std::move(ws);
         }
+        // The address we reached the brain at, for ota::start's URL check.
+        // Our own lookup (esp-ml307 doesn't expose the socket's peer); same
+        // resolver the WebSocket just used, so it names the same host.
+        {
+            std::string ip = resolve_ipv4(s.host);
+            std::lock_guard<std::mutex> lock(s.mu);
+            s.brain_ip = std::move(ip);
+        }
         s.connected = true;
         const TickType_t session_start = xTaskGetTickCount();
         mclog::tagInfo(TAG, "connected");
-        send_event_json("{\"event\":\"boot\"}");
+        // Report the BLE-buddy mode this boot is running in, so the brain
+        // only sends set_buddy (which reboots us) when it actually differs,
+        // plus battery/volume (the brain syncs SPEAKER_VOLUME off this) and
+        // the running firmware, so the console can show it.
+        {
+            JsonDocument boot;
+            boot["event"] = "boot";
+            boot["buddy"] = buddy_ble::enabled();
+            boot["fw"] = ota::running_version();
+            boot["fw_built"] = ota::running_build();
+            boot["fw_sha"] = ota::running_elf_sha256();
+            boot["fw_valid"] = !ota::pending_verify();
+            std::string json;
+            serializeJson(boot, json);
+            // status_fields() is a ready-made `"battery":…,"volume":…`
+            // fragment; splice it in before the closing brace.
+            json.insert(json.size() - 1, "," + commands::status_fields());
+            send_event_json(json);
+        }
 
         // Run until disconnect / error fires.
         while (!closed->load()) {
@@ -235,11 +291,6 @@ bool send_audio(const int16_t* samples, size_t sample_count)
                        sample_count * sizeof(int16_t));
 }
 
-bool send_jpeg(const uint8_t* jpeg, size_t len)
-{
-    return send_binary(OP_JPEG, jpeg, len);
-}
-
 bool send_event_json(std::string_view json)
 {
     auto& s = state();
@@ -252,6 +303,18 @@ bool send_event_json(std::string_view json)
     }
     if (!ws) return false;
     return ws->Send(std::string(json));
+}
+
+std::string brain_ip()
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    return s.connected.load() ? s.brain_ip : std::string();
+}
+
+int64_t last_rx_ms()
+{
+    return state().last_rx_ms.load();
 }
 
 void set_on_audio(AudioFrameHandler handler)

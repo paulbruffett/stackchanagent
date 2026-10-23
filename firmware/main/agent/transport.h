@@ -15,12 +15,12 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <string_view>
 
 namespace agent::transport {
 
 constexpr uint8_t OP_AUDIO = 0x01;
-constexpr uint8_t OP_JPEG  = 0x02;
 
 // Spin up the connection-manager task. Must be called after Wi-Fi is up.
 // Caller retains ownership of host (must outlive this call's copy).
@@ -29,15 +29,20 @@ void start(const char* host, int port);
 bool is_connected();
 
 // Send a 16 kHz / codec-native-rate s16le mono PCM frame prefixed with
-// OP_AUDIO. Returns false if the link is down (frame is dropped, no queue).
+// OP_AUDIO. Returns false if the link is down. Blocking: callers that must
+// not stall (the mic reader) go through mic_pump's queue.
 bool send_audio(const int16_t* samples, size_t sample_count);
-
-// Send a JPEG frame prefixed with OP_JPEG. Returns false if the link is
-// down (frame is dropped, no queue).
-bool send_jpeg(const uint8_t* jpeg, size_t len);
 
 // Send a JSON text frame. Pass a complete JSON string.
 bool send_event_json(std::string_view json);
+
+// IPv4 address (dotted quad) of the brain on the current connection; "" when
+// disconnected or unresolved. ota::start only downloads from this host.
+std::string brain_ip();
+
+// state::now_ms() when the last frame (audio or JSON) arrived from the brain;
+// 0 if none yet.
+int64_t last_rx_ms();
 
 // Register handler for incoming OP_AUDIO frames. The pointer is into
 // the WebSocket library's internal buffer and is only valid for the

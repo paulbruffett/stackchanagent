@@ -5,6 +5,11 @@ firmware/sdkconfig.old
 firmware/managed_components/
 firmware/dependencies.lock
 
+# Firmware signing keys live in ~/.stackchan-keys/, never here. Belt and
+# braces in case one is copied into the tree.
+*signing_key*.pem
+.stackchan-keys/
+
 # Vendored deps — recreated by `python3 firmware/fetch_repos.py`.
 # (Pinned versions live in firmware/repos.json which IS tracked.)
 firmware/components/
