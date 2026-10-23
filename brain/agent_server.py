@@ -11,7 +11,7 @@ Wire protocol:
       from ESP32: {"event": "boot" (+ "buddy": bool, "fw"/"fw_built"/"fw_sha": str,
                    "fw_valid": bool, + status fields)|
                    "status" ("battery": 0-100|null, "charging": bool|null,
-                   "volume": 0-100)|"wakeword"|"tap"|"buddy_prompt"|
+                   "volume": 0-100)|"wakeword"|"tap"|"double_tap"|"buddy_prompt"|
                    "listen_timeout"|"speak_timeout"|"alert_dismissed"|
                    "ota" (+ "id", "state", "pct"/"error"/"fw_sha"), ...}
       to   ESP32: {"cmd": "stop_listening"|"start_listening"|"start_speaking"|
@@ -874,6 +874,14 @@ def wake_up(state: ConnState) -> None:
     memory.set_runtime_state("asleep", False)
 
 
+async def _toggle_tap_light() -> None:
+    name = str(get_config().get("DOUBLE_TAP_LIGHT")).strip()
+    if not name:
+        return
+    result = await ha_fast_path.toggle_by_name(name)
+    log.info("double tap → %r: %s", name, result)
+
+
 def _on_wake_trigger(state: ConnState) -> None:
     """Shared handling for a wake word OR a head tap: wake if asleep and arm
     a listening capture. The firmware has already transitioned itself to
@@ -1009,6 +1017,10 @@ async def handle(ws: ServerConnection) -> None:
                     # firmware has already switched itself to LISTENING and
                     # relit the screen on the same trigger.
                     _on_wake_trigger(state)
+                elif event == "double_tap":
+                    # Head double tap: toggle a light in Home Assistant
+                    # directly, no LLM turn.
+                    spawn(_toggle_tap_light(), "toggle_light")
                 elif event == "boot":
                     state.boot_seen = True
                     buddy = payload.get("buddy")

@@ -5,6 +5,7 @@ and still reports what the attempt cost."""
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -165,3 +166,58 @@ async def test_no_retry_without_robot_area(ha):
     state["reply"] = _ha_reply("error", "x", "no_valid_targets")
     got = await ha_fast_path.try_handle("turn off light")
     assert got.speech is None and len(seen) == 1
+
+
+# --- head double tap → toggle ----------------------------------------------
+
+STATES = [
+    {"entity_id": "switch.office_light", "attributes": {"friendly_name": "Office Light"}},
+    {"entity_id": "light.office_light", "attributes": {"friendly_name": "Office Light"}},
+    {"entity_id": "light.desk", "attributes": {"friendly_name": "Desk Lamp"}},
+    {"entity_id": "sun.sun", "attributes": {}},
+]
+
+
+@pytest.fixture
+def ha_rest(mem, monkeypatch):
+    monkeypatch.setenv("HA_TOKEN", "test-token")
+    monkeypatch.delenv("HA_URL", raising=False)
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/api/states":
+            return httpx.Response(200, json=STATES)
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setattr(ha_fast_path, "_client", None)
+    monkeypatch.setattr(ha_fast_path, "_make_client",
+                        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    return seen
+
+
+async def test_toggle_prefers_the_light_with_that_name(ha_rest):
+    assert await ha_fast_path.toggle_by_name("office light") == "toggled light.office_light"
+    post = ha_rest[-1]
+    assert post.url.path == "/api/services/homeassistant/toggle"
+    assert post.headers["Authorization"] == "Bearer test-token"
+    assert json.loads(post.content) == {"entity_id": "light.office_light"}
+
+
+async def test_toggle_unknown_name_calls_no_service(ha_rest):
+    assert "no entity named" in await ha_fast_path.toggle_by_name("Kitchen")
+    assert [r.url.path for r in ha_rest] == ["/api/states"]
+
+
+async def test_toggle_without_token(ha_rest, monkeypatch):
+    monkeypatch.delenv("HA_TOKEN")
+    assert await ha_fast_path.toggle_by_name("Office Light") == "HA_TOKEN not set"
+    assert ha_rest == []
+
+
+async def test_toggle_reports_ha_errors(mem, monkeypatch):
+    monkeypatch.setenv("HA_TOKEN", "test-token")
+    monkeypatch.setattr(ha_fast_path, "_client", None)
+    monkeypatch.setattr(ha_fast_path, "_make_client", lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401))))
+    assert (await ha_fast_path.toggle_by_name("Office Light")).startswith("failed:")

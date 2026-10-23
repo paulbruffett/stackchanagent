@@ -208,6 +208,11 @@ SPECS: dict[str, Spec] = {
         "bare \"turn off the light\" that HA can't place is retried as \"… in "
         "the <area>\" on the fast path. Empty = off.",
     ),
+    "DOUBLE_TAP_LIGHT": Spec(
+        "Office Light", "str", False, "tools",
+        "Home Assistant device a double tap on the robot's head toggles, by "
+        "its friendly name. Needs HA_TOKEN in .env. Empty = off.",
+    ),
     "DEFAULT_LOCATION": Spec(
         "Seattle, Washington", "str", False, "tools",
         "Default location for the weather tool when the user doesn't name one.",

@@ -173,6 +173,39 @@ async def try_handle(text: str) -> FastPathResult | None:
     return FastPathResult(speech, rtype, latency_ms)
 
 
+async def toggle_by_name(name: str) -> str:
+    """Toggle the HA entity whose friendly name is `name` (case-insensitive),
+    for the head double tap. HA's toggle service flips it in one step, so no
+    state read on our side. Returns a short result for the log."""
+    if not (os.environ.get("HA_TOKEN") or "").strip():
+        return "HA_TOKEN not set"
+    want = name.strip().casefold()
+
+    async def run() -> str:
+        client = _get_client()
+        headers = _http_headers("HA_TOKEN")
+        r = await client.get(_base_url() + "/api/states", headers=headers)
+        r.raise_for_status()
+        matches = [
+            s["entity_id"] for s in r.json()
+            if isinstance(s, dict) and isinstance(s.get("entity_id"), str)
+            and str((s.get("attributes") or {}).get("friendly_name", "")).strip().casefold() == want
+        ]
+        if not matches:
+            return f"no entity named {name!r}"
+        # Prefer a light if the name is shared (e.g. a light and its switch).
+        entity = next((e for e in matches if e.startswith("light.")), matches[0])
+        r = await client.post(_base_url() + "/api/services/homeassistant/toggle",
+                              headers=headers, json={"entity_id": entity})
+        r.raise_for_status()
+        return f"toggled {entity}"
+
+    try:
+        return await asyncio.wait_for(run(), TIMEOUT_S * 2)
+    except Exception as e:
+        return f"failed: {e!r}"
+
+
 # Names Whisper should expect: without them it hears a quiet "office light"
 # as "office air". Taken from what HA exposes to Assist, since those are the
 # names the fast path can act on.
