@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 #include <esp_bt.h>
@@ -54,8 +55,9 @@ static std::unique_ptr<uitk::lvgl_cpp::Label> net_status_label;
 
 // Double-tap detection on the head sensor. A second press inside the window
 // is a double tap; a press closer than the min gap is sensor flicker and is
-// ignored. Both are first guesses — tune on the device.
-static constexpr uint32_t kDoubleTapWindowMs = 450;
+// ignored. 450 ms missed relaxed double taps on the device; 600 ms catches
+// them at the cost of a slightly later single-tap response.
+static constexpr uint32_t kDoubleTapWindowMs = 600;
 static constexpr uint32_t kDoubleTapMinGapMs = 120;
 // millis() of a first press still waiting to see if a second follows; 0 = none.
 // Written by the head-touch task, claimed by whichever of it (double tap) or
@@ -260,14 +262,22 @@ extern "C" void app_main(void)
             // Claim the pending tap so the idle loop can't also fire it.
             if (!g_pending_tap_ms.compare_exchange_strong(first, 0)) return;
             g_last_tap_ms = now;
-            if (agent::transport::send_event_json("{\"event\":\"double_tap\"}")) {
-                mclog::tagInfo(TAG, "head double tap → toggle light");
+            // gap_ms shows up in the brain log, for tuning the window.
+            uint32_t gap = now - first;
+            std::string ev = "{\"event\":\"double_tap\",\"gap_ms\":"
+                             + std::to_string(gap) + "}";
+            if (agent::transport::send_event_json(ev)) {
+                mclog::tagInfo(TAG, "head double tap ({} ms) → toggle light", gap);
             } else {
                 mclog::tagWarn(TAG, "head double tap dropped — brain link down");
             }
             return;
         }
-        if (now - g_last_tap_ms < 800) return;  // debounce repeated touches
+        if (now - g_last_tap_ms < 800) {  // debounce repeated touches
+            mclog::tagInfo(TAG, "head press ignored, {} ms after last tap",
+                           now - g_last_tap_ms);
+            return;
+        }
         g_last_tap_ms = now;
         g_pending_tap_ms.store(now ? now : 1);  // 0 means "none pending"
     });
